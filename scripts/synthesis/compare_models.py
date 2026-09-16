@@ -42,6 +42,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+from utils.analysis import display_name
 from utils.synthesis import SynthesisComparator, SynthesisConfig
 
 DEFAULT_COLORS = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
@@ -111,8 +112,8 @@ def plot_combined_overlay(
         raw = raw_by_model[mt]
         row = raw["stokes_synth"][raw["synth_index"][(ix, iy)]]
         i_syn, v_syn = row[0], row[3]
-        axes[0].plot(wl, i_syn, color=model_colors[mt], ls="--", label=f"NICOLE ({mt})")
-        axes[1].plot(wl, v_syn, color=model_colors[mt], ls="--", label=f"NICOLE ({mt})")
+        axes[0].plot(wl, i_syn, color=model_colors[mt], ls="--", label=f"NICOLE ({display_name(mt)})")
+        axes[1].plot(wl, v_syn, color=model_colors[mt], ls="--", label=f"NICOLE ({display_name(mt)})")
 
     axes[0].set_title(f"Stokes I  pix=({ix},{iy})")
     axes[0].set_xlabel("Wavelength [Å]")

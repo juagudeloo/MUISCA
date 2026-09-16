@@ -34,8 +34,15 @@ sys.path.insert(0, str(ROOT))
 from utils.normalizer import MhdNormalizer, StokesNormalizer
 from models.pinn_mscnn_model import PhysicsInformedMSCNN
 from utils.cache_manage import MuramDataCache, BalancedTrainDataCache
+import mlflow
+import mlflow.pytorch
+from mlflow.models import ModelSignature
+from mlflow.types import Schema, TensorSpec
+
+from utils.hinode_wavelengths import N_WL_OBSERVED
+from utils.mlflow_utils import default_tracking_uri, finite_metrics, flatten_params
 from scripts.base_training import (
-    TrainingConfig,
+    TrainingConfig, set_global_seed,
     load_and_prepare_step, validate, train_epoch, MetricsLogger,
     initialize_wfa_gate_state, update_wfa_gate_state,
     compute_global_bz_balancing_indices,
@@ -455,6 +462,36 @@ class ExperimentTracker:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.results = {}
+        self._load_existing_results()
+
+    def _load_existing_results(self):
+        """Seed results with variations already stored under this experiment name.
+
+        Each ablation arm takes hours, so they are often run in separate submissions --
+        wfa_only and no_physics first, doppler_only and black_body_only later. Without this,
+        the second submission would overwrite experiment_results.json and the comparison
+        plots with only its own arms: the per-variation checkpoints survive (they live in
+        their own subdirectories) but the summary that compares them does not. Loading first
+        means a later run extends the experiment instead of truncating it.
+
+        Arms re-run in the current process overwrite their stored entry, which is what you
+        want -- the newest run of a variation wins. Settings for each arm remain recoverable
+        from its own experiment_config.json.
+        """
+        results_path = self.output_dir / "experiment_results.json"
+        if not results_path.exists():
+            return
+        try:
+            with open(results_path, "r") as f:
+                stored = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"⚠ Could not read existing {results_path} ({exc}); starting fresh.")
+            return
+        stored.pop("__metadata__", None)
+        if stored:
+            self.results.update(stored)
+            print(f"Loaded {len(stored)} existing variation(s) from {results_path.name}: "
+                  f"{', '.join(stored)}")
     def add_experiment(self, name: str, metrics: dict):
         """Add results from one experimental condition."""
         self.results[name] = metrics
@@ -1336,12 +1373,12 @@ def run_single_experiment(
     print(f"Temperature physics mode: {config.temp_physics_mode}")
     if config.temp_physics_mode == 'single_height':
         print(f"Temperature target log(tau): {config.temp_target_logtau}")
-    print(f"WFA gate mode: {config.wfa_gate_mode}")
+    print(f"Physics gate mode: {config.wfa_gate_mode}")
     if config.wfa_gate_mode == 'threshold':
-        print(f"WFA gate threshold: {config.wfa_gate_threshold}")
+        print(f"Physics gate threshold: {config.wfa_gate_threshold}")
     elif config.wfa_gate_mode == 'plateau':
         print(
-            f"WFA gate plateau: patience={config.wfa_gate_patience}, "
+            f"Physics gate plateau: patience={config.wfa_gate_patience}, "
             f"min_delta={config.wfa_gate_min_delta}, warmup={config.wfa_gate_warmup_epochs}"
         )
     print(f"Learning rate: {config.learning_rate}")
@@ -1377,6 +1414,7 @@ def run_single_experiment(
             'temp_target_logtau': config.temp_target_logtau,
         },
         'data_config': {
+            'seed': int(config.seed),
             'min_step': min_step,
             'max_step': max_step,
             'step_size': step_size,
@@ -1410,7 +1448,21 @@ def run_single_experiment(
     with open(config_path, 'w') as f:
         json.dump(config_dict, f, indent=2)
     print(f"Configuration saved to: {config_path}")
+
+    # Nested run for this variation, under the ablation's parent run. Params come from the
+    # same dict that was just written to disk, so MLflow and experiment_config.json can never
+    # disagree about what was configured.
+    mlflow.start_run(run_name=experiment_name, nested=True)
+    mlflow.log_params(flatten_params(config_dict))
+    mlflow.log_artifact(str(config_path))
     
+    # Reseed before the model exists, so every ablation variation starts from identical
+    # weights and sees the same batch order. Variations run back-to-back in one process, so
+    # without this each one inherits whatever RNG state the previous left behind and the arms
+    # differ by initialization noise as much as by their physics terms.
+    set_global_seed(config.seed)
+    print(f"Global seed set to {config.seed} (weights, shuffling)")
+
     # Initialize model
     n_logtau = config.get_n_logtau()
     model = PhysicsInformedMSCNN(
@@ -1445,7 +1497,7 @@ def run_single_experiment(
     train_steps = [s for s in all_steps if s not in test_steps]
 
     import random
-    random.seed(42)
+    random.seed(config.seed)  # was hardcoded to 42; follow the configured seed
     n_val = max(1, len(train_steps) // 10)
     val_steps = random.sample(train_steps, n_val)
     train_steps = [s for s in train_steps if s not in val_steps]
@@ -1579,9 +1631,9 @@ def run_single_experiment(
     for epoch in range(config.n_epochs):
         with timer():
             print(f"\nEpoch {epoch + 1}/{config.n_epochs}")
-            train_wfa_enabled = bool(wfa_gate_state.get('enabled', True))
-            train_wfa_enabled_history.append(train_wfa_enabled)
-            print(f"  Train-time WFA enabled: {train_wfa_enabled}")
+            train_physics_enabled = bool(wfa_gate_state.get('enabled', True))
+            train_wfa_enabled_history.append(train_physics_enabled)
+            print(f"  Train-time physics enabled: {train_physics_enabled}")
             
             # Use the shared train_epoch function with cache
             epoch_metrics = train_epoch(
@@ -1595,7 +1647,7 @@ def run_single_experiment(
                 logger=logger,
                 n_steps_per_epoch=n_steps_per_epoch,
                 cache=cache,
-                enable_wfa=train_wfa_enabled,
+                enable_physics=train_physics_enabled,
                 global_bz_selection_indices=global_bz_selection_indices,
                 global_bz_balance_metadata=global_bz_balance_metadata,
                 balanced_cache=balanced_cache if balanced_runtime_mode == "disk" else None,
@@ -1629,7 +1681,7 @@ def run_single_experiment(
             if wfa_gate_triggered:
                 wfa_gate_trigger_epoch = int(wfa_gate_state.get('trigger_epoch') or (epoch + 1))
                 wfa_gate_trigger_reason = wfa_gate_reason
-                print(f"  WFA gate triggered at epoch {wfa_gate_trigger_epoch}: {wfa_gate_reason}")
+                print(f"  Physics gate triggered at epoch {wfa_gate_trigger_epoch}: {wfa_gate_reason}")
             
             # Validation
             avg_val_loss = validate(
@@ -1721,6 +1773,23 @@ def run_single_experiment(
                     )
             
             print("=" * 100)
+            mlflow.log_metrics(finite_metrics({
+                "train_total_loss": avg_train_loss,
+                "train_mse_loss": avg_mse_loss,
+                "train_physics_loss": avg_physics_loss,
+                "train_wfa_loss": avg_wfa_loss,
+                "train_doppler_loss": avg_doppler_loss,
+                "train_temperature_loss": avg_temperature_loss,
+                "val_loss": avg_val_loss,
+                "learning_rate": current_lr,
+                "test_blos_corr": epoch_test_metrics['blos_correlation'],
+                "test_vlos_corr": epoch_test_metrics['vlos_correlation'],
+                "test_temp_corr": epoch_test_metrics['temp_correlation'],
+                "test_blos_rrmse": epoch_test_metrics['blos_rrmse_tau_avg'],
+                "test_vlos_rrmse": epoch_test_metrics['vlos_rrmse_tau_avg'],
+                "test_temp_rrmse": epoch_test_metrics['temp_rrmse_tau_avg'],
+            }), step=epoch + 1)
+
             print(f"Epoch {epoch + 1} Summary:")
             print(f"  Total Loss:      {avg_train_loss:.6f}")
             print(f"  MSE Loss:        {avg_mse_loss:.6f}")
@@ -1829,6 +1898,47 @@ def run_single_experiment(
     }
     with open(config_path, 'w') as f:
         json.dump(config_dict, f, indent=2)
+
+    # Close out the variation's MLflow run: the checkpoint also goes to MLflow with its
+    # pytorch flavor, in addition to (not instead of) output/, which is what finetune.py and
+    # the analysis pipeline resolve by path. Note a model reloaded from MLflow is ready for
+    # inference but needs set_physics_context() again before it can compute physics losses.
+    mlflow.log_artifact(str(config_path))            # re-log: now carries the runtime block
+    mlflow.log_metrics(finite_metrics({
+        "final_val_loss": val_loss_history[-1],
+        "training_time_minutes": training_time,
+        "total_training_pixels_used": int(total_training_pixels),
+        "wfa_gate_trigger_epoch": wfa_gate_trigger_epoch if wfa_gate_trigger_epoch else -1,
+    }))
+    if config.log_dir and Path(config.log_dir).exists():
+        mlflow.log_artifacts(str(config.log_dir), artifact_path="logs")
+    # Logged with the classic 'pickle' flavor rather than MLflow 3.x's default 'pt2'.
+    # pt2 serializes a torch.export graph, and export cannot trace MultiScaleFeatureMapping
+    # (it fails inside the multi-scale branch with a TorchRuntimeError). Reshaping the
+    # architecture to satisfy the tracer would be a real change to production code for the
+    # benefit of a logging format, so the model is pickled instead -- reloading it needs the
+    # class importable, which is already true for anything working in this repo.
+    #
+    # The signature is still declared explicitly, so the artifact documents its own contract:
+    # Stokes I/V over the Hinode wavelength axis in, a flat 3 x n_logtau stratification out.
+    # -1 marks the batch dimension as dynamic.
+    input_example = np.zeros((1, config.in_channels, N_WL_OBSERVED), dtype=np.float32)
+    signature = ModelSignature(
+        inputs=Schema([
+            TensorSpec(np.dtype(np.float32), (-1, config.in_channels, N_WL_OBSERVED), "stokes")
+        ]),
+        outputs=Schema([
+            TensorSpec(np.dtype(np.float32), (-1, 3 * n_logtau), "mhd_stratification")
+        ]),
+    )
+    mlflow.pytorch.log_model(
+        model,
+        name="model",
+        input_example=input_example,
+        signature=signature,
+        serialization_format="pickle",
+    )
+    mlflow.end_run()
 
     return {
         'experiment_dir': str(config.checkpoint_dir.parent),
@@ -1952,26 +2062,25 @@ def main():
                        default=['all'],
                        help='Which experiments to run (default: all)')
     
+    parser.add_argument('--data-source', '--data_source', dest='data_source',
+                       type=str, choices=['muram_legacy', 'nicole_tau500'], default='nicole_tau500',
+                       help='Training data source (default: nicole_tau500)')
+
     # Cache-related arguments
-    default_cache_dir = os.environ.get(
-        'MURAM_CACHE_DIR',
-        '/scratchsan/observatorio/juagudeloo/Tesis_maestria_OAN/.muram_cache'
-    )
     parser.add_argument('--stokes-ic-mode', '--stokes_ic_mode', dest='stokes_ic_mode',
                        type=str, choices=['per_step', 'fixed_global'], default='fixed_global',
                        help='Continuum normalization mode for Stokes data')
     parser.add_argument('--no-cache', action='store_true',
                        help='Disable data caching')
-    parser.add_argument('--cache-dir', '--cache_dir', dest='cache_dir', type=str, default=default_cache_dir,
-                       help='Directory for cached MURaM data (or set MURAM_CACHE_DIR)')
+    parser.add_argument('--cache-dir', '--cache_dir', dest='cache_dir', type=str, default=None,
+                       help='Directory for cached MURaM data (or set MURAM_CACHE_DIR). Defaults to '
+                            'the standard cache dir, suffixed with the data source for non-legacy sources.')
     parser.add_argument('--balanced-cache', '--balanced_cache', dest='use_balanced_cache', action='store_true',
                        help='Enable post-balancing train-data cache')
     parser.add_argument('--balanced-cache-dir', '--balanced_cache_dir', dest='balanced_cache_dir', type=str,
-                       default=os.environ.get(
-                           'MURAM_BALANCED_CACHE_DIR',
-                           '/scratchsan/observatorio/juagudeloo/Tesis_maestria_OAN/.muram_balanced_cache'
-                       ),
-                       help='Directory for balanced training cache')
+                       default=None,
+                       help='Directory for balanced training cache (or set MURAM_BALANCED_CACHE_DIR). '
+                            'Defaults to the standard dir, suffixed with the data source for non-legacy sources.')
     parser.add_argument('--clear-balanced-cache', '--clear_balanced_cache', dest='clear_balanced_cache', action='store_true',
                        help='Clear balanced training cache before running experiments')
     parser.add_argument('--balanced-cache-strategy', '--balanced_cache_strategy', dest='balanced_cache_strategy',
@@ -2039,6 +2148,12 @@ def main():
         help='Apply Bz balancing globally across train steps or independently per step.'
     )
     parser.add_argument(
+        '--seed', dest='seed', type=int, default=42,
+        help='Seed for weight initialization and batch shuffling. Kept identical across '
+             'ablation variations so the arms differ by their physics terms, not by where '
+             'they started.'
+    )
+    parser.add_argument(
         '--bz-balance-seed', '--bz_balance_seed',
         dest='bz_balance_seed',
         type=int,
@@ -2066,12 +2181,12 @@ def main():
         type=float,
         nargs='+',
         default=None,
-        help='Explicit log(tau) grid values (overrides min/max/step), e.g. --logtau_values -2.0 -1.9 ... 0.0'
+        help='Explicit log(tau) grid values (overrides min/max/step), e.g. --logtau_values -3.0 -2.9 ... 1.4'
     )
-    parser.add_argument('--logtau_min', type=float, default=-2.0,
-                       help='Minimum log(tau) for range mode (default: -2.0)')
-    parser.add_argument('--logtau_max', type=float, default=0.0,
-                       help='Maximum log(tau) for range mode (default: 0.0)')
+    parser.add_argument('--logtau_min', type=float, default=-3.0,
+                       help='Minimum log(tau) for range mode (default: -3.0, the tau_500 generation grid)')
+    parser.add_argument('--logtau_max', type=float, default=1.4,
+                       help='Maximum log(tau) for range mode (default: 1.4, the tau_500 generation grid)')
     parser.add_argument('--logtau_step', type=float, default=0.1,
                        help='Step in log(tau) for range mode (default: 0.1)')
 
@@ -2147,7 +2262,7 @@ def main():
                        help='Minimum epoch train MSE improvement to reset WFA plateau counter')
     parser.add_argument('--wfa-gate-warmup-epochs', '--wfa_gate_warmup_epochs', dest='wfa_gate_warmup_epochs',
                        type=int, default=0,
-                       help='Minimum number of epochs before WFA gate can activate')
+                       help='Minimum number of epochs before the physics gate can activate (gates WFA, Doppler and temperature together)')
 
     args = parser.parse_args()
 
@@ -2163,8 +2278,7 @@ def main():
             args.logtau_min,
             args.logtau_max + 0.5 * args.logtau_step,
             args.logtau_step,
-            dtype=np.float32,
-        )
+        ).astype(np.float32)  # accumulate in float64 first -- see TrainingConfig.get_logtau_values
     resolved_logtau = np.round(resolved_logtau, 6)
 
     if args.bz_balance_logtau is not None:
@@ -2176,6 +2290,24 @@ def main():
                 f"Requested: {target_logtau}. Grid: {resolved_logtau.tolist()}"
             )
         args.bz_balance_tau_idx = int(match_idx[0])
+    default_cache_dir = os.environ.get(
+        'MURAM_CACHE_DIR',
+        '/scratchsan/observatorio/juagudeloo/Tesis_maestria_OAN/.muram_cache'
+    )
+    default_balanced_cache_dir = os.environ.get(
+        'MURAM_BALANCED_CACHE_DIR',
+        '/scratchsan/observatorio/juagudeloo/Tesis_maestria_OAN/.muram_balanced_cache'
+    )
+    if args.cache_dir is None:
+        args.cache_dir = (
+            default_cache_dir if args.data_source == 'muram_legacy'
+            else f'{default_cache_dir}_{args.data_source}'
+        )
+    if args.balanced_cache_dir is None:
+        args.balanced_cache_dir = (
+            default_balanced_cache_dir if args.data_source == 'muram_legacy'
+            else f'{default_balanced_cache_dir}_{args.data_source}'
+        )
     args.cache_dir = str(Path(args.cache_dir).expanduser().resolve())
     args.balanced_cache_dir = str(Path(args.balanced_cache_dir).expanduser().resolve())
     args.modest_cache_dir = str(Path(args.modest_cache_dir).expanduser().resolve())
@@ -2189,12 +2321,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     test_steps = list(range(198, 201))
     
-    # Load normalizers
-    print("Loading normalizers...")
+    # Load normalizers (non-legacy sources use an isolated normalization_stats subdir,
+    # mirroring TrainingConfig.__post_init__'s default mhd/stokes_normalizer_path)
+    norm_dir = (
+        data_path / "normalization_stats" if args.data_source == "muram_legacy"
+        else data_path / "normalization_stats" / args.data_source
+    )
+    print(f"Loading normalizers from {norm_dir}...")
     mhd_normalizer = MhdNormalizer()
-    mhd_normalizer.load(data_path / "normalization_stats/mhd_normalization.json")
+    mhd_normalizer.load(norm_dir / "mhd_normalization.json")
     stokes_normalizer = StokesNormalizer()
-    stokes_normalizer.load(data_path / "normalization_stats/stokes_normalization.json")
+    stokes_normalizer.load(norm_dir / "stokes_normalization.json")
     print("  ✓ Normalizers loaded")
     
     tracker = ExperimentTracker(output_dir)
@@ -2210,12 +2347,12 @@ def main():
     print(f"Stokes mult factor: {args.stokes_mult_factor}")
     print(f"Stokes I_c mode:    {args.stokes_ic_mode}")
     print(f"MODEST pred input:  {'downsampled' if args.modest_downsample_prediction_input else 'upsampled'}")
-    print(f"WFA gate mode:      {args.wfa_gate_mode}")
+    print(f"Physics gate mode:      {args.wfa_gate_mode}")
     if args.wfa_gate_mode == 'threshold':
-        print(f"WFA gate threshold: {args.wfa_gate_threshold}")
+        print(f"Physics gate threshold: {args.wfa_gate_threshold}")
     elif args.wfa_gate_mode == 'plateau':
         print(
-            f"WFA gate plateau:   patience={args.wfa_gate_patience}, "
+            f"Physics gate plateau:  patience={args.wfa_gate_patience}, "
             f"min_delta={args.wfa_gate_min_delta}, warmup={args.wfa_gate_warmup_epochs}"
         )
     print(f"Apply region mask:  {args.apply_region_mask}")
@@ -2316,9 +2453,11 @@ def main():
             bz_balance_bins=args.bz_balance_bins,
             bz_balance_tau_idx=args.bz_balance_tau_idx,
             bz_balance_seed=args.bz_balance_seed,
+            seed=args.seed,
             c1_filters=args.c1_filters,
             stokes_mult_factor=args.stokes_mult_factor,
             stokes_ic_mode=args.stokes_ic_mode,
+            data_source=args.data_source,
             **common_epoch_plot_kwargs,
         )
 
@@ -2419,39 +2558,60 @@ def main():
         balanced_cache.clear()
         print(f"Cleared balanced cache: {args.balanced_cache_dir}")
     
-    # Run selected experiments with shared cache
-    for name in experiments_to_run:
-        if name not in all_experiment_configs:
-            print(f"⚠ Warning: Unknown experiment '{name}', skipping...")
-            continue
+    # One MLflow parent run for the whole ablation, with a nested child per variation, so the
+    # arms can be compared side by side in the UI instead of appearing as unrelated runs.
+    mlflow.set_tracking_uri(default_tracking_uri())
+    mlflow.set_experiment(args.experiment_name)
+    print(f"MLflow tracking to {default_tracking_uri()} (experiment: {args.experiment_name})")
+
+    with mlflow.start_run(run_name=f"{args.experiment_name}-ablation"):
+        mlflow.set_tags({
+            "data_source": args.data_source,
+            "variations": ",".join(experiments_to_run),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID", "local"),
+        })
+
+        # Run selected experiments with shared cache
+        for name in experiments_to_run:
+            if name not in all_experiment_configs:
+                print(f"⚠ Warning: Unknown experiment '{name}', skipping...")
+                continue
         
-        config = all_experiment_configs[name]
-        config.use_cache = not args.no_cache
-        config.cache_dir = args.cache_dir
-        config.use_balanced_cache = args.use_balanced_cache
-        config.balanced_cache_dir = args.balanced_cache_dir
-        config.clear_balanced_cache = False
-        config.balanced_cache_strategy = args.balanced_cache_strategy
-        config.balanced_cache_ram_budget_gb = args.balanced_cache_ram_budget_gb
-        config.balanced_cache_ram_fraction = args.balanced_cache_ram_fraction
+            config = all_experiment_configs[name]
+            config.use_cache = not args.no_cache
+            config.cache_dir = args.cache_dir
+            config.use_balanced_cache = args.use_balanced_cache
+            config.balanced_cache_dir = args.balanced_cache_dir
+            config.clear_balanced_cache = False
+            config.balanced_cache_strategy = args.balanced_cache_strategy
+            config.balanced_cache_ram_budget_gb = args.balanced_cache_ram_budget_gb
+            config.balanced_cache_ram_fraction = args.balanced_cache_ram_fraction
         
-        results = run_single_experiment(
-            experiment_name=name,
-            config=config,
-            mhd_normalizer=mhd_normalizer,
-            stokes_normalizer=stokes_normalizer,
-            test_steps=test_steps,
-            n_steps_per_epoch=args.n_steps,
-            min_step=args.min_step,
-            max_step=args.max_step,
-            step_size=args.step_size,
-            cache=cache,  # Share cache across experiments
-            plot_training_data_histograms=not args.no_training_data_histograms,
-            training_hist_bins=args.training_hist_bins,
-            training_hist_max_samples=args.training_hist_max_samples,
-        )
-        
-        tracker.add_experiment(name, results)
+            try:
+                results = run_single_experiment(
+                    experiment_name=name,
+                    config=config,
+                    mhd_normalizer=mhd_normalizer,
+                    stokes_normalizer=stokes_normalizer,
+                    test_steps=test_steps,
+                    n_steps_per_epoch=args.n_steps,
+                    min_step=args.min_step,
+                    max_step=args.max_step,
+                    step_size=args.step_size,
+                    cache=cache,  # Share cache across experiments
+                    plot_training_data_histograms=not args.no_training_data_histograms,
+                    training_hist_bins=args.training_hist_bins,
+                    training_hist_max_samples=args.training_hist_max_samples,
+                )
+            except BaseException:
+                # Close the variation's nested run so it is not left RUNNING forever in the
+                # UI. MLflow keeps active runs on a stack, so a dangling one would also
+                # swallow the next variation's logging.
+                if mlflow.active_run() is not None:
+                    mlflow.end_run(status="FAILED")
+                raise
+
+            tracker.add_experiment(name, results)
     
     tracker.save_results()
     tracker.print_summary_table()

@@ -8,6 +8,7 @@ from typing import Callable, Any
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.gridspec import GridSpec
 
 from scripts.base_training import TrainingConfig
 from models.pinn_mscnn_model import PhysicsInformedMSCNN
@@ -17,6 +18,95 @@ try:
     from torchinfo import summary as torch_summary
 except Exception:
     torch_summary = None
+
+
+# Edges (G) for reporting accuracy against the true |B_LOS| of each pixel. Chosen around the
+# training data's support: MURaM steps 110-130 hold ~25k distinct pixels above 200 G and ~7k
+# above 352 G, but only ~150 above 954 G and none at all above 1500 G, while the sunspot
+# crops reach 3.7 kG. Splitting the metrics here separates "the model was trained for this"
+# from "the model is extrapolating".
+FIELD_STRENGTH_BIN_EDGES_G = (0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 1500.0, float("inf"))
+
+
+# Human-readable labels for plot titles/legends only. Every other use of an experiment key
+# (output directories, filenames, CSV "model" columns, model_configs dict keys) stays as the
+# raw key -- those are load-bearing for path resolution and downstream filtering elsewhere in
+# the pipeline, and must not be renamed.
+MODEL_DISPLAY_NAMES = {
+    "no_physics": "Baseline",
+    "wfa_only": "WFA",
+    "doppler_only": "Doppler",
+    "black_body_only": "Black Body",
+}
+
+# Fixed left-to-right/top-to-bottom order for multi-model comparison figures, independent of
+# whatever order --model-types was given in on the command line.
+MODEL_CANONICAL_ORDER = ("no_physics", "wfa_only", "doppler_only", "black_body_only")
+
+
+def display_name(model_type: str) -> str:
+    """Human-readable label for a model's raw experiment key, for plot titles/legends only."""
+    return MODEL_DISPLAY_NAMES.get(model_type, model_type)
+
+
+# LaTeX-formatted symbol for each internal MHD parameter key, for plot titles only.
+PARAM_LATEX = {"T": r"$T$", "Vz": r"$V_z$", "Bz": r"$B_z$"}
+
+
+def param_latex(param: str) -> str:
+    return PARAM_LATEX.get(param, f"${param}$")
+
+
+def combined_plot_title(param: str, context: str, tau_val: float) -> str:
+    """Shared title format for the combined multi-model comparison figures, e.g.
+    '$B_z$ - Simulation step 198 | $\\log \\tau = -1.00$'."""
+    return f"{param_latex(param)} - {context} | " + r"$\log \tau = " + f"{tau_val:.2f}" + r"$"
+
+
+def combined_plot_title_no_tau(param: str, context: str) -> str:
+    """Same title format as combined_plot_title but without a fixed tau value, for figures
+    where log(tau) is the plot's own X axis (e.g. metric-vs-tau curves), e.g.
+    '$B_z$ - Simulation step 198'."""
+    return f"{param_latex(param)} - {context}"
+
+
+def ordered_models(models: dict) -> list[str]:
+    """Model keys present in `models`, in MODEL_CANONICAL_ORDER, with any unrecognized keys
+    (e.g. lambda-suffixed variants) appended at the end in their original order."""
+    ordered = [m for m in MODEL_CANONICAL_ORDER if m in models]
+    ordered += [m for m in models if m not in MODEL_CANONICAL_ORDER]
+    return ordered
+
+
+def compute_metrics_by_field_strength(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    field_strength: np.ndarray,
+    edges: tuple = FIELD_STRENGTH_BIN_EDGES_G,
+) -> list[dict]:
+    """Regression metrics computed separately within bins of true |B_LOS|.
+
+    Aggregate metrics hide where a model is reliable: a field of view is dominated by weak
+    pixels, so a good overall correlation can coexist with the strong-field regime being
+    badly wrong. `field_strength` is the reference |B_LOS| per pixel (same shape as y_true),
+    and binning on it -- not on the prediction -- keeps the split independent of the model.
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    strength = np.abs(np.asarray(field_strength).ravel())
+
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (strength >= lo) & (strength < hi) & np.isfinite(y_true) & np.isfinite(y_pred)
+        n = int(mask.sum())
+        label = f"{lo:.0f}-{hi:.0f}G" if np.isfinite(hi) else f">{lo:.0f}G"
+        if n == 0:
+            rows.append({"field_bin": label, "bin_lo_G": float(lo), "bin_hi_G": float(hi), "n_points": 0})
+            continue
+        metrics = compute_regression_metrics(y_true[mask], y_pred[mask])
+        metrics.update({"field_bin": label, "bin_lo_G": float(lo), "bin_hi_G": float(hi)})
+        rows.append(metrics)
+    return rows
 
 
 def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -528,7 +618,7 @@ class MuramDiagnosticPlots:
             V_std = V_std_norm * abs(sd_v)
 
         fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-        fig.suptitle(f"{self.model_name} | Final Stokes Profiles: mean ± 1σ", fontsize=13, fontweight="bold")
+        fig.suptitle(f"{display_name(self.model_name)} | Final Stokes Profiles: mean ± 1σ", fontsize=13, fontweight="bold")
 
         axes[0].plot(wl, I_mean, color="tab:orange", linewidth=1.8, label="Mean I")
         axes[0].fill_between(wl, I_mean - I_std, I_mean + I_std, color="tab:orange", alpha=0.25, label="±1σ")
@@ -590,7 +680,7 @@ class MuramDiagnosticPlots:
         ax[2].axis("off")
         plt.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
 
-        fig.suptitle(f"Final Model | {self.model_name} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}")
+        fig.suptitle(f"Final Model | {display_name(self.model_name)} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}")
         fig.tight_layout()
         fig.savefig(self.out_dir / f"{p}_logtau_{od_eff:.2f}_images.png", dpi=170, bbox_inches="tight")
         plt.close(fig)
@@ -626,9 +716,9 @@ class MuramDiagnosticPlots:
         g.ax_joint.set_xlabel("Ground truth")
         g.ax_joint.set_ylabel("Prediction")
         g.fig.suptitle(
-            f"Final Model | {self.model_name} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}\n"
+            f"Final Model | {display_name(self.model_name)} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}\n"
             f"Corr={format_metric(metrics['corr'])}, R²={format_metric(metrics['r2'])}, "
-            f"RRMSE={format_metric(metrics['rrmse'])}, NMAE={format_metric(metrics['nmae'])}",
+            f"RRMSE={format_metric(metrics['rrmse'])}",
             y=1.02,
         )
         g.fig.tight_layout()
@@ -687,6 +777,323 @@ class MuramDiagnosticPlots:
         out = F.interpolate(t, size=target_shape, mode="bilinear", align_corners=False)
         return out.squeeze(0).squeeze(0).cpu().numpy()
 
+
+# ------------------------------------------------------------------------------------------
+# Multi-model comparison plots. Module-level (not methods) because they take N models' worth
+# of data at once, unlike MuramDiagnosticPlots/ModestDiagnosticPlots which are built (or, for
+# MODEST, iterate internally) one model at a time. Both classes call these after their normal
+# per-model loop finishes, once >=2 models are available. Filenames intentionally do not
+# collide with the existing per-model jointplot/images files -- callers put these under a
+# separate "combined/" directory one level above the per-model output dirs.
+# ------------------------------------------------------------------------------------------
+
+def _resize_map_to_shape(arr2d: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """Bilinear-resize a 2D map to target_shape. Same implementation as the per-class
+    _resize_map_to_shape methods (MuramDiagnosticPlots, ModestDiagnosticPlots), duplicated
+    here at module level since these combined-plot functions aren't methods of either class."""
+    if arr2d.shape == target_shape:
+        return arr2d
+    t = torch.from_numpy(arr2d).float().unsqueeze(0).unsqueeze(0)
+    out = F.interpolate(t, size=target_shape, mode="bilinear", align_corners=False)
+    return out.squeeze(0).squeeze(0).cpu().numpy()
+
+
+def plot_combined_jointplot_grid(
+    true_map: np.ndarray,
+    pred_by_model: dict[str, np.ndarray],
+    param: str,
+    title_suffix: str,
+    tau_val: float,
+    save_path: Path,
+    model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+    max_points: int = 20000,
+) -> None:
+    """2x2 grid of ground-truth-vs-prediction scatter panels, one per model, sharing axis
+    limits so the four panels are directly comparable. Built with plain matplotlib rather
+    than sns.jointplot, which always owns its own figure and cannot be embedded in a grid."""
+    plt.rcParams["font.family"] = "serif"
+    models_present = [m for m in model_order if m in pred_by_model]
+    if len(models_present) < 2:
+        return
+
+    x_all = np.asarray(true_map).ravel()
+    x_finite = x_all[np.isfinite(x_all)]
+    xy_by_model: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    paired_by_model: dict[str, bool] = {}
+    metrics_text_by_model: dict[str, str] = {}
+    lo_list, hi_list = [], []
+    for m in models_present:
+        y_raw = np.asarray(pred_by_model[m])
+        if y_raw.shape == np.asarray(true_map).shape:
+            # Same grid as ground truth -- pair pixel-by-pixel, as in the per-model jointplot.
+            y_all = y_raw.ravel()
+            mask = np.isfinite(x_all) & np.isfinite(y_all)
+            x_full, y_full = x_all[mask], y_all[mask]
+            if x_full.size == 0:
+                continue
+            # Metrics are computed on the full paired population, before the plot-only
+            # subsample below -- same convention as ModestDiagnosticPlots._plot_jointplot.
+            metrics_reg = compute_regression_metrics(x_full, y_full)
+            metrics_text_by_model[m] = (
+                f"Corr={format_metric(metrics_reg['corr'])}\n"
+                f"R²={format_metric(metrics_reg['r2'])}\n"
+                f"RRMSE={format_metric(metrics_reg['rrmse'])}"
+            )
+            if x_full.size > max_points:
+                rng = np.random.default_rng(seed=17)
+                idx = rng.choice(x_full.size, size=max_points, replace=False)
+                x, y = x_full[idx], y_full[idx]
+            else:
+                x, y = x_full, y_full
+            paired_by_model[m] = True
+        else:
+            # Resolution mismatch (e.g. MODEST's upsampled prediction grid vs the native
+            # ground-truth grid) -- fall back to matched-quantile comparison, same as
+            # ModestDiagnosticPlots._plot_jointplot does for the single-model plots.
+            y_finite = y_raw[np.isfinite(y_raw)].ravel()
+            if x_finite.size == 0 or y_finite.size == 0:
+                continue
+            metrics_dist = compute_distribution_similarity_metrics(x_finite, y_finite)
+            metrics_text_by_model[m] = (
+                f"KS={format_metric(metrics_dist['ks'])}\n"
+                f"W1q={format_metric(metrics_dist['w1_quantile'])}\n"
+                f"JSD={format_metric(metrics_dist['jsd'])}\n"
+                f"OVL={format_metric(metrics_dist['overlap'])}"
+            )
+            n = min(max_points, x_finite.size, y_finite.size)
+            q = np.linspace(0.0, 1.0, n, endpoint=False) + 0.5 / n
+            x, y = np.quantile(x_finite, q), np.quantile(y_finite, q)
+            paired_by_model[m] = False
+        xy_by_model[m] = (x, y)
+        both = np.concatenate([x, y])
+        lo_list.append(np.nanquantile(both, 0.01))
+        hi_list.append(np.nanquantile(both, 0.99))
+    if not xy_by_model:
+        return
+    lo, hi = float(min(lo_list)), float(max(hi_list))
+
+    # Same annotation style as notebooks/4-modest_data.ipynb's FOV-info box (plot_modest_continuum):
+    # boxstyle='round,pad=0.5', facecolor='white', alpha=0.8.
+    metrics_box_props = dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.8)
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    for ax, m in zip(axes.ravel(), models_present):
+        if m not in xy_by_model:
+            ax.axis("off")
+            continue
+        x, y = xy_by_model[m]
+        ax.scatter(x, y, s=6, alpha=0.25, color="tab:blue", edgecolors="none")
+        ax.plot([lo, hi], [lo, hi], "r--", lw=1.2)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_title(display_name(m), fontsize=14)
+        if paired_by_model[m]:
+            ax.set_xlabel("Ground truth", fontsize=12)
+            ax.set_ylabel("Prediction", fontsize=12)
+        else:
+            ax.set_xlabel("Ground truth (quantiles)", fontsize=12)
+            ax.set_ylabel("Prediction (quantiles)", fontsize=12)
+        ax.tick_params(labelsize=11)
+        ax.grid(True, alpha=0.25)
+        if m in metrics_text_by_model:
+            ax.text(
+                0.05, 0.95, metrics_text_by_model[m], transform=ax.transAxes, fontsize=10,
+                verticalalignment="top", bbox=metrics_box_props,
+            )
+
+    fig.suptitle(combined_plot_title(param, title_suffix, tau_val), fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_combined_images_grid(
+    true_map: np.ndarray,
+    pred_by_model: dict[str, np.ndarray],
+    param: str,
+    title_suffix: str,
+    tau_val: float,
+    save_path: Path,
+    model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+    transpose: bool = True,
+) -> None:
+    """2-row x (1 + N-model)-column comparison figure: column 1 is Ground Truth (row 0 only;
+    row 1 under it is left blank); each subsequent column is one model, with its prediction on
+    top and its (signed) error below. Ground truth/predictions share one color scale; all
+    models' error panels share one symmetric scale, so colors are comparable across models, not
+    just within one. Colorbars live in their own dedicated narrow columns (not appended to an
+    image axis via make_axes_locatable) so every image panel -- GT and all N models' predictions/
+    errors -- gets the exact same GridSpec cell; set_box_aspect(panel_aspect) then locks each to
+    an identical box matching the region's true height/width ratio (not forced square -- MODEST
+    crops like plage/negative_region/whole are naturally elongated rectangles, not squares)."""
+    plt.rcParams["font.family"] = "serif"
+    models_present = [m for m in model_order if m in pred_by_model]
+    if len(models_present) < 2:
+        return
+
+    param_cmaps = {"T": "hot", "Vz": "bwr_r", "Bz": "PiYG"}
+    cmap = param_cmaps.get(param, "viridis")
+
+    true_arr = np.asarray(true_map)
+    # Ground truth and predictions can live on different native grids (e.g. MODEST's
+    # upsampled prediction grid vs the native GT grid) -- resize GT to the prediction
+    # resolution before computing errors, same convention as the per-model plots
+    # (MuramDiagnosticPlots.generate's "Align GT to pred resolution").
+    pred_shape = next((np.asarray(pred_by_model[m]).shape for m in models_present), true_arr.shape)
+    if true_arr.shape != pred_shape:
+        true_arr = _resize_map_to_shape(true_arr.astype(np.float32), pred_shape)
+
+    gt = true_arr.T if transpose else true_arr
+    panel_h, panel_w = gt.shape[:2]
+    panel_aspect = (panel_h / panel_w) if panel_w else 1.0
+    preds: dict[str, np.ndarray] = {}
+    errs: dict[str, np.ndarray | None] = {}
+    for m in models_present:
+        p = np.asarray(pred_by_model[m])
+        p = p.T if transpose else p
+        preds[m] = p
+        errs[m] = (p - gt) if p.shape == gt.shape else None
+
+    # Color scale is calibrated to Ground Truth's OWN value range, not GT+predictions combined
+    # -- GT should always render at full contrast, while a model whose predictions exceed that
+    # range shows as saturated color, which is itself informative (it flags over/under-shoot
+    # relative to the true physical range).
+    finite_gt = gt[np.isfinite(gt)]
+    if finite_gt.size == 0:
+        vmin, vmax = 0.0, 1.0
+    elif param in ("Vz", "Bz"):
+        vmax = float(np.nanquantile(np.abs(finite_gt), 0.99))
+        vmin = -vmax
+    else:
+        vmin, vmax = (float(v) for v in np.nanquantile(finite_gt, [0.01, 0.99]))
+
+    err_vals = [e[np.isfinite(e)] for e in errs.values() if e is not None]
+    emax = float(np.nanquantile(np.abs(np.concatenate(err_vals)), 0.99)) if err_vals else 1.0
+
+    n_models = len(models_present)
+    # Columns: [gt colorbar | GT | model_1 | ... | model_N | error colorbar]. GT and the N
+    # model columns all share width_ratio 1.0 so they're identically sized; the colorbar
+    # columns are narrow slivers that don't steal space from any image panel.
+    n_cols = n_models + 3
+    width_ratios = [0.05] + [1.0] * (n_models + 1) + [0.05]
+    col_width_in = 2.6
+    fig_width = col_width_in * (n_models + 1) + 1.0
+    fig_height = col_width_in * panel_aspect * 2 + 0.9
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    gs = GridSpec(2, n_cols, figure=fig, width_ratios=width_ratios, hspace=0.12, wspace=0.12)
+
+    ax_gt = fig.add_subplot(gs[0, 1])
+    ax_gt.set_box_aspect(panel_aspect)
+    im_gt = ax_gt.imshow(gt, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_gt.set_title("Ground Truth", fontsize=14)
+    ax_gt.set_xticks([])
+    ax_gt.set_yticks([])
+
+    cax_gt = fig.add_subplot(gs[0, 0])
+    cbar_gt = plt.colorbar(im_gt, cax=cax_gt)
+    cax_gt.yaxis.set_ticks_position("left")
+    cax_gt.yaxis.set_label_position("left")
+    cbar_gt.ax.tick_params(labelsize=10)
+
+    last_err_im = None
+    for col, m in enumerate(models_present, start=2):
+        ax_pred = fig.add_subplot(gs[0, col])
+        ax_pred.set_box_aspect(panel_aspect)
+        ax_pred.imshow(preds[m], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax_pred.set_title(display_name(m), fontsize=14)
+        ax_pred.set_xticks([])
+        ax_pred.set_yticks([])
+
+        ax_err = fig.add_subplot(gs[1, col])
+        ax_err.set_box_aspect(panel_aspect)
+        if errs[m] is not None:
+            last_err_im = ax_err.imshow(errs[m], origin="lower", cmap="RdBu_r", vmin=-emax, vmax=emax)
+        else:
+            ax_err.text(0.5, 0.5, "shape\nmismatch", ha="center", va="center",
+                        transform=ax_err.transAxes, fontsize=10)
+        ax_err.set_xticks([])
+        ax_err.set_yticks([])
+        if col == 2:
+            ax_pred.set_ylabel("", fontsize=13)
+            ax_err.set_ylabel("Error", fontsize=13)
+
+    if last_err_im is not None:
+        cax_err = fig.add_subplot(gs[1, n_cols - 1])
+        cbar_err = plt.colorbar(last_err_im, cax=cax_err)
+        cbar_err.set_label("Pred - GT", fontsize=11)
+        cbar_err.ax.tick_params(labelsize=10)
+
+    fig.suptitle(combined_plot_title(param, title_suffix, tau_val), fontsize=16, fontweight="bold")
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def compute_metric_vs_tau(
+    tau_and_maps: list[tuple[float, np.ndarray, np.ndarray]],
+) -> dict[str, np.ndarray]:
+    """Per-tau RRMSE and Corr between a true map and a predicted map, one point per optical
+    depth. tau_and_maps: (tau_val, true_map, pred_map) triples, any order -- sorted by tau_val
+    here. compute_regression_metrics requires true_map/pred_map to share shape (it does
+    elementwise np.isfinite masking), so a shape mismatch at a given tau (e.g. a MODEST region
+    run without --downsample-prediction-input) yields NaN there rather than raising."""
+    ordered = sorted(tau_and_maps, key=lambda t: t[0])
+    taus = np.array([t[0] for t in ordered], dtype=float)
+    rrmse = np.full(len(ordered), np.nan)
+    corr = np.full(len(ordered), np.nan)
+    for i, (_, true_map, pred_map) in enumerate(ordered):
+        true_map = np.asarray(true_map)
+        pred_map = np.asarray(pred_map)
+        if true_map.shape != pred_map.shape:
+            continue
+        m = compute_regression_metrics(true_map, pred_map)
+        rrmse[i] = m["rrmse"]
+        corr[i] = m["corr"]
+    return {"tau": taus, "rrmse": rrmse, "corr": corr}
+
+
+_METRIC_VS_TAU_LABELS = {"rrmse": "RRMSE", "corr": "Corr"}
+
+
+def plot_metric_vs_tau(
+    param: str,
+    metric_key: str,
+    metrics_by_model: dict[str, dict[str, np.ndarray]],
+    title_suffix: str,
+    save_path: Path,
+    model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+) -> None:
+    """Single-panel, single-paper-column figure (~3.4in wide): one metric_key ("rrmse" or
+    "corr") vs log(tau), one line+marker per model. Kept as a single-metric figure per file
+    (rather than a combined multi-metric panel) so RRMSE and Corr can be placed independently
+    in the paper layout. Font sizes are reduced (~8-9pt axes, ~7-8pt legend) for legibility at
+    that print size."""
+    plt.rcParams["font.family"] = "serif"
+    models_present = [m for m in model_order if m in metrics_by_model]
+    if not models_present:
+        return
+
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
+    for m in models_present:
+        d = metrics_by_model[m]
+        ax.plot(d["tau"], d[metric_key], marker="o", ms=3, lw=1.2, label=display_name(m))
+
+    ax.set_xlabel(r"$\log \tau$", fontsize=9)
+    ax.set_ylabel(_METRIC_VS_TAU_LABELS.get(metric_key, metric_key), fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(True, alpha=0.3)
+    # Below the x-axis, not "best" -- with 4 lines "best" placement can land on top of the
+    # data itself (e.g. correlation curves that cross near the legend's preferred corner).
+    ax.legend(fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.22), frameon=False)
+    ax.set_title(combined_plot_title_no_tau(param, title_suffix), fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 class ModestDiagnosticPlots:
     def __init__(
         self,
@@ -715,6 +1122,8 @@ class ModestDiagnosticPlots:
         self.n_tau_eff = None
         self.tau_indices = None
         self.metrics_rows: list[dict[str, float | str | int]] = []
+        # Same comparisons as metrics_rows, split by the true |B_LOS| of each pixel.
+        self.field_metrics_rows: list[dict[str, float | str | int]] = []
         self.modest_wavelength: np.ndarray | None = None
 
     @staticmethod
@@ -865,7 +1274,29 @@ class ModestDiagnosticPlots:
 
         return calibrated, applied_by_pred_idx
 
+    def _write_field_strength_metrics_csv(self, model_type: str, out_root: Path) -> None:
+        """Companion to metrics_summary.csv, split by the true |B_LOS| of each pixel.
+
+        Lets the range of applicability be read off directly: MURaM steps 110-130 have
+        plenty of pixels below ~500 G, few above ~950 G, and none above 1500 G, while the
+        sunspot crops reach 3.7 kG -- so the high-field rows show extrapolation, not skill.
+        """
+        rows = [r for r in self.field_metrics_rows if r.get("model") == model_type]
+        if not rows:
+            return
+        field_path = out_root / "metrics_by_field_strength.csv"
+        fieldnames = [
+            "model", "param", "logtau", "field_bin", "bin_lo_G", "bin_hi_G",
+            "n_points", "corr", "r2", "rmse", "rrmse", "mae", "nmae", "bias",
+        ]
+        with open(field_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[{model_type}] Range-of-applicability metrics saved to: {field_path}")
+
     def _write_metrics_csv(self, model_type: str, out_root: Path) -> None:
+        self._write_field_strength_metrics_csv(model_type, out_root)
         rows = [r for r in self.metrics_rows if r.get("model") == model_type]
         if not rows:
             return
@@ -1035,7 +1466,7 @@ class ModestDiagnosticPlots:
             comparison = "paired_pixel"
             title_metrics = (
                 f"paired | Corr={format_metric(metrics_reg['corr'])}, R²={format_metric(metrics_reg['r2'])}, "
-                f"RRMSE={format_metric(metrics_reg['rrmse'])}, NMAE={format_metric(metrics_reg['nmae'])}"
+                f"RRMSE={format_metric(metrics_reg['rrmse'])}"
             )
         else:
             x = true_2d[np.isfinite(true_2d)].ravel()
@@ -1142,7 +1573,7 @@ class ModestDiagnosticPlots:
             V_std = V_std_norm * abs(sd_v)
 
         fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-        fig.suptitle(f"{model_type} | MODEST Stokes Profiles: mean ± 1σ", fontsize=13, fontweight="bold")
+        fig.suptitle(f"{display_name(model_type)} | MODEST Stokes Profiles: mean ± 1σ", fontsize=13, fontweight="bold")
 
         axes[0].plot(wl, I_mean, color="tab:orange", linewidth=1.8, label="Mean I")
         axes[0].fill_between(wl, I_mean - I_std, I_mean + I_std, color="tab:orange", alpha=0.25, label="±1σ")
@@ -1165,6 +1596,11 @@ class ModestDiagnosticPlots:
     def run(self, model_configs, models):
         calibration_mode = self._temperature_calibration_mode()
         print(f"Temperature calibration mode: {calibration_mode}")
+        # Accumulated across the per-model loop below so the combined multi-model figures
+        # (built after the loop) have every model's prediction available at once -- each
+        # iteration otherwise overwrites pred_mhd/matches before the next model is loaded.
+        pred_mhd_by_model: dict[str, dict[str, np.ndarray]] = {}
+        matches_by_model: dict[str, list[tuple[float, int, int]]] = {}
         for name, model in models.items():
             model_type = model_configs[name]["experiment_key"]
             pred_tau = self.pipeline.get_model_logtau_values(model_configs[name])
@@ -1186,10 +1622,25 @@ class ModestDiagnosticPlots:
                 pred_ny=self.pred_ny,
                 batch_size=self.args.inference_batch_size,
             )
-            if bool(getattr(self.args, "modest_pred_mhd_invert_sign", False)):
+            # Sign conventions for V_LOS and B_LOS are independent: velocity sign follows the
+            # Doppler direction convention, field sign follows the circular-polarization
+            # convention, and the two do not have to disagree with the reference in the same
+            # way. The original flag flipped both together, which forces a choice that is
+            # wrong for one of them whenever only one needs flipping. Per-parameter flags now
+            # take precedence; the combined flag still applies to whichever is not set
+            # individually, so existing commands keep working.
+            invert_both = bool(getattr(self.args, "modest_pred_mhd_invert_sign", False))
+            invert_vz = getattr(self.args, "modest_pred_vlos_invert_sign", None)
+            invert_bz = getattr(self.args, "modest_pred_blos_invert_sign", None)
+            invert_vz = invert_both if invert_vz is None else bool(invert_vz)
+            invert_bz = invert_both if invert_bz is None else bool(invert_bz)
+            if invert_vz:
                 pred_mhd["Vz"] = -pred_mhd["Vz"]
+            if invert_bz:
                 pred_mhd["Bz"] = -pred_mhd["Bz"]
-                print(f"[{model_type}] Applied predicted MHD sign inversion for Vz and Bz.")
+            if invert_vz or invert_bz:
+                flipped = ", ".join(n for n, f in (("V_LOS", invert_vz), ("B_LOS", invert_bz)) if f)
+                print(f"[{model_type}] Applied predicted MHD sign inversion for {flipped}.")
             out_root = self.modest_output_dir / model_type
             self._plot_stokes_mean_std(model_type=model_type, out_root=out_root)
             cal_path = self._temperature_calibration_path(model_type=model_type, out_root=out_root)
@@ -1223,6 +1674,9 @@ class ModestDiagnosticPlots:
                     )
                     calibration_source = str(cal_path)
 
+            pred_mhd_by_model[model_type] = pred_mhd
+            matches_by_model[model_type] = matches
+
             surface_dir = out_root / "surface"
             joint_dir = out_root / "jointplots"
             surface_dir.mkdir(parents=True, exist_ok=True)
@@ -1237,7 +1691,7 @@ class ModestDiagnosticPlots:
                         continue
                     true_map = true_cube[:, :, i_mod]
                     pred_map = pred_cube[:, :, i_pred]
-                    plot_title = f"{model_type} | {param} | matched log(tau)={tau_val:.2f}"
+                    plot_title = f"{display_name(model_type)} | {param} | matched log(tau)={tau_val:.2f}"
                     if param == "T" and calibration_mode == "apply_fit":
                         if applied_by_tau_idx.get(i_pred) is not None:
                             plot_title += " | post-calibrated (apply_fit)"
@@ -1257,6 +1711,21 @@ class ModestDiagnosticPlots:
                         title=plot_title,
                         save_path=joint_dir / f"{param}_tau_{tau_val:+.2f}_jointplot.png",
                     )
+                    # Range-of-applicability breakdown: same comparison, split by the true
+                    # |B_LOS| of each pixel, so the strong-field regime (where MURaM has few
+                    # or no training pixels) is reported separately instead of being diluted
+                    # by the weak-field majority. Reference strength is SPINOR's own B_LOS,
+                    # so the split never depends on the model being evaluated.
+                    if true_map.shape == pred_map.shape:
+                        ref_bz = self.modest_mhd_data["Bz"][:, :, i_mod]
+                        for row in compute_metrics_by_field_strength(true_map, pred_map, ref_bz):
+                            self.field_metrics_rows.append({
+                                "model": model_type,
+                                "param": param,
+                                "logtau": float(tau_val),
+                                **row,
+                            })
+
                     if metrics_out is not None:
                         metrics, comparison = metrics_out
                         cal_info = applied_by_tau_idx.get(i_pred) if param == "T" else None
@@ -1293,3 +1762,82 @@ class ModestDiagnosticPlots:
                 self._write_metrics_csv(model_type=model_type, out_root=out_root)
             else:
                 print(f"[{model_type}] No images were saved.")
+
+        # Combined multi-model comparison figures (Ground Truth + one prediction/error column
+        # per model), one per (param, tau) -- only meaningful with 2+ models, matching the
+        # auto-trigger convention already used for cross-model comparison elsewhere
+        # (tools/run_nicole_synthesis.sh's steps 4-5).
+        if len(pred_mhd_by_model) >= 2:
+            combined_dir = self.modest_output_dir / "combined"
+            # Only compare taus present in every model's own matches -- in this project all
+            # four checkpoints share one 45-level tau grid, so this is normally just the full
+            # set, but a model with a different predicted grid would otherwise silently
+            # misalign columns.
+            common_tau_vals = None
+            for m_matches in matches_by_model.values():
+                taus = {round(float(t), 6) for t, _, _ in m_matches}
+                common_tau_vals = taus if common_tau_vals is None else (common_tau_vals & taus)
+            common_tau_vals = sorted(common_tau_vals or set())
+
+            any_matches = next(iter(matches_by_model.values()))
+            i_mod_by_tau = {round(float(t), 6): i_mod for t, i_mod, _ in any_matches}
+
+            for param in ("T", "Vz", "Bz"):
+                true_cube = self.modest_mhd_data[param]
+                for tau_r in common_tau_vals:
+                    i_mod = i_mod_by_tau[tau_r]
+                    if i_mod >= true_cube.shape[2]:
+                        continue
+                    true_map = true_cube[:, :, i_mod]
+                    pred_by_model: dict[str, np.ndarray] = {}
+                    for m, m_matches in matches_by_model.items():
+                        i_pred = next((ip for t, im, ip in m_matches if round(float(t), 6) == tau_r), None)
+                        pred_cube = pred_mhd_by_model[m][param]
+                        if i_pred is None or i_pred >= pred_cube.shape[2]:
+                            continue
+                        pred_by_model[m] = pred_cube[:, :, i_pred]
+                    region_label = str(getattr(self.args, "crop_label", "") or "whole").replace("_", " ")
+                    title_context = f"MODEST - {region_label.capitalize()}"
+                    plot_combined_jointplot_grid(
+                        true_map=true_map,
+                        pred_by_model=pred_by_model,
+                        param=param,
+                        title_suffix=title_context,
+                        tau_val=tau_r,
+                        save_path=combined_dir / f"{param}_tau_{tau_r:+.2f}_combined_jointplot.png",
+                    )
+                    plot_combined_images_grid(
+                        true_map=true_map,
+                        pred_by_model=pred_by_model,
+                        param=param,
+                        title_suffix=title_context,
+                        tau_val=tau_r,
+                        save_path=combined_dir / f"{param}_tau_{tau_r:+.2f}_combined_images.png",
+                    )
+
+            # Metric-vs-log(tau) summary curves, one line per model. MODEST's real ground truth
+            # only has a handful of native optical-depth nodes (the SPINOR inversion's own
+            # levels), so each line has as many points as that model's own matches -- not the
+            # 45-level grid MURaM's version gets.
+            for param in ("T", "Vz", "Bz"):
+                true_cube = self.modest_mhd_data[param]
+                metrics_by_model = {}
+                for m, m_matches in matches_by_model.items():
+                    pred_cube = pred_mhd_by_model[m][param]
+                    tau_and_maps = [
+                        (float(tau_val), true_cube[:, :, i_mod], pred_cube[:, :, i_pred])
+                        for tau_val, i_mod, i_pred in m_matches
+                        if i_mod < true_cube.shape[2] and i_pred < pred_cube.shape[2]
+                    ]
+                    metrics_by_model[m] = compute_metric_vs_tau(tau_and_maps)
+                region_label = str(getattr(self.args, "crop_label", "") or "whole").replace("_", " ")
+                title_context = f"MODEST - {region_label.capitalize()}"
+                for metric_key in ("rrmse", "corr"):
+                    plot_metric_vs_tau(
+                        param=param,
+                        metric_key=metric_key,
+                        metrics_by_model=metrics_by_model,
+                        title_suffix=title_context,
+                        save_path=combined_dir / f"{param}_{metric_key}_vs_tau.png",
+                    )
+            print(f"Combined multi-model figures saved to: {combined_dir}")

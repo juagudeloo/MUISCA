@@ -2,6 +2,7 @@ import os
 import sys
 sys.path.append("/scratchsan/observatorio/juagudeloo/MUISCA/")
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -15,34 +16,65 @@ from scripts.base_training import TrainingConfig
 PLAGE_CROP_BOUNDS = (0,100,400, 600)  # X_MIN, X_MAX, Y_MIN, Y_MAX
 
 
+def _build_regions_to_run(args) -> list[tuple[str, tuple[int, int, int, int] | None]]:
+    """(label, bounds) pairs to process this run, bounds=None meaning the whole scene.
+
+    With --regions-json: one or more named regions in a single process (model loading and
+    normalizer setup happen once in main(), not per region -- that's the expensive part).
+    --include-whole additionally prepends "whole". Without --regions-json: unchanged
+    single-region behavior via --cropped-region/--crop-bounds/--crop-label, for backward
+    compatibility with existing commands.
+    """
+    if not args.regions_json:
+        if args.cropped_region:
+            crop_label = args.crop_label.strip()
+            if not crop_label:
+                raise ValueError("--crop-label must be a non-empty string when --cropped-region is set.")
+            return [(crop_label, tuple(int(v) for v in args.crop_bounds))]
+        return [("whole", None)]
+
+    regions = json.loads(args.regions_json)
+    if not isinstance(regions, dict) or not regions:
+        raise ValueError(
+            "--regions-json must be a non-empty JSON object of {\"label\": [y0, y1, x0, x1], ...} "
+            f"(same bounds order as ModestData.extract_region), got: {args.regions_json!r}"
+        )
+    regions_to_run: list[tuple[str, tuple[int, int, int, int] | None]] = []
+    for label, bounds in regions.items():
+        if len(bounds) != 4:
+            raise ValueError(f"Region '{label}' bounds must have exactly 4 integers, got {bounds}")
+        regions_to_run.append((label, tuple(int(v) for v in bounds)))
+    if args.include_whole:
+        regions_to_run.insert(0, ("whole", None))
+    return regions_to_run
+
+
 # -----------------------------------------------------------------------------
 # Main MODEST analysis flow
-# - selects cropped or whole-region output layout
-# - loads trained models and MODEST observations
-# - prepares model inputs from MODEST data
-# - writes region diagnostics, joint plots, and Stokes summaries
+# - builds the list of regions to process (one, by default, or many via --regions-json)
+# - loads trained models and normalizers ONCE, reused across every region below
+# - for each region: loads that region's MODEST snapshot, runs inference, writes
+#   diagnostics, joint plots, Stokes summaries, and (with 2+ models) the combined
+#   multi-model comparison figures
 # -----------------------------------------------------------------------------
 def main(args):
     # Pick GPU when available; otherwise fall back to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     modest_base_dir = Path("/scratchsan/observatorio/juagudeloo/MUISCA/images/analysis/modest")
 
-    # Choose where MODEST diagnostics should be written based on the crop flag.
-    if args.cropped_region:
-        crop_label = args.crop_label.strip()
-        if not crop_label:
-            raise ValueError("--crop-label must be a non-empty string when --cropped-region is set.")
-        modest_output_dir = modest_base_dir / "cropped" / crop_label
-    else:
-        modest_output_dir = modest_base_dir / "whole"
+    regions_to_run = _build_regions_to_run(args)
+    print(f"Regions to process ({len(regions_to_run)}): {[label for label, _ in regions_to_run]}")
 
+    # Model loading and normalizer setup are the expensive parts of this pipeline -- done once
+    # here, then reused for every region in the loop below. AnalysisModelPipeline.output_dir is
+    # only consumed by build_runtime_training_config() (MURaM-only, see muram_analysis.py), so
+    # it does not need to be region-specific here.
     pipeline = AnalysisModelPipeline(
         device=device,
-        output_dir=modest_output_dir,
+        output_dir=modest_base_dir,
         experiment_root=args.experiment_root,
+        experiments_base_dir=args.experiments_base_dir,
     )
-
-    # Load the trained model checkpoints and determine their shared tau grid.
     model_configs, models, n_tau = pipeline.prepare_models(args.model_types)
     print(f"Using device: {device}")
     print(f"Number of log(tau) points: {n_tau}")
@@ -53,7 +85,6 @@ def main(args):
     for _, cfg in model_configs.items():
         print(f"  - {cfg['label']} ({cfg['experiment_key']})")
 
-    # Normalizers are loaded once and reused for every model.
     mhd_normalizer = MhdNormalizer()
     stokes_normalizer = StokesNormalizer()
     default_cfg = TrainingConfig()
@@ -71,20 +102,32 @@ def main(args):
         modest_cache.clear(confirm=False)
     modest_cache.print_cache_info()
 
-    # Diagnostic helper does the per-model plotting and metrics writing.
-    diagnostics = ModestDiagnosticPlots(
-        pipeline=pipeline,
-        modest_output_dir=modest_output_dir,
-        mhd_normalizer=mhd_normalizer,
-        stokes_normalizer=stokes_normalizer,
-        modest=modest,
-        modest_cache=modest_cache,
-        args=args,
-    )
-    diagnostics.prepare_snapshot(n_tau=n_tau)
-    diagnostics.run(model_configs=model_configs, models=models)
+    for label, bounds in regions_to_run:
+        modest_output_dir = modest_base_dir / "whole" if bounds is None else modest_base_dir / "cropped" / label
+        print(f"\n=== Region: {label} ({'whole scene' if bounds is None else bounds}) ===")
 
-    print(f"\nFinished analysis for {modest_output_dir}")
+        # ModestDiagnosticPlots.prepare_snapshot() reads crop settings straight off `args`, so
+        # they're set here per region before constructing it -- everything else it takes
+        # (pipeline, normalizers, modest loader, cache) is the same shared instance every time.
+        args.cropped_region = bounds is not None
+        if bounds is not None:
+            args.crop_bounds = bounds
+        args.crop_label = label
+
+        diagnostics = ModestDiagnosticPlots(
+            pipeline=pipeline,
+            modest_output_dir=modest_output_dir,
+            mhd_normalizer=mhd_normalizer,
+            stokes_normalizer=stokes_normalizer,
+            modest=modest,
+            modest_cache=modest_cache,
+            args=args,
+        )
+        diagnostics.prepare_snapshot(n_tau=n_tau)
+        diagnostics.run(model_configs=model_configs, models=models)
+        print(f"Finished analysis for {modest_output_dir}")
+
+    print(f"\nFinished analysis for {len(regions_to_run)} region(s).")
 
 if __name__ == "__main__":
     # CLI arguments mirror the training and data-loading choices used during analysis.
@@ -94,12 +137,29 @@ if __name__ == "__main__":
         action='store_true',
         help='whether to use cropped region (default: False)')   
     parser.add_argument(
-        '--crop-bounds', 
-        nargs=4, 
-        type=int, 
+        '--crop-bounds',
+        nargs=4,
+        type=int,
         default=PLAGE_CROP_BOUNDS,
         metavar=('X_MIN', 'X_MAX', 'Y_MIN', 'Y_MAX'),
         help=f'bounds for cropping the region (default plage bounds: {PLAGE_CROP_BOUNDS})'
+    )
+    parser.add_argument(
+        '--regions-json', '--regions_json',
+        dest='regions_json',
+        type=str,
+        default=None,
+        help='Process several regions in one run: a JSON object {"label": [y0,y1,x0,x1], ...} '
+             '(same bounds order as ModestData.extract_region). Overrides --cropped-region/'
+             '--crop-bounds/--crop-label when given -- models and normalizers are loaded once '
+             'and reused for every region.',
+    )
+    parser.add_argument(
+        '--include-whole', '--include_whole',
+        dest='include_whole',
+        action='store_true',
+        help='With --regions-json, also process the whole (uncropped) scene alongside the '
+             'listed regions.',
     )
     parser.add_argument(
         '--polarization-mask',
@@ -150,7 +210,33 @@ if __name__ == "__main__":
         '--modest-pred-mhd-invert-sign', '--modest_pred_mhd_invert_sign',
         dest='modest_pred_mhd_invert_sign',
         action='store_true',
-        help='invert predicted MODEST V_LOS and B_LOS signs before region/joint plotting',
+        help='invert BOTH predicted MODEST V_LOS and B_LOS signs. Kept for existing commands; '
+             'the per-parameter flags below override it and are usually what you want, since '
+             'the velocity and field sign conventions are independent.',
+    )
+    parser.add_argument(
+        '--modest-pred-vlos-invert-sign', '--modest_pred_vlos_invert_sign',
+        dest='modest_pred_vlos_invert_sign',
+        action='store_const', const=True, default=None,
+        help='invert only the predicted V_LOS sign (overrides --modest-pred-mhd-invert-sign)',
+    )
+    parser.add_argument(
+        '--modest-pred-vlos-keep-sign', '--modest_pred_vlos_keep_sign',
+        dest='modest_pred_vlos_invert_sign',
+        action='store_const', const=False,
+        help='keep the predicted V_LOS sign even when --modest-pred-mhd-invert-sign is given',
+    )
+    parser.add_argument(
+        '--modest-pred-blos-invert-sign', '--modest_pred_blos_invert_sign',
+        dest='modest_pred_blos_invert_sign',
+        action='store_const', const=True, default=None,
+        help='invert only the predicted B_LOS sign (overrides --modest-pred-mhd-invert-sign)',
+    )
+    parser.add_argument(
+        '--modest-pred-blos-keep-sign', '--modest_pred_blos_keep_sign',
+        dest='modest_pred_blos_invert_sign',
+        action='store_const', const=False,
+        help='keep the predicted B_LOS sign even when --modest-pred-mhd-invert-sign is given',
     )
     parser.add_argument(
         '--model-types', '--model_types',
@@ -163,6 +249,12 @@ if __name__ == "__main__":
         type=str,
         default='experiment_80_to_113',
         help='Experiment folder under output/experiments (e.g., experiment_112_to_113)',
+    )
+    parser.add_argument(
+        '--experiments-base-dir', '--experiments_base_dir', dest='experiments_base_dir',
+        type=str, default=None,
+        help='Directory holding <experiment-root>/ (default: output/experiments). Point at '
+             'output/fine-tune to analyze fine-tuned checkpoints.',
     )
     parser.add_argument(
         '--crop-label',

@@ -1,3 +1,7 @@
+paper_MUISCA/
+papers/
+.muram_cache_nicole_tau500/
+.muram_balanced_cache_nicole_tau500/
 poster/
 output/
 *.tar.gz
@@ -200,3 +204,5 @@ data/*
 !data/normalization_stats
 data/normalization_stats/*
 !data/normalization_stats/*.json
+mlruns.db
+mlruns/

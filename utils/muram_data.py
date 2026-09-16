@@ -11,6 +11,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib.patches as patches
 from scipy.ndimage import convolve1d
 from scipy.interpolate import RegularGridInterpolator, interp1d
+from utils.hinode_wavelengths import hinode_wavelength_grid
 from scipy.integrate import cumulative_trapezoid
 import torch
 from torch.utils.data import Dataset
@@ -965,21 +966,51 @@ class StokesData:
         print("  Done.")
         return self.data
 
-    def resample_to_hinode(self, hinode_params: Optional[Dict] = None) -> Dict[str, np.ndarray]:
+    def resample_to_hinode(self, hinode_wl: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+        """Resample the synthesized profiles onto the Hinode/SOT-SP spectral grid.
+
+        The grid defaults to utils.hinode_wavelengths.hinode_wavelength_grid(), i.e.
+        it is derived from the MODEST FITS header -- the same axis the real
+        observations are loaded on. Pass `hinode_wl` only to override with an
+        explicit array.
+
+        This used to build the grid from a hardcoded
+        CRVAL1=6302.0/CDELT1=0.0215/CRPIX1=57 triple, which yielded
+        [6300.7960, 6303.1825] A while the observations were loaded on
+        [6300.8736, 6303.2576] A. That 0.0776 A disagreement (~3.6 spectral
+        pixels) made every model trained here read a spurious ~3.7 km/s
+        blueshift when applied to real MODEST data.
+        """
         if not self.data:
             raise ValueError("No Stokes data available. Call load_stokes() first.")
-        if hinode_params is None:
-            hinode_params = {
-                "NAXIS1": 112,
-                "CRVAL1": 6302.0,
-                "CDELT1": 0.0215,
-                "CRPIX1": 57
-            }
-        NAXIS1 = hinode_params["NAXIS1"]
-        CRVAL1 = hinode_params["CRVAL1"]
-        CDELT1 = hinode_params["CDELT1"]
-        CRPIX1 = hinode_params["CRPIX1"]
-        self.hinode_wl = CRVAL1 + (np.arange(1, NAXIS1 + 1) - CRPIX1) * CDELT1
+        if hinode_wl is None:
+            hinode_wl = hinode_wavelength_grid()
+        self.hinode_wl = np.asarray(hinode_wl, dtype=np.float64)
+        NAXIS1 = int(self.hinode_wl.size)
+
+        # Guard the invariant that was silently violated before: the axis training
+        # data is resampled onto MUST be the FITS-derived axis the observations are
+        # loaded on. Any reintroduced hardcoded grid fails loudly here instead of
+        # quietly biasing V_LOS by ~3.7 km/s.
+        canonical = hinode_wavelength_grid(NAXIS1)
+        assert np.allclose(self.hinode_wl, canonical, atol=1e-9), (
+            "Hinode resample grid does not match the MODEST FITS-derived axis.\n"
+            f"  got       : [{self.hinode_wl[0]:.4f}, {self.hinode_wl[-1]:.4f}] ({NAXIS1} pts)\n"
+            f"  canonical : [{canonical[0]:.4f}, {canonical[-1]:.4f}] ({canonical.size} pts)\n"
+            f"  max offset: {np.max(np.abs(self.hinode_wl - canonical)):.4e} A "
+            f"(~{3e5 * np.max(np.abs(self.hinode_wl - canonical)) / 6302.0:.3f} km/s of spurious Doppler shift)\n"
+            "Get the axis from utils.hinode_wavelengths, never from hardcoded "
+            "CRVAL1/CDELT1/CRPIX1 values."
+        )
+        # The synthesis grid must bracket the target grid, or the cubic interpolation
+        # below would extrapolate (silently, for out-of-range points).
+        src = np.asarray(self.wl, dtype=np.float64)
+        assert src[0] <= self.hinode_wl[0] and src[-1] >= self.hinode_wl[-1], (
+            f"Synthesis grid [{src[0]:.4f}, {src[-1]:.4f}] A does not cover the target "
+            f"Hinode grid [{self.hinode_wl[0]:.4f}, {self.hinode_wl[-1]:.4f}] A; "
+            "resampling would extrapolate. Widen the synthesis wavelength range."
+        )
+
         print(f"Resampling to Hinode/SP wavelengths...")
         print(f"  {NAXIS1} wavelength points from {self.hinode_wl[0]:.4f} to {self.hinode_wl[-1]:.4f} Å")
         for key in self.data.keys():
@@ -1232,6 +1263,59 @@ def build_balanced_region_indices(
     }
 
 
+def build_bz_balance_bin_edges(
+    scores: np.ndarray,
+    n_bins: int = 12,
+    balance_cap: Optional[float] = None,
+    bin_scale: str = "log",
+) -> Tuple[np.ndarray, float]:
+    """Bin edges for |B_LOS|-strength balancing. Returns (edges, cap).
+
+    Shared by the per-step and global balancers so the two cannot drift apart.
+
+    `bin_scale` matters more than it looks, because MURaM's |Bz| spans four decades with
+    ~90% of pixels under 100 G:
+      - "linear": edges evenly spaced to the max. Nearly every pixel lands in bin 0 and the
+        top bins hold single pixels -- the original scheme, which collapsed the selection to
+        ~96 of 691k pixels.
+      - "quantile": every bin holds the same count, so almost every BIN sits in the weak
+        regime (11 of 13 below 93 G here) and the 100-900 G range the sunspot crops need is
+        squeezed into one already-full bin. Balancing then barely shifts the distribution.
+      - "log" (default): edges spread across the dynamic range, so the decades that matter
+        each get their own bin. This is the one that actually moves the p90 the model sees
+        from ~88 G to ~320 G.
+    All variants cap the top edge at `balance_cap` (default p99.9) and lump everything above
+    it into the final bin, bounding how far the scheme reaches into the degenerate tail.
+    """
+    scores = np.asarray(scores, dtype=np.float64).ravel()
+    score_min, score_max = float(np.min(scores)), float(np.max(scores))
+    n_bins = int(max(2, n_bins))
+
+    cap = float(np.percentile(scores, 99.9)) if balance_cap is None else float(balance_cap)
+    cap = min(max(cap, score_min + np.finfo(np.float32).eps), score_max)
+
+    if bin_scale == "linear":
+        inner = np.linspace(score_min, cap, n_bins)
+    elif bin_scale == "quantile":
+        below = scores[scores <= cap]
+        inner = np.quantile(below if below.size else scores, np.linspace(0.0, 1.0, n_bins))
+    else:  # log
+        positive = scores[scores > 0]
+        floor = max(float(np.percentile(positive, 1)), 1e-3) if positive.size else 1e-3
+        floor = min(floor, cap / 2.0)
+        inner = np.geomspace(floor, cap, n_bins)
+
+    # Deduplicate AFTER narrowing to float32: edges distinct in float64 can collapse once
+    # narrowed, leaving a zero-width bin holding a single pixel that oversampling would then
+    # replicate thousands of times.
+    edges = np.unique(
+        np.concatenate([[score_min], inner[inner < cap], [cap], [score_max]]).astype(np.float32)
+    )
+    if edges.size < 3:
+        edges = np.linspace(score_min, score_max, n_bins + 1, dtype=np.float32)
+    return edges, cap
+
+
 def build_bz_strength_balanced_indices(
     mhd_data: Dict[str, np.ndarray],
     base_selected_indices: Optional[np.ndarray] = None,
@@ -1239,8 +1323,19 @@ def build_bz_strength_balanced_indices(
     score_mode: str = "mean_abs",
     tau_idx: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
+    oversample: bool = True,
+    balance_cap: Optional[float] = None,
+    max_oversample_factor: float = 10.0,
+    bin_scale: str = "log",
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Return flattened indices balanced across Bz-strength bins."""
+    """Return flattened indices balanced across Bz-strength bins.
+
+    oversample: equalize bins upward by drawing rare bins with replacement (default),
+        rather than downward to the rarest bin. Set False for the original behavior.
+    balance_cap: |Bz| ceiling (G) above which all pixels share the top bin. Defaults to
+        the p99.9 of the candidate scores. Bounds how far the scheme tries to balance into
+        the tail, where too few distinct pixels exist to learn from.
+    """
     if "Bz" not in mhd_data:
         raise KeyError("mhd_data must contain a 'Bz' array")
 
@@ -1301,7 +1396,19 @@ def build_bz_strength_balanced_indices(
             "total_candidates": int(candidate_indices.size),
         }
 
-    bin_edges = np.linspace(score_min, score_max, int(max(2, n_bins)) + 1, dtype=np.float32)
+    # Bin edges. Equal-width edges up to score_max collapse on MURaM's |Bz| distribution:
+    # it is so heavy-tailed that the top bin holds a couple of pixels, and equalizing bin
+    # counts downward then throws away ~99.99% of the pool (691k pixels -> ~96). Two
+    # corrections, both needed:
+    #   (a) cap the top edge at `balance_cap` (default: the p99.9 of the scores) and lump
+    #       everything above it into the last bin, so the degenerate extreme tail cannot
+    #       drive the scheme;
+    #   (b) place the remaining edges on quantiles rather than at equal widths, so bins
+    #       hold comparable numbers of distinct pixels.
+    bin_edges, cap = build_bz_balance_bin_edges(
+        candidate_scores, n_bins=n_bins, balance_cap=balance_cap, bin_scale=bin_scale
+    )
+
     bin_ids = np.digitize(candidate_scores, bin_edges[1:-1], right=False)
     bin_ids = np.clip(bin_ids, 0, bin_edges.size - 2)
 
@@ -1313,20 +1420,41 @@ def build_bz_strength_balanced_indices(
     if not occupied_bins:
         raise ValueError("No occupied Bz bins found during balancing")
 
-    target_per_bin = min(occupied_bins)
+    # Equalize UPWARD (oversample rare bins with replacement) instead of downward. The
+    # documented intent is that extreme-field pixels are "seen more often"; undersampling
+    # the common bins to the rarest one achieves that ratio by discarding nearly the whole
+    # dataset instead. Target defaults to the median occupied-bin count, which keeps the
+    # selection the same order of magnitude as the pool.
+    if oversample:
+        target_per_bin = int(np.median(occupied_bins))
+    else:
+        target_per_bin = min(occupied_bins)
+    target_per_bin = max(1, target_per_bin)
+
     selected_chunks = []
     counts_after = {}
+    n_oversampled_bins = 0
     for bin_idx in range(bin_edges.size - 1):
         mask = bin_ids == bin_idx
         bin_indices = candidate_indices[mask]
         bin_count = int(bin_indices.size)
-        counts_after[f"bin_{bin_idx}"] = int(min(bin_count, target_per_bin))
         if bin_count == 0:
+            counts_after[f"bin_{bin_idx}"] = 0
             continue
         if bin_count > target_per_bin:
             chosen = rng.choice(bin_indices, size=target_per_bin, replace=False)
+        elif oversample and bin_count < target_per_bin:
+            # Draw with replacement: these are the rare strong-field pixels we want the
+            # model to see more of. Replication adds no new information, so cap how far a
+            # sparse bin may be inflated -- without this a bin holding a handful of pixels
+            # gets replicated thousands of times and the model memorizes those pixels
+            # instead of learning the regime.
+            allowed = int(min(target_per_bin, bin_count * max_oversample_factor))
+            chosen = rng.choice(bin_indices, size=max(allowed, bin_count), replace=True)
+            n_oversampled_bins += 1
         else:
             chosen = bin_indices
+        counts_after[f"bin_{bin_idx}"] = int(chosen.size)
         selected_chunks.append(chosen)
 
     if not selected_chunks:
@@ -1347,6 +1475,10 @@ def build_bz_strength_balanced_indices(
         "counts_after": counts_after,
         "total_candidates": int(candidate_indices.size),
         "target_per_bin": int(target_per_bin),
+        "oversample": bool(oversample),
+        "bin_scale": str(bin_scale),
+        "balance_cap": float(cap),
+        "n_oversampled_bins": int(n_oversampled_bins),
     }
 
 

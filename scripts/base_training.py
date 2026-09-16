@@ -42,6 +42,7 @@ from utils.muram_data import (
     MuramStepDataset,
     build_granulation_polarization_masks,
     build_balanced_region_indices,
+    build_bz_balance_bin_edges,
     build_bz_strength_balanced_indices,
 )
 from utils.modest_data import ModestData
@@ -71,11 +72,13 @@ class TrainingConfig:
     dz_km: float = 10.0
     step_size: int = 1  # Step size between simulation steps
 
-    # Optical depth remapping grid (used by MURaM -> tau mapping)
+    # Optical depth remapping grid (used by MURaM -> tau mapping).
+    # Defaults are the tau_500 grid NICOLE-generated data is fixed to
+    # (scripts/synthesis/tau500_multi_step_regen.py: NEW_LOGTAU_GRID, 45 levels).
     # If logtau_values is provided, it overrides min/max/step
     logtau_values: list[float] | None = None
-    logtau_min: float = -2.0
-    logtau_max: float = 0.0
+    logtau_min: float = -3.0
+    logtau_max: float = 1.4
     logtau_step: float = 0.1
 
     # Stokes continuum normalization policy
@@ -83,7 +86,12 @@ class TrainingConfig:
     stokes_ic_mode: str = "fixed_global"  # 'per_step' or 'fixed_global'
     stokes_fixed_ic: float | None = None
     stokes_mult_factor: float = 1.0
-    
+
+    # Training data source: 'nicole_tau500' (NICOLE-synthesized on tau_500,
+    # stokes_{step}_nicole_tau500.npy) or 'muram_legacy' (Rosseland-tau grid,
+    # stokes_{step}.npy -- kept for reference/old checkpoints, not the default)
+    data_source: str = "nicole_tau500"
+
     # Training parameters
     n_epochs: int = 20
     batch_size: int = 512  # Spatial batch size (512 pixels per batch)
@@ -157,10 +165,26 @@ class TrainingConfig:
     log_bz_bin_balance_stats: bool = True
     bz_balance_mode: str = "mean_abs"  # 'mean_abs', 'max_abs', or 'tau_index'
     bz_balance_bins: int = 12
+    # Equalize bins upward (oversample rare strong-field bins with replacement) rather than
+    # downward to the rarest bin, and cap how far into the tail the scheme tries to balance.
+    # MURaM's |Bz| is heavy-tailed enough that the old downward scheme kept ~96 of 691k
+    # pixels. Cap defaults to the p99.9 of the scores when left as None.
+    bz_balance_oversample: bool = True
+    bz_balance_cap: float | None = None
+    # 'log' (default), 'quantile' or 'linear' -- see build_bz_balance_bin_edges.
+    bz_balance_bin_scale: str = "log"
+    # Ceiling on how far a sparse bin may be inflated by oversampling, as a multiple of its
+    # distinct-pixel count. Bounds memorization of the handful of extreme-field pixels.
+    bz_balance_max_oversample_factor: float = 10.0
     bz_balance_tau_idx: int | None = None
     bz_balance_scope: str = "global"  # 'global' or 'per_step'
     bz_balance_seed: int = 42
-    
+
+    # Seed for weight initialization and batch shuffling (distinct from bz_balance_seed,
+    # which only governs pixel selection). Held fixed across ablation variations so the arms
+    # differ by their physics terms and not by where they started -- see set_global_seed.
+    seed: int = 42
+
     # Epoch diagnostics (image + scatter evolution)
     enable_epoch_plots: bool = True
     epoch_plot_step: int | None = None  # If None, use first validation step
@@ -194,7 +218,22 @@ class TrainingConfig:
         if self.stokes_cont_indices is None:
             self.stokes_cont_indices = [0, 1, 2, 3]
 
-        if self.stokes_ic_mode == "fixed_global" and self.stokes_fixed_ic is None:
+        valid_data_sources = {"muram_legacy", "nicole_tau500"}
+        if self.data_source not in valid_data_sources:
+            raise ValueError(
+                f"data_source must be one of {sorted(valid_data_sources)}, got {self.data_source!r}"
+            )
+        # Non-legacy sources get isolated normalizer-stats paths by default, so a
+        # fresh compute_normalization_stats.py run never overwrites the legacy files.
+        if self.data_source != "muram_legacy":
+            default_mhd_norm_path = "normalization_stats/mhd_normalization.json"
+            default_stokes_norm_path = "normalization_stats/stokes_normalization.json"
+            if self.mhd_normalizer_path == default_mhd_norm_path:
+                self.mhd_normalizer_path = f"normalization_stats/{self.data_source}/mhd_normalization.json"
+            if self.stokes_normalizer_path == default_stokes_norm_path:
+                self.stokes_normalizer_path = f"normalization_stats/{self.data_source}/stokes_normalization.json"
+
+        if self.data_source == "muram_legacy" and self.stokes_ic_mode == "fixed_global" and self.stokes_fixed_ic is None:
             ic_stats_path = Path(self.data_path) / "normalization_stats" / "ic_reference_stats.json"
             if ic_stats_path.exists():
                 with open(ic_stats_path, "r", encoding="utf-8") as f:
@@ -202,6 +241,12 @@ class TrainingConfig:
                 fixed_ic = ic_payload.get("fixed_ic")
                 if fixed_ic is not None:
                     self.stokes_fixed_ic = float(fixed_ic)
+
+        if self.data_source != "muram_legacy" and self.stokes_ic_mode == "fixed_global" and self.stokes_fixed_ic is None:
+            # fixed_ic is meaningless for pre-normalized sources (already continuum-
+            # normalized by NICOLE); skip it instead of requiring an unrelated legacy
+            # ic_reference_stats.json.
+            self.stokes_ic_mode = "per_step"
 
         if not np.isfinite(float(self.stokes_mult_factor)) or float(self.stokes_mult_factor) <= 0:
             raise ValueError(f"stokes_mult_factor must be finite and > 0, got {self.stokes_mult_factor}")
@@ -231,11 +276,15 @@ class TrainingConfig:
             self.logtau_values = None
         # Normalize cache dir (allow shared override via env)
         default_cache = "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_cache"
+        if self.data_source != "muram_legacy" and self.cache_dir == default_cache:
+            self.cache_dir = f"{default_cache}_{self.data_source}"
         if (not self.cache_dir or self.cache_dir == default_cache) and os.environ.get("MURAM_CACHE_DIR"):
             self.cache_dir = os.environ["MURAM_CACHE_DIR"]
         self.cache_dir = str(Path(self.cache_dir).expanduser().resolve())
 
         default_balanced_cache = "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_balanced_cache"
+        if self.data_source != "muram_legacy" and self.balanced_cache_dir == default_balanced_cache:
+            self.balanced_cache_dir = f"{default_balanced_cache}_{self.data_source}"
         if (not self.balanced_cache_dir or self.balanced_cache_dir == default_balanced_cache) and os.environ.get("MURAM_BALANCED_CACHE_DIR"):
             self.balanced_cache_dir = os.environ["MURAM_BALANCED_CACHE_DIR"]
         self.balanced_cache_dir = str(Path(self.balanced_cache_dir).expanduser().resolve())
@@ -347,13 +396,17 @@ class TrainingConfig:
         else:
             if self.logtau_step <= 0:
                 raise ValueError(f"logtau_step must be > 0, got {self.logtau_step}")
-            # include endpoint robustly
+            # include endpoint robustly. Accumulate in float64 (numpy's default)
+            # then cast down -- computing the arange directly in float32 accrues
+            # visible step-to-step rounding drift (~4e-6 by the last of 45
+            # steps), enough to fail exact-grid-match checks against externally
+            # generated data (e.g. the tau500 atmos_*.npz files) that use the
+            # same min/max/step but arange's float64 default.
             logtau = np.arange(
                 self.logtau_min,
                 self.logtau_max + 0.5 * self.logtau_step,
                 self.logtau_step,
-                dtype=np.float32,
-            )
+            ).astype(np.float32)
 
         if logtau.ndim != 1 or logtau.size < 2:
             raise ValueError("logtau grid must be 1D with at least 2 points")
@@ -414,9 +467,28 @@ class MetricsLogger:
     def __del__(self):
         self.close()
 
+def set_global_seed(seed: int) -> None:
+    """Seed Python, NumPy and torch so a run starts from a reproducible state.
+
+    Call this before building the model. Weight initialization and DataLoader shuffling both
+    draw from torch's global RNG, so without it every ablation variation starts from
+    different weights and sees batches in a different order: the arms then differ by
+    initialization noise on top of whatever the physics terms do, which is exactly the
+    variance an ablation is supposed to exclude. Variations run sequentially in one process,
+    so each consumes the RNG stream the previous one left behind -- reseeding per variation,
+    not once at startup, is what makes them comparable.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def build_cache_config_signature(config: TrainingConfig) -> dict:
     """Shared cache-signature contract across training/ablation/analysis."""
     return {
+        'data_source': str(config.data_source),
         'nx': config.nx,
         'ny': config.ny,
         'nz': config.nz,
@@ -436,12 +508,18 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
     """Signature for post-balancing cache validity."""
     return {
         "version": 1,
+        "data_source": str(config.data_source),
         "steps": [int(s) for s in sorted(train_steps)],
         "apply_region_mask": bool(config.apply_region_mask),
         "apply_bz_bin_balance": bool(config.apply_bz_bin_balance),
         "bz_balance_scope": str(config.bz_balance_scope),
         "bz_balance_mode": str(config.bz_balance_mode),
         "bz_balance_bins": int(config.bz_balance_bins),
+        # Part of the signature: both change which pixels land in the balanced cache.
+        "bz_balance_oversample": bool(config.bz_balance_oversample),
+        "bz_balance_cap": None if config.bz_balance_cap is None else float(config.bz_balance_cap),
+        "bz_balance_max_oversample_factor": float(config.bz_balance_max_oversample_factor),
+        "bz_balance_bin_scale": str(config.bz_balance_bin_scale),
         "bz_balance_tau_idx": None if config.bz_balance_tau_idx is None else int(config.bz_balance_tau_idx),
         "bz_balance_seed": int(config.bz_balance_seed),
         "logtau_values": [float(x) for x in config.get_logtau_values().tolist()],
@@ -616,10 +694,21 @@ def preload_balanced_steps_from_cache(
     return loaded
 
 
+def _has_active_physics(config: TrainingConfig) -> bool:
+    """Whether any physics term is weighted, and so whether the gate has anything to hold back."""
+    return (config.lambda_wfa > 0) or (config.lambda_doppler > 0) or (config.lambda_temp > 0)
+
+
 def initialize_wfa_gate_state(config: TrainingConfig) -> dict[str, Any]:
-    """Create runtime state for train-time WFA activation gate."""
+    """Create runtime state for the train-time physics activation gate.
+
+    Opens immediately when no physics term is weighted at all -- there is nothing to gate --
+    but NOT merely because lambda_wfa is zero. That earlier condition made the gate a no-op
+    for doppler_only and black_body_only, so those arms had their term active from epoch 1
+    while wfa_only waited for the MSE plateau: the very asymmetry the gate exists to avoid.
+    """
     gate_mode = str(config.wfa_gate_mode).lower()
-    enabled = gate_mode == 'off' or config.lambda_wfa <= 0
+    enabled = gate_mode == 'off' or not _has_active_physics(config)
     return {
         'mode': gate_mode,
         'enabled': enabled,
@@ -637,9 +726,14 @@ def update_wfa_gate_state(
     epoch: int,
     epoch_mse_loss: float,
 ) -> tuple[dict[str, Any], bool, str | None]:
-    """Update train-time WFA gate using epoch train MSE and return transition info."""
+    """Update the train-time physics gate from epoch train MSE; returns transition info.
+
+    Config keys keep the wfa_gate_* names for backwards compatibility -- finetune.py restores
+    them from a base run's experiment_config.json -- but the gate governs all three physics
+    terms, not just the WFA.
+    """
     gate_mode = str(gate_state.get('mode', config.wfa_gate_mode)).lower()
-    if gate_mode == 'off' or config.lambda_wfa <= 0:
+    if gate_mode == 'off' or not _has_active_physics(config):
         gate_state['enabled'] = True
         gate_state['last_metric'] = float(epoch_mse_loss)
         return gate_state, False, None
@@ -690,6 +784,124 @@ def update_wfa_gate_state(
         return gate_state, True, trigger_reason
 
     return gate_state, False, None
+
+def load_source_arrays(
+    step: int,
+    config: TrainingConfig,
+    ignore_missing_files: bool = False,
+) -> tuple[StokesData, dict[str, np.ndarray]] | None:
+    """
+    Load raw, per-step MHD + Stokes arrays for `config.data_source`.
+
+    Returns a (stokes, mhd_data) pair with the same downstream contract
+    regardless of source: `stokes` is a StokesData instance with `.data`
+    (fine wavelength grid, I/Q/U/V, pre-LSF/resample) and `.mean_continuum`
+    populated; `mhd_data` maps {'T', 'Vz', 'Bz'} to (nx, ny, n_logtau)
+    Quantities on config.get_logtau_values(). Callers still need to run
+    load_hinode_lsf/apply_spectral_convolution/resample_to_hinode/
+    spectropolarimetry on the returned `stokes` -- those steps are
+    source-agnostic and are not duplicated here.
+
+    Returns None (instead of raising) when required files are missing and
+    ignore_missing_files=True.
+    """
+    new_logtau = config.get_logtau_values()
+
+    if config.data_source == "muram_legacy":
+        mhd = MhdData(
+            data_path=config.data_path / "muram-simulation",
+            nx=config.nx, ny=config.ny, nz=config.nz
+        )
+        try:
+            mhd.load_step(step=step, z_max=config.z_max)
+        except FileNotFoundError as exc:
+            if ignore_missing_files:
+                print(f"  ⚠ Skipping step {step} because required files are missing: {exc}")
+                return None
+            raise
+        mhd.load_opacity_table(kappa_path=config.data_path / config.kappa_path)
+        mhd.compute_optical_depth(dz=config.dz_km * u.km)
+        mhd.remap_to_optical_depth(new_logtau, quantities=["T", "Vz", "Bz"])
+
+        stokes = StokesData(
+            data_dir=config.data_path / "muram-simulation/",
+            step=step,
+            wavelength_range=(6300.5, 6303.5),
+            wavelength_step=0.01
+        )
+        try:
+            stokes.load_stokes()
+        except FileNotFoundError as exc:
+            if ignore_missing_files:
+                print(f"  ⚠ Skipping step {step} because required files are missing: {exc}")
+                return None
+            raise
+        stokes_cont_indices = config.stokes_cont_indices or [0, 1, 2, 3]
+        if config.stokes_ic_mode == "fixed_global":
+            if config.stokes_fixed_ic is None:
+                raise ValueError("stokes_fixed_ic must be set for fixed_global mode")
+            fixed_ic = float(config.stokes_fixed_ic)
+        else:
+            fixed_ic = None
+        stokes.continuum_normalization(cont_indices=stokes_cont_indices, fixed_ic=fixed_ic)
+        if config.stokes_mult_factor != 1.0:
+            stokes.data["I"] = stokes.data["I"] * config.stokes_mult_factor
+            stokes.data["V"] = stokes.data["V"] * config.stokes_mult_factor
+
+        return stokes, mhd.od_data
+
+    elif config.data_source == "nicole_tau500":
+        sim_dir = config.data_path / "muram-simulation"
+        stokes_path = sim_dir / f"stokes_{step}_nicole_tau500.npy"
+        atmos_path = sim_dir / f"atmos_{step}_tau500.npz"
+        if not stokes_path.exists() or not atmos_path.exists():
+            missing = stokes_path if not stokes_path.exists() else atmos_path
+            if ignore_missing_files:
+                print(f"  ⚠ Skipping step {step} because required files are missing: {missing}")
+                return None
+            raise FileNotFoundError(
+                f"nicole_tau500 data not found for step {step}: expected {stokes_path} and {atmos_path}"
+            )
+
+        atmos = np.load(atmos_path)
+        saved_logtau = np.round(np.asarray(atmos["logtau"], dtype=np.float32), 6)
+        if saved_logtau.shape != new_logtau.shape or not np.allclose(saved_logtau, new_logtau, atol=1e-6):
+            raise ValueError(
+                f"atmos_{step}_tau500.npz was generated on a different log(tau) grid than the "
+                f"active config. Saved: {saved_logtau.tolist()} | Requested: {new_logtau.tolist()}. "
+                "Set logtau_min=-3.0, logtau_max=1.4, logtau_step=0.1 (the tau500-generation grid) "
+                "to use this data source."
+            )
+
+        mhd_data = {
+            "T": np.asarray(atmos["T"], dtype=np.float64) * u.K,
+            "Vz": np.asarray(atmos["Vz"], dtype=np.float64) * u.km / u.s,
+            "Bz": np.asarray(atmos["Bz"], dtype=np.float64) * u.G,
+        }
+
+        # Stokes cube is (nx, ny, nwl, 4) = I,Q,U,V, already NICOLE-normalized
+        # (Continuum reference=1) -- fixed_ic / stokes_mult_factor do not apply.
+        stokes_cube = np.load(stokes_path)
+        stokes = StokesData(
+            data_dir=sim_dir,
+            step=step,
+            wavelength_range=(6300.5, 6303.5),
+            wavelength_step=0.01,
+        )
+        stokes.data = {
+            "I": stokes_cube[:, :, :, 0],
+            "Q": stokes_cube[:, :, :, 1],
+            "U": stokes_cube[:, :, :, 2],
+            "V": stokes_cube[:, :, :, 3],
+        }
+        stokes.nx, stokes.ny, stokes.nwl = stokes.data["I"].shape
+        stokes_cont_indices = config.stokes_cont_indices or [0, 1, 2, 3]
+        stokes.mean_continuum = stokes.data["I"][:, :, stokes_cont_indices].mean(axis=2)
+
+        return stokes, mhd_data
+
+    raise ValueError(f"Unknown data_source: {config.data_source!r}")
+
 
 def load_and_prepare_step(
     step: int,
@@ -818,6 +1030,10 @@ def load_and_prepare_step(
                         n_bins=config.bz_balance_bins,
                         score_mode=config.bz_balance_mode,
                         tau_idx=config.bz_balance_tau_idx,
+                        oversample=config.bz_balance_oversample,
+                        balance_cap=config.bz_balance_cap,
+                        max_oversample_factor=config.bz_balance_max_oversample_factor,
+                        bin_scale=config.bz_balance_bin_scale,
                     )
 
                 dataset_cached = MuramStepDataset(
@@ -863,54 +1079,18 @@ def load_and_prepare_step(
                 print(f"  ⚠ Cache load failed for step {step}: {e}")
                 print(f"  Reprocessing step {step}...")
     
-    # Load MHD data
-    mhd = MhdData(
-        data_path=config.data_path / "muram-simulation",
-        nx=config.nx, ny=config.ny, nz=config.nz
-    )
-    try:
-        mhd.load_step(step=step, z_max=config.z_max)
-    except FileNotFoundError as exc:
-        if ignore_missing_files:
-            print(f"  ⚠ Skipping step {step} because required files are missing: {exc}")
-            return None
-        raise
-    mhd.load_opacity_table(kappa_path=config.data_path / config.kappa_path)
-    mhd.compute_optical_depth(dz=config.dz_km * u.km)
-    
-    # Remap to optical depth (from config)
+    # Check normalizer/tau-grid compatibility before doing any I/O.
     if hasattr(mhd_normalizer, "n_tau") and len(new_logtau) != mhd_normalizer.n_tau:
         raise ValueError(
             f"logtau grid has {len(new_logtau)} levels, but mhd_normalizer expects "
             f"{mhd_normalizer.n_tau}. Recompute normalizer stats or adjust logtau grid."
         )
-    mhd.remap_to_optical_depth(new_logtau, quantities=["T", "Vz", "Bz"])
-    
-    # Load Stokes data
-    stokes = StokesData(
-        data_dir=config.data_path / "muram-simulation/",
-        step=step,
-        wavelength_range=(6300.5, 6303.5),
-        wavelength_step=0.01
-    )
-    try:
-        stokes.load_stokes()
-    except FileNotFoundError as exc:
-        if ignore_missing_files:
-            print(f"  ⚠ Skipping step {step} because required files are missing: {exc}")
-            return None
-        raise
-    stokes_cont_indices = config.stokes_cont_indices or [0, 1, 2, 3]
-    if config.stokes_ic_mode == "fixed_global":
-        if config.stokes_fixed_ic is None:
-            raise ValueError("stokes_fixed_ic must be set for fixed_global mode")
-        fixed_ic = float(config.stokes_fixed_ic)
-    else:
-        fixed_ic = None
-    stokes.continuum_normalization(cont_indices=stokes_cont_indices, fixed_ic=fixed_ic)
-    if config.stokes_mult_factor != 1.0:
-        stokes.data["I"] = stokes.data["I"] * config.stokes_mult_factor
-        stokes.data["V"] = stokes.data["V"] * config.stokes_mult_factor
+
+    result = load_source_arrays(step=step, config=config, ignore_missing_files=ignore_missing_files)
+    if result is None:
+        return None
+    stokes, mhd_od_data = result
+
     stokes.load_hinode_lsf(config.data_path / config.lsf_path)
     stokes.apply_spectral_convolution()
     stokes.resample_to_hinode()
@@ -952,17 +1132,21 @@ def load_and_prepare_step(
         }
     elif apply_bz_balance:
         selected_indices, bz_balance_info = build_bz_strength_balanced_indices(
-            mhd_data=mhd.od_data,
+            mhd_data=mhd_od_data,
             base_selected_indices=selected_indices,
             n_bins=config.bz_balance_bins,
             score_mode=config.bz_balance_mode,
             tau_idx=config.bz_balance_tau_idx,
+            oversample=config.bz_balance_oversample,
+            balance_cap=config.bz_balance_cap,
+            max_oversample_factor=config.bz_balance_max_oversample_factor,
+            bin_scale=config.bz_balance_bin_scale,
         )
-    
+
     # Create dataset
     dataset = MuramStepDataset(
         stokes_data=stokes.data,
-        mhd_data=mhd.od_data,
+        mhd_data=mhd_od_data,
         stokes_normalizer=stokes_normalizer,
         mhd_normalizer=mhd_normalizer,
         selected_flat_indices=selected_indices,
@@ -1028,7 +1212,7 @@ def load_and_prepare_step(
             cache.save(
                 step=step,
                 stokes_data=stokes.data,
-                mhd_data=mhd.od_data,
+                mhd_data=mhd_od_data,
                 approx_data=approx_data,
                 config_hash=config_hash,
                 logtau_values=new_logtau,
@@ -1137,26 +1321,40 @@ def compute_global_bz_balancing_indices(
         counts_before = {"bin_0": int(scores_global.size)}
         target_per_bin = int(scores_global.size)
     else:
-        bin_edges = np.linspace(score_min, score_max, n_bins + 1, dtype=np.float32)
+        # Shared with the per-step balancer so the two cannot drift apart; see
+        # build_bz_balance_bin_edges for why the bin scale matters on this distribution.
+        bin_edges, cap = build_bz_balance_bin_edges(
+            scores_global,
+            n_bins=n_bins,
+            balance_cap=config.bz_balance_cap,
+            bin_scale=config.bz_balance_bin_scale,
+        )
+
         bin_ids = np.digitize(scores_global, bin_edges[1:-1], right=False)
-        bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+        bin_ids = np.clip(bin_ids, 0, bin_edges.size - 2)
 
         counts_before = {
             f"bin_{bin_idx}": int(np.sum(bin_ids == bin_idx))
-            for bin_idx in range(n_bins)
+            for bin_idx in range(bin_edges.size - 1)
         }
         occupied = [c for c in counts_before.values() if c > 0]
         if not occupied:
             raise RuntimeError("Global Bz balancing found no occupied bins.")
-        target_per_bin = int(min(occupied))
+        target_per_bin = int(np.median(occupied)) if config.bz_balance_oversample else int(min(occupied))
+        target_per_bin = max(1, target_per_bin)
 
         selected_chunks = []
-        for bin_idx in range(n_bins):
+        for bin_idx in range(bin_edges.size - 1):
             idx_bin = np.flatnonzero(bin_ids == bin_idx)
             if idx_bin.size == 0:
                 continue
             if idx_bin.size > target_per_bin:
                 chosen = rng.choice(idx_bin, size=target_per_bin, replace=False)
+            elif config.bz_balance_oversample and idx_bin.size < target_per_bin:
+                # Bound replication: inflating a bin of a few pixels up to the target
+                # teaches the model those specific pixels, not the regime they sit in.
+                allowed = int(min(target_per_bin, idx_bin.size * config.bz_balance_max_oversample_factor))
+                chosen = rng.choice(idx_bin, size=max(allowed, idx_bin.size), replace=True)
             else:
                 chosen = idx_bin
             selected_chunks.append(chosen.astype(np.int64, copy=False))
@@ -1218,7 +1416,7 @@ def train_one_step(
     epoch: int,
     step_num: int,
     logger: MetricsLogger | None,
-    enable_wfa: bool = True,
+    enable_physics: bool = True,
 ) -> dict[str, float]:
     """
     Train on one simulation step (one epoch through that step's data).
@@ -1287,7 +1485,7 @@ def train_one_step(
             predictions=predictions,
             targets=mhd_batch,
             spatial_indices=spatial_idx_batch,
-            enable_wfa=enable_wfa,
+            enable_physics=enable_physics,
         )
         
         total_loss = loss_dict['loss']
@@ -1315,9 +1513,9 @@ def train_one_step(
     for key in step_metrics.keys():
         step_metrics[key] /= n_batches
 
-    # Mark physics fields as NaN when WFA gate is closed so the CSV reflects
+    # Mark physics fields as NaN when the physics gate is closed so the CSV reflects
     # that no physics constraint was active (rather than a misleading 0.0).
-    if not enable_wfa:
+    if not enable_physics:
         for key in ('physics_loss', 'wfa_loss', 'doppler_loss', 'temperature_loss'):
             step_metrics[key] = float('nan')
 
@@ -1360,7 +1558,8 @@ def validate(
     """
     model.eval()
     n_val_samples = 0
-    
+    total_val_loss = 0.0
+
     with torch.no_grad():
         for step in val_steps:
             try:
@@ -1406,7 +1605,7 @@ def validate(
                         predictions=predictions,
                         targets=mhd_batch,
                         spatial_indices=spatial_idx_batch,
-                        enable_wfa=True,
+                        enable_physics=True,
                     )
                     
                     total_loss = loss_dict['loss']
@@ -1486,7 +1685,7 @@ def load_checkpoint(
     print(f"  Train loss: {train_loss:.6f}, Val loss: {val_loss:.6f}")
     if isinstance(wfa_gate_state, dict):
         print(
-            "  WFA gate state: "
+            "  Physics gate state: "
             f"enabled={wfa_gate_state.get('enabled')}, "
             f"mode={wfa_gate_state.get('mode')}, "
             f"trigger_epoch={wfa_gate_state.get('trigger_epoch')}"
@@ -1505,7 +1704,7 @@ def train_epoch(
     logger: MetricsLogger | None = None,
     n_steps_per_epoch: int = -1,
     cache: MuramDataCache | None = None,
-    enable_wfa: bool = True,
+    enable_physics: bool = True,
     global_bz_selection_indices: dict[int, np.ndarray] | None = None,
     global_bz_balance_metadata: dict[str, Any] | None = None,
     balanced_cache: BalancedTrainDataCache | None = None,
@@ -1624,7 +1823,7 @@ def train_epoch(
                 epoch=epoch,
                 step_num=step,
                 logger=logger,
-                enable_wfa=enable_wfa,
+                enable_physics=enable_physics,
             )
             
             # Accumulate step metrics (including temperature)
@@ -2553,16 +2752,16 @@ def train_pinn_model(config: TrainingConfig):
             f"Bz balance scope/mode/bins: {config.bz_balance_scope}/{config.bz_balance_mode}/{config.bz_balance_bins}"
         )
         print(f"Bz balance tau idx: {config.bz_balance_tau_idx} (None -> deepest)")
-    print(f"WFA gate mode: {config.wfa_gate_mode}")
+    print(f"Physics gate mode: {config.wfa_gate_mode}")
     if config.wfa_gate_mode == 'threshold':
-        print(f"WFA gate threshold (train MSE): {config.wfa_gate_threshold}")
+        print(f"Physics gate threshold (train MSE): {config.wfa_gate_threshold}")
     elif config.wfa_gate_mode == 'plateau':
         print(
-            f"WFA gate plateau patience/min_delta: "
+            f"Physics gate plateau patience/min_delta: "
             f"{config.wfa_gate_patience}/{config.wfa_gate_min_delta}"
         )
     if config.wfa_gate_mode != 'off':
-        print(f"WFA gate warmup epochs: {config.wfa_gate_warmup_epochs}")
+        print(f"Physics gate warmup epochs: {config.wfa_gate_warmup_epochs}")
     print(f"B_LOS physics mode: {config.blos_physics_mode}")
     if config.blos_physics_mode == "single_height":
         print(f"B_LOS target log(tau): {config.blos_target_logtau}")
@@ -2758,8 +2957,8 @@ def train_pinn_model(config: TrainingConfig):
     for epoch in range(start_epoch, config.n_epochs):
         print(f"\nEpoch {epoch + 1}/{config.n_epochs}")
         print("-" * 70)
-        train_wfa_enabled = bool(wfa_gate_state.get('enabled', True))
-        print(f"  Train-time WFA enabled: {train_wfa_enabled}")
+        train_physics_enabled = bool(wfa_gate_state.get('enabled', True))
+        print(f"  Train-time physics enabled: {train_physics_enabled}")
         
         # Train for one epoch using the extracted function
         epoch_metrics = train_epoch(
@@ -2773,7 +2972,7 @@ def train_pinn_model(config: TrainingConfig):
             logger=logger,
             n_steps_per_epoch=-1,  # Use all training steps
             cache=cache,
-            enable_wfa=train_wfa_enabled,
+            enable_physics=train_physics_enabled,
             global_bz_selection_indices=global_bz_selection_indices,
             global_bz_balance_metadata=global_bz_balance_metadata,
             balanced_cache=balanced_cache if balanced_runtime_mode == "disk" else None,
@@ -2840,7 +3039,7 @@ def train_pinn_model(config: TrainingConfig):
         print(f"        ├─ Doppler Loss:     {epoch_metrics['doppler_loss']:.6f}")
         print(f"        └─ Temperature Loss: {epoch_metrics['temperature_loss']:.6f}")
         print(
-            f"  WFA gate state (next epoch): enabled={bool(wfa_gate_state.get('enabled', True))}, "
+            f"  Physics gate state (next epoch): enabled={bool(wfa_gate_state.get('enabled', True))}, "
             f"mode={wfa_gate_state.get('mode')}"
         )
         if wfa_gate_state.get('mode') == 'plateau':
@@ -2849,7 +3048,7 @@ def train_pinn_model(config: TrainingConfig):
                 f"best_train_mse={wfa_gate_state.get('best_metric')}"
             )
         if wfa_gate_triggered:
-            print(f"  ★ WFA gate activated for subsequent epochs: {wfa_gate_reason}")
+            print(f"  ★ Physics gate activated for subsequent epochs: {wfa_gate_reason}")
         print(f"  Pixels used this epoch (balanced): {epoch_metrics.get('n_pixels_used', 0)}")
         
         # Save checkpoint
@@ -2940,6 +3139,9 @@ def main():
     parser.add_argument('--stokes-mult-factor', '--stokes_mult_factor', dest='stokes_mult_factor',
                        type=float, default=1.0,
                        help='Scalar multiplier applied to normalized Stokes I and V before training')
+    parser.add_argument('--data-source', '--data_source', dest='data_source',
+                       type=str, choices=['muram_legacy', 'nicole_tau500'], default='nicole_tau500',
+                       help='Training data source (default: nicole_tau500)')
     parser.add_argument('--wfa-gate-mode', '--wfa_gate_mode', dest='wfa_gate_mode',
                        type=str, choices=['off', 'threshold', 'plateau'], default=None,
                        help='Train-time WFA activation gate mode')
@@ -2954,27 +3156,23 @@ def main():
                        help='Minimum epoch train MSE improvement to reset WFA plateau counter')
     parser.add_argument('--wfa-gate-warmup-epochs', '--wfa_gate_warmup_epochs', dest='wfa_gate_warmup_epochs',
                        type=int, default=None,
-                       help='Minimum number of epochs before WFA gate can activate')
+                       help='Minimum number of epochs before the physics gate can activate (gates WFA, Doppler and temperature together)')
     
     # Add cache-related arguments
     parser.add_argument('--no-cache', action='store_true',
                        help='Disable data caching')
     parser.add_argument('--cache-dir', '--cache_dir', type=str,
-                       default=os.environ.get(
-                           "MURAM_CACHE_DIR",
-                           "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_cache",
-                       ),
-                       help='Directory for cached data (or set MURAM_CACHE_DIR)')
+                       default=None,
+                       help='Directory for cached data (or set MURAM_CACHE_DIR). Defaults to the '
+                            'standard .muram_cache dir, suffixed with the data source for non-legacy sources.')
     parser.add_argument('--clear-cache', action='store_true',
                        help='Clear cache before training')
     parser.add_argument('--balanced-cache', '--balanced_cache', dest='use_balanced_cache', action='store_true',
                        help='Enable post-balancing train-data cache')
     parser.add_argument('--balanced-cache-dir', '--balanced_cache_dir', dest='balanced_cache_dir', type=str,
-                       default=os.environ.get(
-                           "MURAM_BALANCED_CACHE_DIR",
-                           "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_balanced_cache",
-                       ),
-                       help='Directory for balanced training cache')
+                       default=None,
+                       help='Directory for balanced training cache (or set MURAM_BALANCED_CACHE_DIR). '
+                            'Defaults to the standard dir, suffixed with the data source for non-legacy sources.')
     parser.add_argument('--clear-balanced-cache', '--clear_balanced_cache', dest='clear_balanced_cache', action='store_true',
                        help='Clear balanced training cache before training')
     parser.add_argument('--balanced-cache-strategy', '--balanced_cache_strategy', dest='balanced_cache_strategy',
@@ -3118,6 +3316,7 @@ def main():
         config.c1_filters = args.c1_filters
     config.stokes_ic_mode = args.stokes_ic_mode
     config.stokes_mult_factor = args.stokes_mult_factor
+    config.data_source = args.data_source
     if config.stokes_ic_mode == 'fixed_global' and config.stokes_fixed_ic is None:
         ic_stats_path = Path(config.data_path) / "normalization_stats" / "ic_reference_stats.json"
         if ic_stats_path.exists():
@@ -3137,6 +3336,29 @@ def main():
     if args.wfa_gate_warmup_epochs is not None:
         config.wfa_gate_warmup_epochs = args.wfa_gate_warmup_epochs
     
+    # Non-legacy sources get isolated cache dirs and normalizer-stats paths by
+    # default, mirroring TrainingConfig.__post_init__ (which already ran with
+    # data_source='muram_legacy' before the override above).
+    default_cache_dir = "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_cache"
+    default_balanced_cache_dir = "/scratchsan/observatorio/juagudeloo/MUISCA/.muram_balanced_cache"
+    if args.cache_dir is None:
+        args.cache_dir = os.environ.get(
+            "MURAM_CACHE_DIR",
+            default_cache_dir if args.data_source == "muram_legacy" else f"{default_cache_dir}_{args.data_source}",
+        )
+    if args.balanced_cache_dir is None:
+        args.balanced_cache_dir = os.environ.get(
+            "MURAM_BALANCED_CACHE_DIR",
+            default_balanced_cache_dir if args.data_source == "muram_legacy" else f"{default_balanced_cache_dir}_{args.data_source}",
+        )
+    if args.data_source != "muram_legacy":
+        default_mhd_norm_path = "normalization_stats/mhd_normalization.json"
+        default_stokes_norm_path = "normalization_stats/stokes_normalization.json"
+        if config.mhd_normalizer_path == default_mhd_norm_path:
+            config.mhd_normalizer_path = f"normalization_stats/{args.data_source}/mhd_normalization.json"
+        if config.stokes_normalizer_path == default_stokes_norm_path:
+            config.stokes_normalizer_path = f"normalization_stats/{args.data_source}/stokes_normalization.json"
+
     # Apply cache CLI overrides
     config.use_cache = not args.no_cache
     config.cache_dir = str(Path(args.cache_dir).expanduser().resolve())
