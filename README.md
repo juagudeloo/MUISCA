@@ -16,7 +16,6 @@ A physics-informed deep learning framework for atmospheric inversion of solar sp
 - [Notebooks](#notebooks)
 - [Configuration](#configuration) — including [Data Sources](#data-sources) and the spectral axis
 - [Outputs](#outputs) — metrics CSVs and range of applicability
-- [Citation](#citation)
 
 ---
 
@@ -282,6 +281,7 @@ per-invocation, and an absolute `MUISCA_ROOT` so they work from any working dire
   run; `--include-whole 0|1` toggles the full-FOV pass on the CLI without editing the file
 
 #### `run_nicole_synthesis.sh`
+- Requires a built NICOLE v16.06 (see [Prerequisites](#getting-started))
 - Runs the full NICOLE round-trip bridge (`scripts/synthesis/`: sample → export → synthesize →
   compare, plus the cross-model steps with 2+ `MODEL_TYPES`) for `--source modest|muram`
 - Same `REGIONS`/`INCLUDE_WHOLE` batching as `generate_analysis.sh` for the MODEST source
@@ -299,6 +299,17 @@ conda activate muisca
 pip install torch torchvision astropy scipy tqdm matplotlib
 ```
 
+**NICOLE v16.06** is also required for any step that synthesizes or re-synthesizes Stokes
+profiles (Quick Start step 0, and `tools/run_nicole_synthesis.sh`). It is **not** bundled with
+this repository and is not publicly downloadable — it is obtained directly from the code's
+maintainers/authors (in this project's case, through a collaborator). Once you have the
+source, point `NICOLE_ROOT` in `tools/generate_tau500_stokes*.sh` and
+`tools/run_nicole_synthesis.sh` at the extracted `NICOLE_v16.06/` tree and build it with
+gfortran — see ["Operational prerequisite: building NICOLE
+v16.06"](docs/muisca_to_nicole_bridge.md#operational-prerequisite-building-nicole-v1606) for
+the exact build flags. Skip this if you only plan to train/analyze against MURaM steps that
+already have their `stokes_<step>_nicole_tau500.npy` synthesized.
+
 ### Quick Start
 
 The `tools/*.sh` wrappers are the intended entry points: each holds its configuration in a
@@ -307,6 +318,7 @@ directly or submitted with `sbatch`. Run them in this order.
 
 0. **Synthesize training Stokes** — only needed for MURaM steps that don't have
    `stokes_<step>_nicole_tau500.npy` yet. Expensive (chunked NICOLE runs), so check first.
+   Requires a built NICOLE v16.06 (see Prerequisites above).
    ```bash
    ./tools/generate_tau500_stokes.sh --submit-waves   # generate
    ./tools/generate_tau500_stokes.sh --merge          # reassemble chunks
@@ -654,28 +666,6 @@ To add new physics terms or modify the architecture:
 3. **New experiments**:
    - Create script in `scripts/experiments/`
    - Use `TrainingConfig` for consistency
-
----
-
-## 📚 Key References
-
-1. **Weak-Field Approximation**: Landi Degl'Innocenti & Landolfi, "Polarization in Spectral Lines", 2004
-2. **MURaM**: Vögler et al., "The CO5BOLD/MURaM Code", 2005
-
----
-
-## 📝 Citation
-
-If you use this code, please cite:
-
-```bibtex
-@mastersthesis{agudelo2025muisca,
-  title={MUISCA: Multi-Scale Convolutional Neural Network for Inverting Stokes Parameters},
-  author={Agudelo, Julian},
-  year={2025},
-  school={Universidad Nacional de Colombia}
-}
-```
 
 ---
 
