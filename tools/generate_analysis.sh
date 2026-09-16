@@ -14,7 +14,10 @@ cd "${MUISCA_ROOT}" || exit 1
 # Shared model selection (space-separated list)
 # Base options: all, no_physics, wfa_only, doppler_only, black_body_only, all_physics_terms
 # Lambda variants must match experiment keys, e.g. wfa_only-lambda-0_01
-MODEL_TYPES="no_physics wfa_only black_body_only doppler_only"
+# With 2+ models, both muram_analysis.py and modest_analysis.py also generate the combined
+# multi-model comparison figures (jointplots 2x2, images 2x(1+N)) under a "combined/"
+# subdirectory, in addition to the usual per-model plots.
+MODEL_TYPES="no_physics wfa_only doppler_only black_body_only"
 EXPERIMENT_ROOT="experiment_110_to_130-step_size_10-normal"
 
 # Runtime control
@@ -26,19 +29,25 @@ CACHE_DIR="/scratchsan/observatorio/juagudeloo/MUISCA/.muram_cache"
 STEP_TO_PLOT="198"
 
 # MODEST analysis args
+#
+# List every region to process in one run. label:Y0,Y1,X0,X1 -- same order as
+# ModestData.extract_region. modest_analysis.py loads models/normalizers ONCE and reuses them
+# across all regions listed here. REGIONS must have at least one entry (see the validation
+# below) -- --regions-json requires a non-empty region dict; add INCLUDE_WHOLE=1 to also get
+# the whole scene alongside these crops.
+REGIONS=(
+  "sunspot:100,300,250,450"
+  "plage:0,100,400,600"
+  "negative_region:0,80,0,200"
+  "quiet_sun:0,100,600,700"
+)
+INCLUDE_WHOLE="1"   # 1 => also process the whole (uncropped) scene alongside REGIONS
+
+# Single-region crop, used only by the "distributions" run target -- distributions_analysis.py
+# doesn't support the REGIONS batch above.
 CROPPED_REGION="0"                      # 1 => --cropped-region
-#sunspot
-# CROP_BOUNDS=(100 300 250 450)             # X_MIN X_MAX Y_MIN Y_MAX
-# CROP_LABEL="sunspot"                      # label for cropped region (used in plot titles and output paths)
-#plage
-# CROP_BOUNDS=(0 100 400 600)             # X_MIN X_MAX Y_MIN Y_MAX
-# CROP_LABEL="plage"                      # label for cropped region (used in plot titles and output paths)
-#negative region
-# CROP_BOUNDS=(0 80 0 200)             # X_MIN X_MAX Y_MIN Y_MAX
-# CROP_LABEL="negative_region"      
-#quiet sun
-CROP_BOUNDS=(0 100 600 700)             # X_MIN X_MAX Y_MIN Y_MAX
-CROP_LABEL="quiet_sun"                      # label for cropped region (used in plot titles and output paths)
+CROP_BOUNDS=(100 300 250 450)             # X_MIN X_MAX Y_MIN Y_MAX
+CROP_LABEL="sunspot"                      # label for cropped region (used in plot titles and output paths)
 POLARIZATION_MASK="0"                   # 1 => --polarization-mask
 POLARIZATION_THRESHOLD="1e-2"
 MODEST_CACHE_DIR="/scratchsan/observatorio/juagudeloo/MUISCA/.modest_cache"
@@ -71,7 +80,7 @@ Options:
   --run both|muram|modest   Select analyses to run (default: both)
   --distribution-target stokes|mhd|both  distributions mode selector (default: both)
   --step-to-plot STEP         MURaM: simulation step to plot (default: 198)
-  --cropped-region 0|1      MODEST only: enable/disable cropped-region output (default: 0)
+  --include-whole 0|1       MODEST: also process the whole (uncropped) scene alongside REGIONS (default: 1)
   --polarization-mask 0|1   MODEST only: enable/disable polarization mask (default: 0)
   --polarization-threshold VALUE  MODEST only: circular polarization threshold (default: 1e-2)
   --experiment-root NAME    Experiment folder under output/experiments (default from script variable)
@@ -90,6 +99,10 @@ Options:
   --temp-calibration-min-samples N   MODEST: min samples to fit per-tau bias (default: 500)
   --temp-calibration-clip-quantiles "Q_LOW Q_HIGH"  MODEST: e.g. "0.01 0.99"
   -h, --help                Show this help
+
+MODEST region selection is configured by editing the CONFIGURATION block at the top of this
+script: REGIONS/INCLUDE_WHOLE for the main muram/modest analysis, CROPPED_REGION/CROP_BOUNDS/
+CROP_LABEL for the "distributions" mode (which doesn't support the REGIONS batch above).
 EOF
 }
 
@@ -118,8 +131,8 @@ while [[ $# -gt 0 ]]; do
       DISTRIBUTION_TARGET="${2:-}"
       shift 2
       ;;
-    --cropped-region)
-      CROPPED_REGION="${2:-}"
+    --include-whole)
+      INCLUDE_WHOLE="${2:-}"
       shift 2
       ;;
     --polarization-mask)
@@ -218,13 +231,23 @@ case "${DISTRIBUTION_TARGET}" in
     ;;
 esac
 
+if [[ ( "${RUN_TARGET}" == "both" || "${RUN_TARGET}" == "modest" ) && ${#REGIONS[@]} -eq 0 ]]; then
+  echo "REGIONS must have at least one entry to run MODEST analysis (--regions-json requires a non-empty region dict). Use INCLUDE_WHOLE=1 to additionally include the whole scene." >&2
+  exit 1
+fi
+
 if ! [[ "${STEP_TO_PLOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid value for --step-to-plot: ${STEP_TO_PLOT} (must be an integer)" >&2
   exit 1
 fi
 
 if [[ "${CROPPED_REGION}" != "0" && "${CROPPED_REGION}" != "1" ]]; then
-  echo "Invalid value for --cropped-region: ${CROPPED_REGION} (use: 0|1)" >&2
+  echo "Invalid value for CROPPED_REGION: ${CROPPED_REGION} (use: 0|1)" >&2
+  exit 1
+fi
+
+if [[ "${INCLUDE_WHOLE}" != "0" && "${INCLUDE_WHOLE}" != "1" ]]; then
+  echo "Invalid value for --include-whole: ${INCLUDE_WHOLE} (use: 0|1)" >&2
   exit 1
 fi
 
@@ -344,6 +367,25 @@ if [[ -n "${TEMP_CALIBRATION_CLIP_QUANTILES}" ]]; then
   TEMP_CALIBRATION_FLAGS="${TEMP_CALIBRATION_FLAGS} --temp-calibration-clip-quantiles ${TEMP_CALIBRATION_CLIP_QUANTILES}"
 fi
 
+# Build --regions-json from the REGIONS array above ("label:Y0,Y1,X0,X1" entries), when set.
+# A python3 -c one-liner is more robust than hand-building JSON in bash.
+REGIONS_JSON=""
+if [[ ${#REGIONS[@]} -gt 0 ]]; then
+  REGIONS_JSON="$(python3 -c '
+import json, sys
+regions = {}
+for entry in sys.argv[1:]:
+    label, bounds = entry.split(":", 1)
+    regions[label] = [int(x) for x in bounds.split(",")]
+print(json.dumps(regions))
+' "${REGIONS[@]}")"
+fi
+
+INCLUDE_WHOLE_FLAG=""
+if [[ "${INCLUDE_WHOLE}" == "1" ]]; then
+  INCLUDE_WHOLE_FLAG="--include-whole"
+fi
+
 # ==============================================================================
 # RUN ANALYSIS
 # ==============================================================================
@@ -358,13 +400,12 @@ fi
 
 if [[ "${RUN_TARGET}" == "both" || "${RUN_TARGET}" == "modest" ]]; then
   python3 "${MUISCA_ROOT}/scripts/analysis/modest_analysis.py" \
-    ${CROPPED_REGION_FLAG} \
-    --crop-bounds "${CROP_BOUNDS[@]}" \
+    --regions-json "${REGIONS_JSON}" \
+    ${INCLUDE_WHOLE_FLAG} \
     ${POLARIZATION_MASK_FLAG} \
     --polarization-threshold "${POLARIZATION_THRESHOLD}" \
     --experiment-root "${EXPERIMENT_ROOT}" \
     --model-types ${MODEL_TYPES} \
-    --crop-label "${CROP_LABEL}" \
     --modest-cache-dir "${MODEST_CACHE_DIR}" \
     --modest-stokes-shift-positions "${MODEST_STOKES_SHIFT_POSITIONS}" \
     --modest-stokes-i-scale "${MODEST_STOKES_I_SCALE}" \

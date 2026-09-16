@@ -134,4 +134,4 @@ Six notebooks document the development incrementally:
 ### Other Utilities
 
 - `utils/model_prof_tools.py` — NICOLE model/profile binary I/O (used for synthesis/inversion integration; see `docs/nicole_integration_guide.md`)
-- `tools/generate_analysis.sh` — shell wrapper over all analysis scripts; edit `EXPERIMENT_ROOT` and `MODEL_TYPES` at the top before running
+- `tools/generate_analysis.sh` — shell wrapper over all analysis scripts; edit `EXPERIMENT_ROOT`, `MODEL_TYPES`, and `REGIONS` (MODEST regions to batch-process, e.g. sunspot/plage/quiet_sun) at the top before running; `--include-whole 0|1` toggles whether the whole (uncropped) scene is also processed alongside `REGIONS`

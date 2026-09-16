@@ -38,7 +38,10 @@ conda activate /homes/observatorio/juagudeloo/.conda/envs/pytorch_jupyter
 # ==============================================================================
 # CONFIGURATION -- keep in sync with generate_tau500_stokes.sh
 # ==============================================================================
-STEPS=(110 120 130 198) # MURaM steps: 110-130 contiguous for train/val, 198 for the OOD test split
+STEPS=(201 212 223) # MURaM steps: later dynamo steps, past the 198-200 OOD test split, kept in
+                     # reserve for possible Bz-balanced fine-tuning (scripts/finetune.py) if
+                     # requested -- NOT added to base training. 110/120/130/198 already exist
+                     # under data/muram-simulation/ and are intentionally left out of this list.
 N_CHUNKS=40              # row-chunks per step (480 rows / N_CHUNKS rows each)
 NX_ROWS=480              # MURaM frame rows (nx)
 
