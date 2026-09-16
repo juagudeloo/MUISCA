@@ -65,24 +65,34 @@ Tesis_maestria_OAN/
 │   ├── base_training.py            # TrainingConfig + core training loop
 │   ├── compute_normalization_stats.py # Builds MHD/Stokes normalization JSONs
 │   ├── finetune.py                 # Bz-balanced fine-tuning of a trained checkpoint
-│   ├── synthesis/                  # τ₅₀₀ Stokes generation & NICOLE comparison
+│   ├── synthesis/                  # τ₅₀₀ Stokes generation & NICOLE round-trip bridge
 │   │   ├── generate_tau500_stokes.py  # Chunked NICOLE synthesis per MURaM step
-│   │   └── merge_tau500_stokes.py     # Reassembles chunks into stokes_<step>_nicole_tau500.npy
+│   │   ├── merge_tau500_stokes.py     # Reassembles chunks into stokes_<step>_nicole_tau500.npy
+│   │   ├── export_predictions.py      # Writes a trained model's predictions to predictions.h5
+│   │   ├── run_nicole_synthesis.py    # Re-synthesizes Stokes from those predictions via NICOLE
+│   │   ├── compare_synthesis.py       # χ² of one model's re-synthesis vs the observed profile
+│   │   ├── compare_models.py          # Same, joined across 2+ models (cross_model_chi2.json, per-pixel overlay plots)
+│   │   ├── aggregate_comparison.py    # χ² distributions binned by |B_LOS| across all sampled pixels
+│   │   └── sample_pixels.py           # |B_LOS|-stratified pixel selection shared by the above
 │   └── experiments/
 │       └── ablation_study.py       # Physics regularization ablation study (5 configurations)
 │
 ├── scripts/analysis/                # Post-training diagnostics
-│   ├── muram_analysis.py           # Diagnostic maps on MURaM steps
-│   ├── modest_analysis.py          # Diagnostic comparison on MODEST data
+│   ├── muram_analysis.py           # Diagnostic maps + multi-model comparison on MURaM steps
+│   ├── modest_analysis.py          # Same on MODEST data; batches multiple regions in one run
 │   └── distributions_analysis.py   # Stokes/MHD histogram comparisons
 │
 ├── tools/                           # Run wrappers (HPC/local)
 │   ├── run_experiments.sh          # SLURM-ready ablation launcher
 │   ├── compute_normalization_stats.sh # SLURM-ready normalization launcher
 │   ├── fine_tune.sh                # SLURM-ready Bz-balanced fine-tuning launcher
-│   ├── generate_tau500_stokes.sh   # τ₅₀₀ Stokes generation (multi-step)
-│   ├── run_nicole_synthesis.sh     # MUISCA → NICOLE forward-synthesis comparison
-│   └── generate_analysis.sh        # Unified analysis launcher (MURaM/MODEST)
+│   ├── generate_tau500_stokes.sh   # τ₅₀₀ Stokes generation (multi-step, SLURM array)
+│   ├── generate_tau500_stokes_single_node.sh # Same, single node (small pilot batches)
+│   ├── run_nicole_synthesis.sh     # MUISCA → NICOLE round-trip; batches MODEST regions
+│   └── generate_analysis.sh        # Unified analysis launcher (MURaM/MODEST); batches MODEST regions
+│
+├── docs/                            # Design notes and investigation write-ups
+│   └── muisca_to_nicole_bridge.md  # Full reference for the synthesis/ bridge above
 │
 ├── notebooks/                       # Jupyter notebooks (documentation & analysis)
 │   ├── 1-muram_mhd_data.ipynb      # MURaM MHD data loading & optical depth mapping
@@ -168,7 +178,14 @@ must be cleared when normalization changes), and `.modest_cache/` (observations)
 - **AnalysisModelPipeline**: Centralized loading of trained experiment models/configs
 - Builds runtime `TrainingConfig` from saved experiment metadata
 - Produces denormalized model predictions and shared tau-grid alignment helpers
-- Includes **MuramDiagnosticPlots** and **ModestDiagnosticPlots** for standardized outputs
+- **MuramDiagnosticPlots** / **ModestDiagnosticPlots**: per-model diagnostic plots
+- `display_name()` maps experiment keys to display names (`no_physics`→Baseline,
+  `wfa_only`→WFA, `doppler_only`→Doppler, `black_body_only`→Black Body) used in every plot
+  title/legend
+- Module-level functions for comparing 2+ trained models side by side in one figure:
+  `plot_combined_jointplot_grid` (scatter grid), `plot_combined_images_grid` (ground truth +
+  one prediction/error column per model, shared color scale), and `plot_metric_vs_tau` /
+  `compute_metric_vs_tau` (RRMSE or correlation vs. log τ, one line per model)
 
 #### `cache_manage.py`
 - **DataCache**: HDF5 caching layer for processed MURaM/MHD/Stokes/physics tensors
@@ -220,15 +237,29 @@ must be cleared when normalization changes), and `.modest_cache/` (observations)
 
 ### 4. **Analysis Scripts** (`scripts/analysis/`)
 
+Both scripts take `--model-types`, a space-separated list of experiment keys
+(`no_physics wfa_only doppler_only black_body_only`, or any subset). With 2 or more models,
+each also writes a `combined/` folder alongside the usual per-model output: jointplot and
+image-grid comparisons (see `plot_combined_*_grid` above) plus one `metric_vs_tau.png` per
+parameter, all with the four models overlaid.
+
 #### `analysis/muram_analysis.py`
 - Loads trained experiment checkpoints and generates MURaM diagnostic plots
 - Uses shared cache and normalizers to compare denormalized predictions vs ground truth
 
 #### `analysis/modest_analysis.py`
-- Runs inference and diagnostics on MODEST products (whole FOV or cropped regions)
+- Runs inference and diagnostics on MODEST products
+- `--regions-json '{"label": [y0,y1,x0,x1], ...}'` processes several cropped regions (plus,
+  with `--include-whole`, the full FOV) in one invocation, loading the models once and
+  reusing them across regions. Without it, falls back to a single region via
+  `--cropped-region`/`--crop-bounds`/`--crop-label`
 - Supports polarization masking and configurable model subset comparisons
 
 ### 5. **Automation Wrappers** (`tools/`)
+
+Every `.sh` wrapper follows the same pattern: a `CONFIGURATION` block of variables at the top
+of the file (edit these directly), a `--run`/`--help` CLI for the few things worth overriding
+per-invocation, and an absolute `MUISCA_ROOT` so they work from any working directory.
 
 #### `run_experiments.sh`
 - SLURM-ready launcher for `scripts/experiments/ablation_study.py`
@@ -238,9 +269,22 @@ must be cleared when normalization changes), and `.modest_cache/` (observations)
 - SLURM-ready launcher for normalization-stat computation script
 - Supports cache toggle, resume mode, and explicit/range logtau configuration
 
+#### `fine_tune.sh`
+- SLURM-ready launcher for `scripts/finetune.py` (Bz-balanced fine-tuning)
+
+#### `generate_tau500_stokes.sh` / `generate_tau500_stokes_single_node.sh`
+- Submit the chunked NICOLE synthesis (`scripts/synthesis/generate_tau500_stokes.py`) for a
+  list of MURaM steps, as a SLURM array or on a single node; edit the `STEPS` array at the top
+
 #### `generate_analysis.sh`
 - Unified entry point to run `muram_analysis.py`, `modest_analysis.py`, or both
-- Exposes runtime flags for crop mode and analysis selection
+- `REGIONS`/`INCLUDE_WHOLE` at the top define which MODEST regions to batch-process in one
+  run; `--include-whole 0|1` toggles the full-FOV pass on the CLI without editing the file
+
+#### `run_nicole_synthesis.sh`
+- Runs the full NICOLE round-trip bridge (`scripts/synthesis/`: sample → export → synthesize →
+  compare, plus the cross-model steps with 2+ `MODEL_TYPES`) for `--source modest|muram`
+- Same `REGIONS`/`INCLUDE_WHOLE` batching as `generate_analysis.sh` for the MODEST source
 
 ---
 
@@ -296,7 +340,7 @@ directly or submitted with `sbatch`. Run them in this order.
 
 4. **Analyze**:
    ```bash
-   ./tools/generate_analysis.sh          # edit EXPERIMENT_ROOT/MODEL_TYPES at the top first
+   ./tools/generate_analysis.sh          # edit EXPERIMENT_ROOT/MODEL_TYPES/REGIONS at the top first
    ```
 
 > **Cluster note:** jobs target `-w maxwell` on `--cluster=fisica`. Use
@@ -571,6 +615,22 @@ Reading `bias` alongside `rmse` is also how you separate a systematic offset fro
 tail: when `bias ≈ mae` the error is almost entirely one-directional, and when the mean and
 median disagree in sign a minority of pixels is driving the aggregate.
 
+### Analysis Plots
+
+Under `images/analysis/{muram,modest}/...`, each model gets its own `surface/` (imshow
+ground-truth/prediction/error) and `jointplots/` folder. With `--model-types` set to 2+
+models, a sibling `combined/` folder is also written, one level above the per-model ones,
+comparing all requested models in the same figure:
+
+| file | contents |
+|---|---|
+| `<param>_..._combined_jointplot.png` | 2×2 scatter grid, one panel per model |
+| `<param>_..._combined_images.png` | ground truth + one prediction/error column per model, shared color scale |
+| `<param>_{rrmse,corr}_vs_tau.png` | that metric vs. log τ, one line per model |
+
+For MODEST, `modest_analysis.py --regions-json ...` writes one such `combined/` per region
+under `images/analysis/modest/{whole,cropped/<label>}/`.
+
 Range of applicability worth keeping in mind: MURaM steps 110–130 hold plenty of pixels below
 ~500 G, few above ~950 G, and none above ~1500 G, while the Hinode sunspot crops reach ~3.7 kG.
 Rows above that range describe extrapolation, not skill.
@@ -634,4 +694,4 @@ This project is developed as part of a Master's thesis at Universidad Nacional d
 
 ---
 
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-09-16
