@@ -65,7 +65,7 @@ def param_latex(param: str, los: bool = False) -> str:
 # Physical unit of each MHD parameter. Every quantity plotted here must carry its unit;
 # quantities that are genuinely dimensionless (the Stokes profiles, normalized to the
 # continuum) are labelled as the explicit ratio instead, so the reader sees why.
-PARAM_UNITS = {"T": "K", "Vz": r"km\,s$^{-1}$", "Bz": "G"}
+PARAM_UNITS = {"T": "K", "Vz": r"$\mathrm{km\,s^{-1}}$", "Bz": "G"}
 
 
 def param_unit(param: str) -> str:
