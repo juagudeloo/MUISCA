@@ -467,10 +467,16 @@ class ModestData:
 	def build_spinor_atmosphere(
 		self,
 		tau_values: Tuple[float, float, float] = (-2.0, -0.8, 0.0),
-		temp_indices: Tuple[int, int, int] = (8, 6, 7),
-		vel_indices: Tuple[int, int, int] = (20, 18, 19),
-		mag_field_indices: Tuple[int, int, int] = (11, 9, 10),
-		gamma_indices: Tuple[int, int, int] = (14, 12, 13),
+		# 0-based planes of inverted_atmos.fits. Its header numbers them 1-based:
+		# LGTRF=3,4,5 (the node log-tau values, constant -2.0/-0.8/0.0, so node order is
+		# ascending), TEMPE=6,7,8, BFIEL=9,10,11, GAMMA=12,13,14, AZIMU=15,16,17,
+		# VELOS=18,19,20, VMICI=21. Subtract one for numpy indexing; getting the first
+		# node wrong reads the first node of the *next* parameter block instead (e.g.
+		# BFIEL as temperature), which is silent because every plane is a plausible float.
+		temp_indices: Tuple[int, int, int] = (5, 6, 7),
+		vel_indices: Tuple[int, int, int] = (17, 18, 19),
+		mag_field_indices: Tuple[int, int, int] = (8, 9, 10),
+		gamma_indices: Tuple[int, int, int] = (11, 12, 13),
 	) -> Dict[str, Dict[float, np.ndarray]]:
 		if self.inverted_atmos is None:
 			raise ValueError("Load inverted atmosphere first")

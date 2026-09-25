@@ -49,25 +49,83 @@ def display_name(model_type: str) -> str:
     return MODEL_DISPLAY_NAMES.get(model_type, model_type)
 
 
-# LaTeX-formatted symbol for each internal MHD parameter key, for plot titles only.
+# LaTeX-formatted symbol for each internal MHD parameter key, for plot titles only. MURaM is
+# synthesised at disc centre, where the vertical components ARE the line-of-sight ones, so its
+# figures keep $V_z$/$B_z$; MODEST figures compare against SPINOR's line-of-sight quantities and
+# must say so, which is what `los=True` selects.
 PARAM_LATEX = {"T": r"$T$", "Vz": r"$V_z$", "Bz": r"$B_z$"}
+PARAM_LATEX_LOS = {"T": r"$T$", "Vz": r"$v_{\mathrm{LOS}}$", "Bz": r"$B_{\mathrm{LOS}}$"}
 
 
-def param_latex(param: str) -> str:
-    return PARAM_LATEX.get(param, f"${param}$")
+def param_latex(param: str, los: bool = False) -> str:
+    table = PARAM_LATEX_LOS if los else PARAM_LATEX
+    return table.get(param, f"${param}$")
 
 
-def combined_plot_title(param: str, context: str, tau_val: float) -> str:
+# Physical unit of each MHD parameter. Every quantity plotted here must carry its unit;
+# quantities that are genuinely dimensionless (the Stokes profiles, normalized to the
+# continuum) are labelled as the explicit ratio instead, so the reader sees why.
+PARAM_UNITS = {"T": "K", "Vz": r"km\,s$^{-1}$", "Bz": "G"}
+
+
+def param_unit(param: str) -> str:
+    return PARAM_UNITS.get(param, "")
+
+
+def param_axis_label(param: str, prefix: str = "", los: bool = False) -> str:
+    """Axis/colorbar label with unit: '$B_z$ [G]', or 'Ground truth [G]' when `prefix` is given."""
+    head = prefix if prefix else param_latex(param, los=los)
+    unit = param_unit(param)
+    return f"{head} [{unit}]" if unit else head
+
+
+# Quantile clip for every image colour scale: 2nd--98th percentile. Kept as one constant so the
+# per-model panels and the combined grids never drift apart.
+IMAGE_COLOR_QUANTILE = 0.02
+
+# Helioprojective geometry of the MODEST scan, the same values used for the observation
+# figures of the paper: FOV centre (Solar-X, Solar-Y) in arcsec and the Hinode/SP fast-map
+# pixel scale. Crops are located with these so a map can be placed inside the full scene.
+MODEST_FOV_CENTER_ARCSEC = (16.0, -126.0)
+MODEST_PIXEL_SCALE_ARCSEC = 0.32
+
+
+def modest_crop_extent(
+    crop_bounds: tuple[int, int, int, int],
+    scene_shape: tuple[int, int],
+) -> tuple[tuple[float, float, float, float], tuple[str, str]]:
+    """Helioprojective extent of a MODEST crop given in native pixels (y0, y1, x0, x1).
+
+    Returned in the transposed orientation the combined image grids draw in (horizontal axis =
+    scan Y, vertical axis = X), and computed from the NATIVE bounds so it is independent of
+    whether the predictions live on the upsampled 0.16" grid or the native 0.32" one."""
+    y0, y1, x0, x1 = (float(v) for v in crop_bounds)
+    ny, nx = (float(v) for v in scene_shape)
+    x_center, y_center = MODEST_FOV_CENTER_ARCSEC
+    scale = MODEST_PIXEL_SCALE_ARCSEC
+
+    def to_x(px: float) -> float:
+        return x_center + (px - nx / 2.0) * scale
+
+    def to_y(py: float) -> float:
+        return y_center + (py - ny / 2.0) * scale
+
+    # imshow's extent maps array EDGES, not pixel centres -- hence the half-pixel offset.
+    extent = (to_y(y0 - 0.5), to_y(y1 - 0.5), to_x(x0 - 0.5), to_x(x1 - 0.5))
+    return extent, ("Solar-Y [arcsec]", "Solar-X [arcsec]")
+
+
+def combined_plot_title(param: str, context: str, tau_val: float, los: bool = False) -> str:
     """Shared title format for the combined multi-model comparison figures, e.g.
     '$B_z$ - Simulation step 198 | $\\log \\tau = -1.00$'."""
-    return f"{param_latex(param)} - {context} | " + r"$\log \tau = " + f"{tau_val:.2f}" + r"$"
+    return f"{param_latex(param, los=los)} - {context} | " + r"$\log \tau = " + f"{tau_val:.2f}" + r"$"
 
 
-def combined_plot_title_no_tau(param: str, context: str) -> str:
+def combined_plot_title_no_tau(param: str, context: str, los: bool = False) -> str:
     """Same title format as combined_plot_title but without a fixed tau value, for figures
     where log(tau) is the plot's own X axis (e.g. metric-vs-tau curves), e.g.
     '$B_z$ - Simulation step 198'."""
-    return f"{param_latex(param)} - {context}"
+    return f"{param_latex(param, los=los)} - {context}"
 
 
 def ordered_models(models: dict) -> list[str]:
@@ -622,14 +680,14 @@ class MuramDiagnosticPlots:
 
         axes[0].plot(wl, I_mean, color="tab:orange", linewidth=1.8, label="Mean I")
         axes[0].fill_between(wl, I_mean - I_std, I_mean + I_std, color="tab:orange", alpha=0.25, label="±1σ")
-        axes[0].set_ylabel("Stokes I")
+        axes[0].set_ylabel(r"$I / I_\mathrm{c}$")
         axes[0].grid(True, alpha=0.25)
         axes[0].legend(loc="best", fontsize=9)
 
         axes[1].plot(wl, V_mean, color="tab:purple", linewidth=1.8, label="Mean V")
         axes[1].fill_between(wl, V_mean - V_std, V_mean + V_std, color="tab:purple", alpha=0.25, label="±1σ")
         axes[1].set_xlabel("Wavelength [Angstrom]")
-        axes[1].set_ylabel("Stokes V")
+        axes[1].set_ylabel(r"$V / I_\mathrm{c}$")
         axes[1].grid(True, alpha=0.25)
         axes[1].legend(loc="best", fontsize=9)
 
@@ -655,30 +713,33 @@ class MuramDiagnosticPlots:
         err_map = pred_map - true_map
         both = np.concatenate([true_map.ravel(), pred_map.ravel()])
 
+        q = IMAGE_COLOR_QUANTILE
         if p in ("Vz", "Bz"):
-            vmax = np.nanquantile(np.abs(both), 0.99)
+            vmax = np.nanquantile(np.abs(both), 1.0 - q)
             vmin = -vmax
         else:
-            vmin, vmax = np.nanquantile(both, [0.01, 0.99])
+            vmin, vmax = np.nanquantile(both, [q, 1.0 - q])
 
-        emax = np.nanquantile(np.abs(err_map.ravel()), 0.99)
+        emax = np.nanquantile(np.abs(err_map.ravel()), 1.0 - q)
         param_cmap = self.param_cmaps.get(p, "viridis")
 
         fig, ax = plt.subplots(1, 3, figsize=(14, 4))
         im0 = ax[0].imshow(true_map.T, origin="lower", cmap=param_cmap, vmin=vmin, vmax=vmax)
         ax[0].set_title(f"GT {p}")
         ax[0].axis("off")
-        plt.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
+        plt.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04).set_label(param_axis_label(p))
 
         im1 = ax[1].imshow(pred_map.T, origin="lower", cmap=param_cmap, vmin=vmin, vmax=vmax)
         ax[1].set_title(f"Pred {p}")
         ax[1].axis("off")
-        plt.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+        plt.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04).set_label(param_axis_label(p))
 
         im2 = ax[2].imshow(err_map.T, origin="lower", cmap=self.error_cmap, vmin=-emax, vmax=emax)
         ax[2].set_title(f"Error {p}")
         ax[2].axis("off")
-        plt.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
+        plt.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04).set_label(
+            param_axis_label(p, "Pred - GT")
+        )
 
         fig.suptitle(f"Final Model | {display_name(self.model_name)} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}")
         fig.tight_layout()
@@ -713,8 +774,8 @@ class MuramDiagnosticPlots:
         g.ax_joint.plot([lo, hi], [lo, hi], "r--", lw=1.2)
         g.ax_joint.set_xlim(lo, hi)
         g.ax_joint.set_ylim(lo, hi)
-        g.ax_joint.set_xlabel("Ground truth")
-        g.ax_joint.set_ylabel("Prediction")
+        g.ax_joint.set_xlabel(param_axis_label(p, "Ground truth"))
+        g.ax_joint.set_ylabel(param_axis_label(p, "Prediction"))
         g.fig.suptitle(
             f"Final Model | {display_name(self.model_name)} | Snapshot {self.label} | {p} @ log(tau)={od_eff:.2f}\n"
             f"Corr={format_metric(metrics['corr'])}, R²={format_metric(metrics['r2'])}, "
@@ -806,6 +867,7 @@ def plot_combined_jointplot_grid(
     tau_val: float,
     save_path: Path,
     model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+    los: bool = False,
     max_points: int = 20000,
 ) -> None:
     """2x2 grid of ground-truth-vs-prediction scatter panels, one per model, sharing axis
@@ -888,11 +950,11 @@ def plot_combined_jointplot_grid(
         ax.set_ylim(lo, hi)
         ax.set_title(display_name(m), fontsize=14)
         if paired_by_model[m]:
-            ax.set_xlabel("Ground truth", fontsize=12)
-            ax.set_ylabel("Prediction", fontsize=12)
+            ax.set_xlabel(param_axis_label(param, "Ground truth", los=los), fontsize=12)
+            ax.set_ylabel(param_axis_label(param, "Prediction", los=los), fontsize=12)
         else:
-            ax.set_xlabel("Ground truth (quantiles)", fontsize=12)
-            ax.set_ylabel("Prediction (quantiles)", fontsize=12)
+            ax.set_xlabel(param_axis_label(param, "Ground truth (quantiles)", los=los), fontsize=12)
+            ax.set_ylabel(param_axis_label(param, "Prediction (quantiles)", los=los), fontsize=12)
         ax.tick_params(labelsize=11)
         ax.grid(True, alpha=0.25)
         if m in metrics_text_by_model:
@@ -901,7 +963,7 @@ def plot_combined_jointplot_grid(
                 verticalalignment="top", bbox=metrics_box_props,
             )
 
-    fig.suptitle(combined_plot_title(param, title_suffix, tau_val), fontsize=16, fontweight="bold")
+    fig.suptitle(combined_plot_title(param, title_suffix, tau_val, los=los), fontsize=16, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -916,7 +978,10 @@ def plot_combined_images_grid(
     tau_val: float,
     save_path: Path,
     model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+    los: bool = False,
     transpose: bool = True,
+    extent: tuple[float, float, float, float] | None = None,
+    extent_labels: tuple[str, str] | None = None,
 ) -> None:
     """2-row x (1 + N-model)-column comparison figure: column 1 is Ground Truth (row 0 only;
     row 1 under it is left blank); each subsequent column is one model, with its prediction on
@@ -926,7 +991,12 @@ def plot_combined_images_grid(
     image axis via make_axes_locatable) so every image panel -- GT and all N models' predictions/
     errors -- gets the exact same GridSpec cell; set_box_aspect(panel_aspect) then locks each to
     an identical box matching the region's true height/width ratio (not forced square -- MODEST
-    crops like plage/negative_region/whole are naturally elongated rectangles, not squares)."""
+    crops like plage/negative_region/whole are naturally elongated rectangles, not squares).
+
+    `extent` (already in the transposed panel orientation) puts every panel on a physical
+    coordinate grid -- arcsec for MODEST crops, Mm for MURaM -- with ticks drawn on the ground
+    truth panel and the first error panel only, so the figure carries a spatial scale without
+    cluttering every cell. Without it the panels keep their old tick-less look."""
     plt.rcParams["font.family"] = "serif"
     models_present = [m for m in model_order if m in pred_by_model]
     if len(models_present) < 2:
@@ -959,48 +1029,69 @@ def plot_combined_images_grid(
     # -- GT should always render at full contrast, while a model whose predictions exceed that
     # range shows as saturated color, which is itself informative (it flags over/under-shoot
     # relative to the true physical range).
+    q = IMAGE_COLOR_QUANTILE
     finite_gt = gt[np.isfinite(gt)]
     if finite_gt.size == 0:
         vmin, vmax = 0.0, 1.0
     elif param in ("Vz", "Bz"):
-        vmax = float(np.nanquantile(np.abs(finite_gt), 0.99))
+        vmax = float(np.nanquantile(np.abs(finite_gt), 1.0 - q))
         vmin = -vmax
     else:
-        vmin, vmax = (float(v) for v in np.nanquantile(finite_gt, [0.01, 0.99]))
+        vmin, vmax = (float(v) for v in np.nanquantile(finite_gt, [q, 1.0 - q]))
 
     err_vals = [e[np.isfinite(e)] for e in errs.values() if e is not None]
-    emax = float(np.nanquantile(np.abs(np.concatenate(err_vals)), 0.99)) if err_vals else 1.0
+    emax = float(np.nanquantile(np.abs(np.concatenate(err_vals)), 1.0 - q)) if err_vals else 1.0
 
     n_models = len(models_present)
-    # Columns: [gt colorbar | GT | model_1 | ... | model_N | error colorbar]. GT and the N
-    # model columns all share width_ratio 1.0 so they're identically sized; the colorbar
-    # columns are narrow slivers that don't steal space from any image panel.
-    n_cols = n_models + 3
-    width_ratios = [0.05] + [1.0] * (n_models + 1) + [0.05]
+    # Columns: [gt colorbar | spacer | GT | model_1 | ... | model_N | error colorbar]. GT and
+    # the N model columns all share width_ratio 1.0 so they're identically sized; the colorbar
+    # columns are narrow slivers that don't steal space from any image panel. The spacer is an
+    # unused column that keeps the ground-truth panel's y tick labels from landing on top of
+    # its colorbar once a spatial extent is drawn.
+    n_cols = n_models + 4
+    spacer_ratio = 0.30 if extent is not None else 0.02
+    width_ratios = [0.05, spacer_ratio] + [1.0] * (n_models + 1) + [0.05]
     col_width_in = 2.6
     fig_width = col_width_in * (n_models + 1) + 1.0
     fig_height = col_width_in * panel_aspect * 2 + 0.9
     fig = plt.figure(figsize=(fig_width, fig_height))
     gs = GridSpec(2, n_cols, figure=fig, width_ratios=width_ratios, hspace=0.12, wspace=0.12)
 
-    ax_gt = fig.add_subplot(gs[0, 1])
+    # imshow's own aspect would fight set_box_aspect once a physical extent is given, so the
+    # box keeps the region's true ratio and the image is stretched to fill it.
+    imshow_kw = {"origin": "lower", "extent": extent}
+    if extent is not None:
+        imshow_kw["aspect"] = "auto"
+
+    def _spatial_ticks(ax) -> None:
+        """Ticks + axis names where the figure shows its spatial scale; bare panel otherwise."""
+        if extent is None:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return
+        ax.tick_params(labelsize=9)
+        if extent_labels is not None:
+            ax.set_xlabel(extent_labels[0], fontsize=11)
+            ax.set_ylabel(extent_labels[1], fontsize=11)
+
+    ax_gt = fig.add_subplot(gs[0, 2])
     ax_gt.set_box_aspect(panel_aspect)
-    im_gt = ax_gt.imshow(gt, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    im_gt = ax_gt.imshow(gt, cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kw)
     ax_gt.set_title("Ground Truth", fontsize=14)
-    ax_gt.set_xticks([])
-    ax_gt.set_yticks([])
+    _spatial_ticks(ax_gt)
 
     cax_gt = fig.add_subplot(gs[0, 0])
     cbar_gt = plt.colorbar(im_gt, cax=cax_gt)
     cax_gt.yaxis.set_ticks_position("left")
     cax_gt.yaxis.set_label_position("left")
+    cbar_gt.set_label(param_axis_label(param, los=los), fontsize=11)
     cbar_gt.ax.tick_params(labelsize=10)
 
     last_err_im = None
-    for col, m in enumerate(models_present, start=2):
+    for col, m in enumerate(models_present, start=3):
         ax_pred = fig.add_subplot(gs[0, col])
         ax_pred.set_box_aspect(panel_aspect)
-        ax_pred.imshow(preds[m], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax_pred.imshow(preds[m], cmap=cmap, vmin=vmin, vmax=vmax, **imshow_kw)
         ax_pred.set_title(display_name(m), fontsize=14)
         ax_pred.set_xticks([])
         ax_pred.set_yticks([])
@@ -1008,23 +1099,28 @@ def plot_combined_images_grid(
         ax_err = fig.add_subplot(gs[1, col])
         ax_err.set_box_aspect(panel_aspect)
         if errs[m] is not None:
-            last_err_im = ax_err.imshow(errs[m], origin="lower", cmap="RdBu_r", vmin=-emax, vmax=emax)
+            last_err_im = ax_err.imshow(errs[m], cmap="RdBu_r", vmin=-emax, vmax=emax, **imshow_kw)
         else:
             ax_err.text(0.5, 0.5, "shape\nmismatch", ha="center", va="center",
                         transform=ax_err.transAxes, fontsize=10)
-        ax_err.set_xticks([])
-        ax_err.set_yticks([])
-        if col == 2:
+        if col == 3:
             ax_pred.set_ylabel("", fontsize=13)
-            ax_err.set_ylabel("Error", fontsize=13)
+            # Once the panels carry spatial ticks the error row is named by its own colorbar
+            # ("Pred - GT [unit]"), which frees the ylabel slot for the coordinate name.
+            _spatial_ticks(ax_err)
+            if extent is None:
+                ax_err.set_ylabel("Error", fontsize=13)
+        else:
+            ax_err.set_xticks([])
+            ax_err.set_yticks([])
 
     if last_err_im is not None:
         cax_err = fig.add_subplot(gs[1, n_cols - 1])
         cbar_err = plt.colorbar(last_err_im, cax=cax_err)
-        cbar_err.set_label("Pred - GT", fontsize=11)
+        cbar_err.set_label(param_axis_label(param, "Pred - GT", los=los), fontsize=11)
         cbar_err.ax.tick_params(labelsize=10)
 
-    fig.suptitle(combined_plot_title(param, title_suffix, tau_val), fontsize=16, fontweight="bold")
+    fig.suptitle(combined_plot_title(param, title_suffix, tau_val, los=los), fontsize=16, fontweight="bold")
     plt.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -1064,6 +1160,7 @@ def plot_metric_vs_tau(
     title_suffix: str,
     save_path: Path,
     model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
+    los: bool = False,
 ) -> None:
     """Single-panel, single-paper-column figure (~3.4in wide): one metric_key ("rrmse" or
     "corr") vs log(tau), one line+marker per model. Kept as a single-metric figure per file
@@ -1087,7 +1184,7 @@ def plot_metric_vs_tau(
     # Below the x-axis, not "best" -- with 4 lines "best" placement can land on top of the
     # data itself (e.g. correlation curves that cross near the legend's preferred corner).
     ax.legend(fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.22), frameon=False)
-    ax.set_title(combined_plot_title_no_tau(param, title_suffix), fontsize=10, fontweight="bold")
+    ax.set_title(combined_plot_title_no_tau(param, title_suffix, los=los), fontsize=10, fontweight="bold")
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -1403,25 +1500,28 @@ class ModestDiagnosticPlots:
             if (np.isfinite(gt).any() and np.isfinite(pr).any())
             else np.array([0.0, 1.0])
         )
+        q = IMAGE_COLOR_QUANTILE
         if param in ("Vz", "Bz"):
-            vmax = np.quantile(np.abs(vals), 0.99)
+            vmax = np.quantile(np.abs(vals), 1.0 - q)
             vmin = -vmax
         else:
-            vmin, vmax = np.quantile(vals, [0.01, 0.99])
+            vmin, vmax = np.quantile(vals, [q, 1.0 - q])
 
         fig, axes = plt.subplots(1, 3, figsize=(16, 5))
         im0 = axes[0].imshow(gt, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         axes[0].set_title(f"Ground truth ({gt.shape[0]}x{gt.shape[1]})")
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04).set_label(param_axis_label(param, los=True))
         im1 = axes[1].imshow(pr, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         axes[1].set_title(f"Prediction ({pr.shape[0]}x{pr.shape[1]})")
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04).set_label(param_axis_label(param, los=True))
         if gt.shape == pr.shape:
             er = pr - gt
-            emax = np.quantile(np.abs(er[np.isfinite(er)]), 0.99) if np.isfinite(er).any() else 1.0
+            emax = np.quantile(np.abs(er[np.isfinite(er)]), 1.0 - q) if np.isfinite(er).any() else 1.0
             im2 = axes[2].imshow(er, origin="lower", cmap="RdBu_r", vmin=-emax, vmax=emax)
             axes[2].set_title("Error (Pred-GT)")
-            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04).set_label(
+                param_axis_label(param, "Pred - GT", los=True)
+            )
         else:
             axes[2].text(
                 0.5,
@@ -1444,6 +1544,7 @@ class ModestDiagnosticPlots:
         pred_2d: np.ndarray,
         title: str,
         save_path: Path,
+        param: str = "",
         max_points: int = 50000,
     ) -> tuple[dict[str, float], str] | None:
         if true_2d.shape == pred_2d.shape:
@@ -1503,11 +1604,11 @@ class ModestDiagnosticPlots:
         g.ax_joint.set_xlim(lo, hi)
         g.ax_joint.set_ylim(lo, hi)
         if comparison == "paired_pixel":
-            g.ax_joint.set_xlabel("Ground truth")
-            g.ax_joint.set_ylabel("Prediction")
+            g.ax_joint.set_xlabel(param_axis_label(param, "Ground truth", los=True))
+            g.ax_joint.set_ylabel(param_axis_label(param, "Prediction", los=True))
         else:
-            g.ax_joint.set_xlabel("Ground truth (quantiles)")
-            g.ax_joint.set_ylabel("Prediction (quantiles)")
+            g.ax_joint.set_xlabel(param_axis_label(param, "Ground truth (quantiles)", los=True))
+            g.ax_joint.set_ylabel(param_axis_label(param, "Prediction (quantiles)", los=True))
         g.fig.suptitle(
             f"{title}\n"
             f"{title_metrics}",
@@ -1577,14 +1678,14 @@ class ModestDiagnosticPlots:
 
         axes[0].plot(wl, I_mean, color="tab:orange", linewidth=1.8, label="Mean I")
         axes[0].fill_between(wl, I_mean - I_std, I_mean + I_std, color="tab:orange", alpha=0.25, label="±1σ")
-        axes[0].set_ylabel("Stokes I")
+        axes[0].set_ylabel(r"$I / I_\mathrm{c}$")
         axes[0].grid(True, alpha=0.25)
         axes[0].legend(loc="best", fontsize=9)
 
         axes[1].plot(wl, V_mean, color="tab:purple", linewidth=1.8, label="Mean V")
         axes[1].fill_between(wl, V_mean - V_std, V_mean + V_std, color="tab:purple", alpha=0.25, label="±1σ")
         axes[1].set_xlabel("Wavelength [Angstrom]")
-        axes[1].set_ylabel("Stokes V")
+        axes[1].set_ylabel(r"$V / I_\mathrm{c}$")
         axes[1].grid(True, alpha=0.25)
         axes[1].legend(loc="best", fontsize=9)
 
@@ -1691,7 +1792,10 @@ class ModestDiagnosticPlots:
                         continue
                     true_map = true_cube[:, :, i_mod]
                     pred_map = pred_cube[:, :, i_pred]
-                    plot_title = f"{display_name(model_type)} | {param} | matched log(tau)={tau_val:.2f}"
+                    plot_title = (
+                        f"{display_name(model_type)} | {param_latex(param, los=True)} | "
+                        f"matched log(tau)={tau_val:.2f}"
+                    )
                     if param == "T" and calibration_mode == "apply_fit":
                         if applied_by_tau_idx.get(i_pred) is not None:
                             plot_title += " | post-calibrated (apply_fit)"
@@ -1710,6 +1814,7 @@ class ModestDiagnosticPlots:
                         pred_2d=pred_map,
                         title=plot_title,
                         save_path=joint_dir / f"{param}_tau_{tau_val:+.2f}_jointplot.png",
+                        param=param,
                     )
                     # Range-of-applicability breakdown: same comparison, split by the true
                     # |B_LOS| of each pixel, so the strong-field regime (where MURaM has few
@@ -1782,6 +1887,20 @@ class ModestDiagnosticPlots:
             any_matches = next(iter(matches_by_model.values()))
             i_mod_by_tau = {round(float(t), 6): i_mod for t, i_mod, _ in any_matches}
 
+            # Helioprojective extent of the crop, so the maps carry a spatial scale that can be
+            # matched against the full-scene figure. Derived from the NATIVE crop bounds, which
+            # is why it holds whether or not the predictions were downsampled back to 0.32".
+            scene = getattr(self.modest, "continuum", None)
+            if scene is not None:
+                scene_shape = (int(scene.shape[0]), int(scene.shape[1]))
+                if getattr(self.args, "cropped_region", False):
+                    crop_bounds = tuple(int(v) for v in self.args.crop_bounds)
+                else:
+                    crop_bounds = (0, scene_shape[0], 0, scene_shape[1])
+                map_extent, map_extent_labels = modest_crop_extent(crop_bounds, scene_shape)
+            else:
+                map_extent, map_extent_labels = None, None
+
             for param in ("T", "Vz", "Bz"):
                 true_cube = self.modest_mhd_data[param]
                 for tau_r in common_tau_vals:
@@ -1805,6 +1924,7 @@ class ModestDiagnosticPlots:
                         title_suffix=title_context,
                         tau_val=tau_r,
                         save_path=combined_dir / f"{param}_tau_{tau_r:+.2f}_combined_jointplot.png",
+                        los=True,
                     )
                     plot_combined_images_grid(
                         true_map=true_map,
@@ -1813,6 +1933,9 @@ class ModestDiagnosticPlots:
                         title_suffix=title_context,
                         tau_val=tau_r,
                         save_path=combined_dir / f"{param}_tau_{tau_r:+.2f}_combined_images.png",
+                        extent=map_extent,
+                        extent_labels=map_extent_labels,
+                        los=True,
                     )
 
             # Metric-vs-log(tau) summary curves, one line per model. MODEST's real ground truth
@@ -1839,5 +1962,6 @@ class ModestDiagnosticPlots:
                         metrics_by_model=metrics_by_model,
                         title_suffix=title_context,
                         save_path=combined_dir / f"{param}_{metric_key}_vs_tau.png",
+                        los=True,
                     )
             print(f"Combined multi-model figures saved to: {combined_dir}")

@@ -138,14 +138,14 @@ def _plot_modest_stokes_mean_std(
 
     axes[0].plot(wl, I_mean, color="tab:orange", linewidth=1.8, label="Mean I")
     axes[0].fill_between(wl, I_mean - I_std, I_mean + I_std, color="tab:orange", alpha=0.25, label="±1σ")
-    axes[0].set_ylabel("Stokes I")
+    axes[0].set_ylabel(r"$I / I_\mathrm{c}$")
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="best", fontsize=9)
 
     axes[1].plot(wl, V_mean, color="tab:purple", linewidth=1.8, label="Mean V")
     axes[1].fill_between(wl, V_mean - V_std, V_mean + V_std, color="tab:purple", alpha=0.25, label="±1σ")
     axes[1].set_xlabel("Wavelength [Angstrom]")
-    axes[1].set_ylabel("Stokes V")
+    axes[1].set_ylabel(r"$V / I_\mathrm{c}$")
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="best", fontsize=9)
 

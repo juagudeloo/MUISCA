@@ -17,6 +17,10 @@ from utils.analysis import (
 )
 from scripts.base_training import TrainingConfig, load_and_prepare_step
 
+# Horizontal size of one MURaM surface pixel, in Mm (25 km, see TrainingConfig's 480x480 grid
+# spanning 12x12 Mm). Used to put the comparison maps on a physical scale.
+MURAM_PIXEL_SIZE_MM = 0.025
+
 
 # -----------------------------------------------------------------------------
 # Main MURaM analysis flow
@@ -153,6 +157,9 @@ def main(args):
                     tau_val=od_eff,
                     save_path=combined_dir / f"{p}_logtau_{od_eff:.2f}_combined_jointplot.png",
                 )
+                # The grids draw the maps transposed, so the horizontal axis is the map's
+                # first index and the vertical one its second.
+                n_horizontal, n_vertical = true_map.shape[:2]
                 plot_combined_images_grid(
                     true_map=true_map,
                     pred_by_model=pred_by_model,
@@ -160,6 +167,9 @@ def main(args):
                     title_suffix=title_context,
                     tau_val=od_eff,
                     save_path=combined_dir / f"{p}_logtau_{od_eff:.2f}_combined_images.png",
+                    extent=(0.0, n_horizontal * MURAM_PIXEL_SIZE_MM,
+                            0.0, n_vertical * MURAM_PIXEL_SIZE_MM),
+                    extent_labels=("X [Mm]", "Y [Mm]"),
                 )
 
         # Metric-vs-log(tau) summary curves, one line per model, across the FULL tau grid (not
