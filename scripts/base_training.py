@@ -969,9 +969,15 @@ def load_and_prepare_step(
     region_sampling_info = None
     bz_balance_info = None
 
-    # Try to load from cache (strict first, then relaxed hash fallback)
+    # Try to load from cache (strict first, then relaxed hash fallback). The relaxed fallback
+    # only exists so legacy per-step-Ic caches survive the move to a fixed global Ic. It must
+    # not apply to nicole_tau500: TrainingConfig forces that source to per_step, so the
+    # fallback would accept any cache and serve physics approximations (e.g. `temp`) computed
+    # by older code.
     allow_relaxed_cache_fallback = (
-        config.stokes_ic_mode == "per_step" and config.stokes_fixed_ic is None
+        config.data_source == "muram_legacy"
+        and config.stokes_ic_mode == "per_step"
+        and config.stokes_fixed_ic is None
     )
 
     if cache is not None:
