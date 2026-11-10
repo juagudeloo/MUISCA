@@ -436,6 +436,8 @@ class AnalysisModelPipeline:
                 "vlos_target_logtau": phys_cfg.get("vlos_target_logtau", -1.0),
                 "temp_physics_mode": phys_cfg.get("temp_physics_mode", "single_height"),
                 "temp_target_logtau": phys_cfg.get("temp_target_logtau", 0.0),
+                "temp_continuum_indices": phys_cfg.get("temp_continuum_indices", None),
+                "temp_continuum_wavelength": phys_cfg.get("temp_continuum_wavelength", None),
                 "logtau_values": data_cfg.get("logtau_values", None),
             })
 

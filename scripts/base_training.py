@@ -49,7 +49,7 @@ from utils.modest_data import ModestData
 from utils.normalizer import MhdNormalizer, StokesNormalizer
 from utils.cache_manage import MuramDataCache, ModestDataCache, BalancedTrainDataCache
 from models.pinn_mscnn_model import PhysicsInformedMSCNN
-from utils.physics_utils import ApproxInversions
+from utils.physics_utils import ApproxInversions, TEMP_BB_METHOD
 
 
 @dataclass
@@ -125,10 +125,10 @@ class TrainingConfig:
     vlos_physics_mode: str = "single_height"  # 'tau_averaged' or 'single_height'
     vlos_target_logtau: float | None = -1.0  # Target log(tau) for V_LOS single_height mode
     temp_physics_mode: str = "single_height"  # 'tau_averaged' or 'single_height'
-    temp_target_logtau: float | None = 0.0  # Target log(tau) for temperature single_height mode
-    temp_reference_temperature: float = 6000.0  # Reference temperature for blackbody (Kelvin)
+    # -0.2 ~ tau = 2/3, where the continuum brightness temperature forms (Eddington-Barbier)
+    temp_target_logtau: float | None = -0.2  # Target log(tau) for temperature single_height mode
     temp_continuum_indices: list[int] | None = None  # Continuum indices for temperature estimation
-    temp_continuum_wavelength: float = 6300.5  # Angstroms
+    temp_continuum_wavelength: float | None = None  # Angstroms; None = mean wavelength of the indices
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -262,7 +262,8 @@ class TrainingConfig:
             if not np.isfinite(float(self.stokes_fixed_ic)) or float(self.stokes_fixed_ic) <= 0:
                 raise ValueError(f"stokes_fixed_ic must be finite and > 0, got {self.stokes_fixed_ic}")
         if self.temp_continuum_indices is None:
-            self.temp_continuum_indices = [0, 1, 2, 3]
+            # Red end of the Hinode grid (6303.19-6303.26 A); the blue end is in the Fe I 6301.5 wing
+            self.temp_continuum_indices = [108, 109, 110, 111]
         valid_wfa_gate_modes = {"off", "threshold", "plateau"}
         if self.wfa_gate_mode not in valid_wfa_gate_modes:
             raise ValueError(
@@ -501,6 +502,22 @@ def build_cache_config_signature(config: TrainingConfig) -> dict:
         'stokes_ic_mode': str(config.stokes_ic_mode),
         'stokes_fixed_ic': None if config.stokes_fixed_ic is None else float(config.stokes_fixed_ic),
         'stokes_mult_factor': float(config.stokes_mult_factor),
+        **_temperature_approx_signature(config),
+    }
+
+
+def _temperature_approx_signature(config: TrainingConfig) -> dict:
+    """Black-body settings that change the cached `approximations/temp`.
+
+    `temp_bb_method` names the current algorithm, so a change to the math invalidates caches
+    built by older code instead of silently reusing their temperatures.
+    """
+    return {
+        'temp_bb_method': TEMP_BB_METHOD,
+        'temp_continuum_indices': tuple(int(x) for x in config.temp_continuum_indices),
+        'temp_continuum_wavelength': (
+            None if config.temp_continuum_wavelength is None else float(config.temp_continuum_wavelength)
+        ),
     }
 
 
@@ -527,6 +544,7 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
         "stokes_ic_mode": str(config.stokes_ic_mode),
         "stokes_fixed_ic": None if config.stokes_fixed_ic is None else float(config.stokes_fixed_ic),
         "stokes_mult_factor": float(config.stokes_mult_factor),
+        **{k: list(v) if isinstance(v, tuple) else v for k, v in _temperature_approx_signature(config).items()},
     }
 
 
@@ -1196,8 +1214,11 @@ def load_and_prepare_step(
     # Compute temperature approximation using blackbody method
     temp_approx = inv.compute_temperature_blackbody(
         cont_indices=config.temp_continuum_indices,
-        reference_temperature=config.temp_reference_temperature * u.K,
-        continuum_wavelength=config.temp_continuum_wavelength * u.Angstrom
+        continuum_wavelength=(
+            None if config.temp_continuum_wavelength is None
+            else config.temp_continuum_wavelength * u.Angstrom
+        ),
+        hsra_normalized=(config.data_source == "nicole_tau500"),
     ).value  # (nx, ny)
     
     approx_data = {
@@ -2771,7 +2792,7 @@ def train_pinn_model(config: TrainingConfig):
     print(f"Temperature physics mode: {config.temp_physics_mode}")
     if config.temp_physics_mode == "single_height":
         print(f"Temperature target log(tau): {config.temp_target_logtau}")
-    print(f"Temperature reference: {config.temp_reference_temperature} K")
+    print(f"Temperature continuum indices: {config.temp_continuum_indices}")
     print(f"Epoch plots: {config.enable_epoch_plots}")
     if config.enable_epoch_plots:
         print(f"Epoch plot step: {config.epoch_plot_step if config.epoch_plot_step is not None else 'first val step'}")

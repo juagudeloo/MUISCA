@@ -66,7 +66,8 @@ VLOS_MODE='single_height'       # 'tau_averaged' or 'single_height'
 VLOS_TARGET_LOGTAU=-1.0         # Only used if VLOS_MODE='single_height'
 
 TEMP_MODE='single_height'       # 'tau_averaged' or 'single_height'
-TEMP_TARGET_LOGTAU=0.0          # Only used if TEMP_MODE='single_height' (0.0 = photosphere)
+TEMP_TARGET_LOGTAU=-0.2         # Only used if TEMP_MODE='single_height' (-0.2 ~ tau=2/3, where the continuum forms)
+TEMP_CONTINUUM_INDICES=(108 109 110 111)  # Hinode-grid continuum points for the black-body temperature (red end)
 
 # Optional train-time WFA gate
 WFA_GATE_MODE='plateau'         # 'off', 'threshold', or 'plateau'
@@ -186,6 +187,7 @@ python3 "${MUISCA_ROOT}/scripts/experiments/ablation_study.py" \
     --vlos_target_logtau "${VLOS_TARGET_LOGTAU}" \
     --temp_physics_mode "${TEMP_MODE}" \
     --temp_target_logtau "${TEMP_TARGET_LOGTAU}" \
+    --temp_continuum_indices "${TEMP_CONTINUUM_INDICES[@]}" \
     --wfa-gate-mode "${WFA_GATE_MODE}" \
     --wfa-gate-threshold "${WFA_GATE_THRESHOLD}" \
     --wfa-gate-patience "${WFA_GATE_PATIENCE}" \
