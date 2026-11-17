@@ -20,6 +20,47 @@ from scipy.stats import pearsonr
 from scipy.optimize import curve_fit
 
 
+# NICOLE's `Continuum reference = 1` divides every profile by the HSRA disk-centre continuum
+# at the middle of the synthesized range. The nicole_tau500 training cubes span
+# 6300.5 + 300 * 0.01 A, so that normalization wavelength is 6302.0 A.
+HSRA_REFERENCE_WAVELENGTH = 6302.0 * u.Angstrom
+
+# Identifies the black-body algorithm in cache signatures; change it whenever the math changes.
+TEMP_BB_METHOD = "planck_exact_hsra"
+
+# Coefficients of NICOLE's `conhsra` polynomial fit to the HSRA disk-centre continuum, segment
+# 6250 <= lambda < 8300 A (NICOLE/forward/forward.f90, array c4; max error 0.125 %). Lambda in
+# Angstrom, result in erg s^-1 cm^-2 cm^-1 sr^-1, i.e. per unit wavelength (NICOLE manual,
+# `Continuum reference`).
+_CONHSRA_C4 = (4.861821e15, -2.2589885e12, 4.3764376e8, -39279.61444, 1.34388)
+_CONHSRA_C4_RANGE_AA = (6250.0, 8300.0)
+
+
+def hsra_continuum_intensity(wavelength: u.Quantity) -> u.Quantity:
+    """HSRA disk-centre continuum intensity per unit wavelength, from NICOLE's `conhsra` fit."""
+    lam = wavelength.to(u.Angstrom).value
+    lo, hi = _CONHSRA_C4_RANGE_AA
+    if not np.all((lam >= lo) & (lam < hi)):
+        raise ValueError(f"conhsra port only covers {lo}-{hi} A, got {lam}")
+    c0, c1, c2, c3, c4 = _CONHSRA_C4
+    value = c0 + lam * (c1 + lam * (c2 + lam * (c3 + lam * c4)))
+    return value * u.erg / (u.s * u.cm**2 * u.cm * u.sr)
+
+
+def planck_brightness_temperature(intensity: u.Quantity, wavelength: u.Quantity) -> u.Quantity:
+    """Exact inversion of the Planck function per unit wavelength: T such that B_lambda(T) = I."""
+    from astropy.constants import h, k_B
+
+    radiance = intensity * u.sr  # strip the per-steradian so the log argument is dimensionless
+    argument = (2 * h * c**2 / (wavelength**5 * radiance)).to(u.dimensionless_unscaled).value
+    return (h * c / (wavelength * k_B) / np.log1p(argument)).to(u.K)
+
+
+def hsra_brightness_temperature(wavelength: u.Quantity = HSRA_REFERENCE_WAVELENGTH) -> u.Quantity:
+    """Brightness temperature of the HSRA disk-centre continuum (~6125 K at 6302 A)."""
+    return planck_brightness_temperature(hsra_continuum_intensity(wavelength), wavelength)
+
+
 class ApproxInversions:
     """
     Class for computing approximate line-of-sight (LOS) magnetic field and velocity
@@ -212,81 +253,62 @@ class ApproxInversions:
         return self.vlos
     
     def compute_temperature_blackbody(
-        self, 
-        cont_indices: List[int] = [0, 1, 2, 3],
-        reference_temperature: u.Quantity = 6000 * u.K,
-        continuum_wavelength: Optional[u.Quantity] = None
+        self,
+        cont_indices: List[int] = [108, 109, 110, 111],
+        continuum_wavelength: Optional[u.Quantity] = None,
+        hsra_normalized: bool = True,
     ) -> u.Quantity:
         """
-        Estimate temperature from Stokes I continuum intensity using black-body approximation.
-        
-        The temperature is derived from the normalized continuum intensity contrast
-        using the linearized Planck function relation:
-        
-        T = T_0 * (1 + (I_norm,c - 1) / α)
-        
-        where α = x * e^x / (e^x - 1) with x = hc / (λ k_B T_0)
-        
+        Estimate temperature from the Stokes I continuum as a Planck brightness temperature.
+
+        The profiles are assumed normalized to the HSRA disk-centre continuum at
+        `HSRA_REFERENCE_WAVELENGTH` (NICOLE's `Continuum reference = 1`), so the absolute
+        intensity is I_abs = I_norm * I_HSRA and the temperature is the exact inversion
+
+            T = (h c / λ_c k_B) / ln(1 + 2 h c² / (λ_c⁵ I_abs)),
+
+        with no linearization and no anchor temperature: I_norm = 1 returns the HSRA
+        brightness temperature (~6125 K at 6302 Å).
+
         Parameters
         ----------
         cont_indices : list of int
-            Wavelength indices corresponding to continuum (line-free) regions.
-            Default uses the first 4 wavelength points [0, 1, 2, 3].
-        reference_temperature : astropy.units.Quantity
-            Reference temperature for the quiet-Sun photosphere (default: 6000 K).
+            Wavelength indices averaged as the continuum. The default is the red end of the
+            112-point Hinode grid (6303.19-6303.26 Å), the highest points of the quiet-Sun
+            profile; the blue end still sits in the wing of Fe I 6301.5 Å.
         continuum_wavelength : astropy.units.Quantity, optional
-            Representative wavelength for the continuum region. If None, uses
-            the central wavelength of the spectral line.
-            
+            Wavelength at which the Planck function is inverted. If None, the mean wavelength
+            of `cont_indices`.
+        hsra_normalized : bool
+            Must be True: the inversion is only meaningful for HSRA-normalized profiles.
+
         Returns
         -------
         astropy.units.Quantity
             Temperature map with shape (nx, ny) in Kelvin.
-            
+
         Notes
         -----
-        The approximation assumes:
-        1. Local Thermodynamic Equilibrium (LTE): I_c ≈ B_λ(T)
-        2. Small intensity contrasts (|C| < 20%)
-        3. Disk-center observations (μ ≈ 1)
-        
-        The continuum at ~6302 Å forms around log(τ_500) ≈ 0, so this
-        temperature represents conditions in the low photosphere.
+        Assumes LTE (I_c ≈ B_λ(T)) and disk centre (μ ≈ 1). This is a brightness temperature:
+        by Eddington-Barbier it matches T near τ ≈ 2/3 (log τ ≈ -0.2), not at log τ = 0.
         """
-        from astropy.constants import h, k_B, c
-        
-        # Use central wavelength if not specified
+        if not hsra_normalized:
+            raise ValueError(
+                "compute_temperature_blackbody needs profiles normalized to the HSRA "
+                "disk-centre continuum (NICOLE 'Continuum reference = 1')."
+            )
+
         if continuum_wavelength is None:
-            continuum_wavelength = self.central_wavelength
-        
-        # Extract temperature value for calculations
-        T_0 = reference_temperature.to(u.K).value  # K
-        lambda_0 = continuum_wavelength.to(u.m).value  # meter
-        
-        # Compute dimensionless parameter x = hc / (λ k_B T_0)
-        x = (h * c / (lambda_0 * k_B * T_0)).decompose().value
-        
-        # Compute Planck sensitivity α = x * e^x / (e^x - 1)
-        exp_x = np.exp(x)
-        alpha = x * exp_x / (exp_x - 1)
-        
-        # Compute continuum intensity for each pixel (average over continuum indices)
-        # Shape: (nx, ny)
-        I_c_per_pixel = np.mean(self.stokes["I"][:, :, cont_indices], axis=2)
-        
-        # Compute reference continuum (spatial mean = quiet-Sun average)
-        I_c_reference = np.mean(I_c_per_pixel)
-        
-        # Normalized continuum intensity: I_norm,c = I_c / I_c,ref
-        I_norm_c = I_c_per_pixel / I_c_reference
-        
-        # Intensity contrast: C = I_norm,c - 1
-        contrast = I_norm_c - 1.0
-        
-        # Temperature: T = T_0 * (1 + C/α)
-        temperature = T_0 * (1.0 + contrast / alpha)
-        
-        self.temperature = temperature * u.K
+            continuum_wavelength = np.mean(self.wavelength[cont_indices]) * u.Angstrom
+
+        # Per-pixel continuum in HSRA units, shape (nx, ny)
+        I_norm_c = np.mean(self.stokes["I"][:, :, cont_indices], axis=2)
+
+        # NICOLE divides by a single reference value per region, so the same factor applies
+        # at every wavelength of the window
+        I_abs = I_norm_c * hsra_continuum_intensity(HSRA_REFERENCE_WAVELENGTH)
+
+        self.temperature = planck_brightness_temperature(I_abs, continuum_wavelength)
         return self.temperature
     
     def compare_with_mhd(self, mhd_od_data: Dict[str, np.ndarray],

@@ -1412,6 +1412,8 @@ def run_single_experiment(
             'vlos_target_logtau': config.vlos_target_logtau,
             'temp_physics_mode': config.temp_physics_mode,
             'temp_target_logtau': config.temp_target_logtau,
+            'temp_continuum_indices': list(config.temp_continuum_indices),
+            'temp_continuum_wavelength': config.temp_continuum_wavelength,
         },
         'data_config': {
             'seed': int(config.seed),
@@ -1988,6 +1990,8 @@ def run_single_experiment(
             'vlos_target_logtau': config.vlos_target_logtau,
             'temp_physics_mode': config.temp_physics_mode,
             'temp_target_logtau': config.temp_target_logtau,
+            'temp_continuum_indices': list(config.temp_continuum_indices),
+            'temp_continuum_wavelength': config.temp_continuum_wavelength,
             'device': config.device,
             'data_path': str(config.data_path),
             'logtau_values': [float(x) for x in config.get_logtau_values().tolist()],
@@ -2053,8 +2057,14 @@ def main():
     parser.add_argument('--temp_physics_mode', type=str, default='single_height',
                        choices=['tau_averaged', 'single_height'],
                        help='Temperature physics comparison mode')
-    parser.add_argument('--temp_target_logtau', type=float, default=0.0,
-                       help='Target log(tau) for temperature single_height mode (default: 0.0 for photosphere)')
+    parser.add_argument('--temp_target_logtau', type=float, default=-0.2,
+                       help='Target log(tau) for temperature single_height mode (default: -0.2, '
+                            'tau ~ 2/3 where the continuum brightness temperature forms)')
+    parser.add_argument('--temp_continuum_indices', type=int, nargs='+', default=None,
+                       help='Hinode-grid indices averaged as the continuum for the black-body '
+                            'temperature (default: 108 109 110 111, the red end of the window)')
+    parser.add_argument('--temp_continuum_wavelength', type=float, default=None,
+                       help='Wavelength (A) for the Planck inversion (default: mean wavelength of the indices)')
     
     # Experiment selection
     parser.add_argument('--experiments', type=str, nargs='+',
@@ -2438,6 +2448,8 @@ def main():
             vlos_target_logtau=args.vlos_target_logtau,
             temp_physics_mode=args.temp_physics_mode,
             temp_target_logtau=args.temp_target_logtau,
+            temp_continuum_indices=args.temp_continuum_indices,
+            temp_continuum_wavelength=args.temp_continuum_wavelength,
             device=args.device,
             checkpoint_dir=output_dir / folder_name / "checkpoints",
             log_dir=output_dir / folder_name / "logs",

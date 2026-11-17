@@ -1,3 +1,4 @@
+import csv
 import os
 import sys
 sys.path.append("/scratchsan/observatorio/juagudeloo/MUISCA/")
@@ -176,6 +177,7 @@ def main(args):
         # just the "ods" subset plotted above) -- condenses the per-tau scatter/imshow figures
         # into a couple of compact, paper-column-sized figures for the write-up.
         title_context = f"Simulation step {args.step_to_plot}"
+        metric_rows = []
         for p in params:
             true_cube = last_gt_den[p]
             metrics_by_model = {}
@@ -186,6 +188,9 @@ def main(args):
                     for i in range(len(logtau))
                 ]
                 metrics_by_model[m] = compute_metric_vs_tau(tau_and_maps)
+                mv = metrics_by_model[m]
+                metric_rows += [(m, p, round(float(t), 2), float(r), float(c))
+                                for t, r, c in zip(mv["tau"], mv["rrmse"], mv["corr"])]
             for metric_key in ("rrmse", "corr"):
                 plot_metric_vs_tau(
                     param=p,
@@ -194,6 +199,11 @@ def main(args):
                     title_suffix=title_context,
                     save_path=combined_dir / f"{p}_{metric_key}_vs_tau.png",
                 )
+        # The same numbers as the curves, on every tau node, so tables can cite them directly
+        with open(combined_dir / "metrics_vs_tau.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["model", "param", "logtau", "rrmse", "corr"])
+            writer.writerows(metric_rows)
         print(f"Combined multi-model figures saved to: {combined_dir}")
 
 if __name__ == "__main__":
