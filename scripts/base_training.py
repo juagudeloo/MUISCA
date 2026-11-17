@@ -125,7 +125,7 @@ class TrainingConfig:
     vlos_physics_mode: str = "single_height"  # 'tau_averaged' or 'single_height'
     vlos_target_logtau: float | None = -1.0  # Target log(tau) for V_LOS single_height mode
     temp_physics_mode: str = "single_height"  # 'tau_averaged' or 'single_height'
-    # -0.2 ~ tau = 2/3, where the continuum brightness temperature forms (Eddington-Barbier)
+    # -0.2: node where T_BB has the lowest RRMSE against MURaM T on training steps 110 and 120
     temp_target_logtau: float | None = -0.2  # Target log(tau) for temperature single_height mode
     temp_continuum_indices: list[int] | None = None  # Continuum indices for temperature estimation
     temp_continuum_wavelength: float | None = None  # Angstroms; None = mean wavelength of the indices

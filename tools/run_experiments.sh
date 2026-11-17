@@ -66,7 +66,7 @@ VLOS_MODE='single_height'       # 'tau_averaged' or 'single_height'
 VLOS_TARGET_LOGTAU=-1.0         # Only used if VLOS_MODE='single_height'
 
 TEMP_MODE='single_height'       # 'tau_averaged' or 'single_height'
-TEMP_TARGET_LOGTAU=-0.2         # Only used if TEMP_MODE='single_height' (-0.2 ~ tau=2/3, where the continuum forms)
+TEMP_TARGET_LOGTAU=-0.2         # Only used if TEMP_MODE='single_height' (-0.2: lowest RRMSE of T_BB vs MURaM T on steps 110 and 120)
 TEMP_CONTINUUM_INDICES=(108 109 110 111)  # Hinode-grid continuum points for the black-body temperature (red end)
 
 # Optional train-time WFA gate
