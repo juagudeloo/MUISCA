@@ -48,12 +48,24 @@ def _t_ref() -> float:
 
 
 def test_unit_continuum_returns_reference_temperature():
+    """An HSRA-normalized continuum of exactly 1 gives the HSRA brightness temperature.
+
+    This anchors the whole temperature approximation, because I / I_c,HSRA = 1 must
+    mean "as bright as the HSRA". The anchor itself must be about 6125 K at 6302 A,
+    within 5 K.
+    """
     assert _bb_temperature(1.0)[0] == pytest.approx(_t_ref(), abs=1e-6)
     # Sanity on the anchor itself: HSRA at 6302 A is ~6125 K
     assert hsra_brightness_temperature().to_value(u.K) == pytest.approx(6125.0, abs=5.0)
 
 
 def test_small_contrasts_match_first_order_expansion():
+    """Within +-5 % contrast, the exact Planck inversion matches the linear expansion within 5 K.
+
+    The expansion is T = T_ref (1 + dI / alpha), with alpha = x e^x / (e^x - 1) and
+    x = h c / (lambda k T_ref). This ties the exact formula to the linearized one used
+    before commit 87d0ecc, where both must agree.
+    """
     t_ref = _t_ref()
     x = (h * c / (LAMBDA_C * k_B * t_ref * u.K)).decompose().value
     alpha = x * np.exp(x) / np.expm1(x)
@@ -63,11 +75,21 @@ def test_small_contrasts_match_first_order_expansion():
 
 
 def test_monotonic_in_intensity():
+    """T (K) increases strictly with intensity for I / I_c,HSRA from 0.1 to 2.0.
+
+    Brighter pixels must always map to hotter ones, with no overflow or branch problem in
+    the Planck inversion, even for umbral (0.1) or very bright (2.0) intensities.
+    """
     t = _bb_temperature(np.linspace(0.1, 2.0, 400))
     assert np.all(np.diff(t) > 0)
 
 
 def test_rejects_non_hsra_normalized_profiles():
+    """Profiles not normalized to the HSRA continuum raise ValueError.
+
+    A brightness temperature needs an absolute intensity, so profiles normalized to their
+    own scene mean must be refused instead of giving a wrong temperature silently.
+    """
     inv = ApproxInversions(
         stokes={"I": np.ones((1, 1, WL.size))},
         wavelength=WL,
@@ -79,7 +101,13 @@ def test_rejects_non_hsra_normalized_profiles():
 
 
 def test_sanity_against_muram_step_110():
-    """Median/sd of (T_BB - T_sim) on a MURaM training step, through the real Stokes pipeline."""
+    """On MURaM step 110, the median of T_BB - T_sim at log tau = -0.2 is within 100 K.
+
+    Runs the real Stokes pipeline (LSF, Hinode resampling) on every fourth pixel in x and
+    y, and prints a table of median T_BB - T_sim (K), its spread and the correlation at
+    log tau = 0, -0.1 and -0.2, next to the old linearized method. Use ``pytest -s`` to
+    see it. Skips when the step 110 files are missing.
+    """
     from scripts.base_training import TrainingConfig, load_source_arrays
 
     config = TrainingConfig()

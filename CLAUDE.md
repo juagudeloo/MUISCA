@@ -65,7 +65,14 @@ sbatch tools/generate_analysis.sh
 sbatch tools/fine_tune.sh --experiment-name <name> --variations wfa_only,all_physics_terms
 ```
 
-There is no linting or unit test infrastructure in this research codebase.
+**Tests and docstrings:**
+```bash
+pytest tests/ --doctest-modules utils/            # synthetic tests + docstring examples
+pytest -m "not data" tests/                       # skip tests that need real MURaM/MODEST/HSRA files
+python tools/check_docstrings.py coverage <files> # Google-style docstring with Args/Examples
+python tools/check_docstrings.py same-code <files> # a docs-only edit left the code unchanged
+```
+Every test has a docstring stating the property it checks, its units/tolerance, and why it matters. Known bugs are documented as strict `xfail` tests.
 
 ## Architecture
 

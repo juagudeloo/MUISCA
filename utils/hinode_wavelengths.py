@@ -51,10 +51,26 @@ def read_hinode_wavelength_metadata(
     modest_dir: Union[Path, str] = DEFAULT_MODEST_DIR,
     filename: str = DEFAULT_PROFS_FILENAME,
 ) -> tuple[float, float, float]:
-    """Return (wl_min_abs, wl_max_abs, wl_ref) in Angstrom from the MODEST FITS header.
+    """Read the wavelength range of the Hinode/SP axis from the MODEST FITS header.
 
-    Raises FileNotFoundError / KeyError / ValueError rather than falling back to
-    assumed values -- see the module docstring.
+    Uses ``WLREF`` (Fe I 6302.4936 A, laboratory rest wavelength) and the offsets
+    ``WLMIN``/``WLMAX``. There is deliberately no fallback: see the module docstring.
+
+    Args:
+        modest_dir: Folder of a MODEST scan.
+        filename: FITS file whose header holds the keywords.
+
+    Returns:
+        ``(wl_min_abs, wl_max_abs, wl_ref)`` in Angstrom.
+
+    Raises:
+        FileNotFoundError: If the file is missing.
+        KeyError: If a keyword is missing.
+        ValueError: If the values are non-finite or the axis is not increasing.
+
+    Examples:
+        >>> read_hinode_wavelength_metadata()  # doctest: +SKIP
+        (6300.8736, 6303.2576, 6302.4936)
     """
     path = Path(modest_dir) / filename
     if not path.exists():
@@ -94,11 +110,22 @@ def hinode_wavelength_grid(
     modest_dir: Union[Path, str] = DEFAULT_MODEST_DIR,
     filename: str = DEFAULT_PROFS_FILENAME,
 ) -> np.ndarray:
-    """Return the (n_wl,) Hinode/SOT-SP wavelength grid in Angstrom.
+    """The Hinode/SOT-SP wavelength grid, evenly spaced between the FITS endpoints.
 
-    Endpoints come from the MODEST FITS header; points are evenly spaced
-    between them (the same linspace convention the observation loader has
-    always used, so observed profiles are unchanged by this refactor).
+    Args:
+        n_wl: Number of points. 112 for the observed profiles, 250 for MODEST's
+            inverted profiles.
+        modest_dir: Folder of a MODEST scan.
+        filename: FITS file whose header holds the keywords.
+
+    Returns:
+        float64 array of shape ``(n_wl,)`` in Angstrom. With 112 points the spacing is
+        ~21.5 mA.
+
+    Examples:
+        >>> wl = hinode_wavelength_grid()  # doctest: +SKIP
+        >>> wl.shape, round(wl[0], 4), round(wl[-1], 4)  # doctest: +SKIP
+        ((112,), 6300.8736, 6303.2576)
     """
     wl_min_abs, wl_max_abs, _ = read_hinode_wavelength_metadata(modest_dir, filename)
     return np.linspace(wl_min_abs, wl_max_abs, int(n_wl), dtype=np.float64)
@@ -109,10 +136,21 @@ def hinode_grid_first_and_step_mA(
     modest_dir: Union[Path, str] = DEFAULT_MODEST_DIR,
     filename: str = DEFAULT_PROFS_FILENAME,
 ) -> tuple[float, float]:
-    """Return (first_wavelength_A, step_mA) for the FITS-derived grid.
+    """First wavelength and constant step of the Hinode grid, the way NICOLE.input wants them.
 
-    For NICOLE, which is configured with a first wavelength plus a constant
-    step rather than an explicit array.
+    Args:
+        n_wl: Number of points.
+        modest_dir: Folder of a MODEST scan.
+        filename: FITS file whose header holds the keywords.
+
+    Returns:
+        ``(first_wavelength_A, step_mA)``: the first point in Angstrom and the step in
+        milli-Angstrom.
+
+    Examples:
+        >>> first, step = hinode_grid_first_and_step_mA()  # doctest: +SKIP
+        >>> round(first, 4), round(step, 3)  # doctest: +SKIP
+        (6300.8736, 21.477)
     """
     grid = hinode_wavelength_grid(n_wl, modest_dir, filename)
     step_mA = float((grid[-1] - grid[0]) / (grid.size - 1) * 1000.0)

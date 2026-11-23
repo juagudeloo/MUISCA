@@ -1,8 +1,40 @@
 #!/usr/bin/env python3
+"""Read and write NICOLE model atmospheres and Stokes profiles.
 
-# Tools to read/write NICOLE models and profiles
+``check_types``, ``check_model``, ``check_prof``, ``read_prof`` and ``read_model`` are
+NICOLE's own Python tools, shipped with the code (Python 2 era), kept as they are and
+used as the reference readers. The ``write_*`` functions were added for MUISCA. They
+turn MURaM atmospheres and MUISCA predictions into NICOLE input, and are tested as
+exact inverses of the readers (``tests/test_model_io.py``).
+
+Conventions: MUISCA arrays use ascending log tau (top to bottom), while NICOLE files
+store depth deepest first. Velocities are km/s in MUISCA and cm/s in NICOLE. Fields are
+in G. Binary files are little-endian float64 records, one header record plus one record
+per pixel in ``iy + ix * ny`` order.
+
+Examples:
+    >>> import tempfile, numpy as np
+    >>> path = tempfile.mkdtemp() + "/cube.model"
+    >>> logtau = np.array([-2.0, -1.0, 0.0])
+    >>> T = np.full((1, 1, 3), 5000.0)
+    >>> write_binary_model_cube(path, logtau, T, np.zeros_like(T), np.zeros_like(T))
+    >>> check_model(path)
+    ['nicole2.3', 1, 1, 3]
+"""
 
 def check_types():
+    """Struct format letters for 32-bit int, 64-bit int and 64-bit float on this platform.
+
+    Part of NICOLE's shipped tools. Exits the process if the platform has non-standard
+    sizes.
+
+    Returns:
+        ``[int4f, intf, flf]``, e.g. ``['i', 'q', 'd']``.
+
+    Examples:
+        >>> check_types()[2]
+        'd'
+    """
     import struct
     import sys
 
@@ -45,6 +77,23 @@ def check_types():
     
 
 def check_model (filename):
+    """Detect the format of a NICOLE model file and its dimensions (NICOLE's shipped tool).
+
+    Recognizes ASCII (format versions 1.0 and 2.3), binary ``nicole1.6bm`` and
+    ``nicole2.3bm``, and IDL save files.
+
+    Args:
+        filename: Path to the model file.
+
+    Returns:
+        ``[filetype, nx, ny, nz]``, e.g. ``['nicole2.3', 480, 480, 45]``, or
+        ``['inexistent', -1, -1, -1]`` if the file cannot be opened. Exits the process
+        for unknown formats.
+
+    Examples:
+        >>> check_model("workdir/model.bin")  # doctest: +SKIP
+        ['nicole2.3', 12, 480, 45]
+    """
 # Check the input model and determine what kind of file it is
 # Return nx, ny and nz
     import re
@@ -165,6 +214,23 @@ def check_model (filename):
     sys.exit(1)
 
 def check_prof (filename):
+    """Detect the format of a NICOLE profile file and its dimensions (NICOLE's shipped tool).
+
+    Args:
+        filename: Path to the profile file.
+
+    Returns:
+        ``[filetype, nx, ny, nlam]``, or ``['inexistent', -1, -1, -1]``.
+
+    Note:
+        Under Python 3 it fails with ``UnicodeDecodeError`` on binary profiles, because
+        it first reads the file in text mode. Callers that know the format pass it to
+        ``read_prof`` directly (see ``utils/synthesis.py``).
+
+    Examples:
+        >>> check_prof("profiles.txt")  # doctest: +SKIP
+        ['ascii', 1, 1, 112]
+    """
 # Check the input profile and determine what kind of file it is
 # Return nx, ny and nlambda
     import re
@@ -274,7 +340,32 @@ def check_prof (filename):
     sys.exit(1)
 
 def read_prof(filename, filetype, nx, ny, nlam, ix, iy, sequential=0):
-# Read a particular profile from a profile file 
+    """Read the Stokes profile of one pixel (NICOLE's shipped tool).
+
+    Args:
+        filename: Path to the profile file.
+        filetype: Format from ``check_prof``, e.g. ``'nicole2.3'`` or ``'ascii'``.
+        nx: Number of pixels along x in the file.
+        ny: Number of pixels along y in the file.
+        nlam: Number of wavelengths.
+        ix: x index of the pixel, 0-based.
+        iy: y index of the pixel, 0-based.
+        sequential: If non-zero, read the record after the previous call instead of
+            seeking to ``(ix, iy)``. The first call must use 0.
+
+    Returns:
+        Flat list of ``4 * nlam`` floats, interleaved per wavelength as
+        ``[I0, Q0, U0, V0, I1, ...]``. ``np.reshape(nlam, 4)`` gives one row per
+        wavelength.
+
+    Note:
+        The binary branch keeps the file open in the module-level global ``f``.
+
+    Examples:
+        >>> flat = read_prof("profile.pro", "nicole2.3", 1, 1, 112, 0, 0)  # doctest: +SKIP
+        >>> I, Q, U, V = np.reshape(flat, (112, 4)).T  # doctest: +SKIP
+    """
+# Read a particular profile from a profile file
 # Note that ix,iy=0 represents the first profile
 # Use the sequential keyword to specify that this file is going to be
 # read sequentially rather than accessing specific records. In that
@@ -350,7 +441,31 @@ def read_prof(filename, filetype, nx, ny, nlam, ix, iy, sequential=0):
         sys.exit(1)
 
 def read_model(filename, filetype, nx, ny, nz, ix, iy, sequential=0):
-# Read a particular model from a model file 
+    """Read the model atmosphere of one pixel (NICOLE's shipped tool).
+
+    Args:
+        filename: Path to the model file.
+        filetype: Format from ``check_model``.
+        nx: Number of pixels along x in the file.
+        ny: Number of pixels along y in the file.
+        nz: Number of depth points.
+        ix: x index of the pixel, 0-based.
+        iy: y index of the pixel, 0-based.
+        sequential: If non-zero, read the next record instead of seeking.
+
+    Returns:
+        Flat list of ``22 * nz + 3 + 8`` floats. Each depth variable occupies ``nz``
+        consecutive values, stored deepest first, in this order: 0 z, 1 log tau, 2 T (K),
+        3 gas_p, 4 rho, 5 el_p, 6 v_los (cm/s), 7 v_mic (cm/s), 8 b_long (G), 9 b_x,
+        10 b_y, 11 bl_x, 12 bl_y, 13 bl_z, 14-16 velocity components, 17-21 densities
+        (nH, nH-, nH+, nH2, nH2+). Then v_mac, stray-light fraction and expansion,
+        followed by 8 "keep" flags. Abundances are not returned.
+
+    Examples:
+        >>> d = read_model("cube.model", "nicole2.3", 1, 1, 45, 0, 0)  # doctest: +SKIP
+        >>> T_deepest_first = d[2 * 45:3 * 45]  # doctest: +SKIP
+    """
+# Read a particular model from a model file
 # Note that ix,iy=0 represents the first model
 # Use the sequential keyword to specify that this file is going to be
 # read sequentially rather than accessing specific records. In that
@@ -803,6 +918,35 @@ def write_ascii_model(
     el_p=None,
     el_p_seed=1.0,
 ):
+    """Write one pixel's atmosphere as a NICOLE ASCII model (format version 1.0).
+
+    Args:
+        filepath: Output path. Parent folders are created.
+        logtau: log tau_500 of each node, ascending (MUISCA convention).
+        T: Temperature in K.
+        v_los_kms: LOS velocity in km/s, positive = redshift. It is written in cm/s.
+        b_long_G: Longitudinal field in G.
+        v_mic_cms: Microturbulence in cm/s, scalar or per node.
+        v_mac_cms: Macroturbulence in cm/s, written in the header line.
+        stray_light: Stray-light fraction, written in the header line.
+        b_x_G: Transverse field components in G, scalar or per node. ``b_y_G`` is the
+            second component.
+        el_p: Electron pressure in dyn cm^-2 per node. ``None`` writes the constant
+            ``el_p_seed``, which NICOLE replaces when "Impose hydrostatic
+            equilibrium = Y".
+        el_p_seed: Seed value used when ``el_p`` is None.
+
+    Raises:
+        ValueError: If the per-node arrays have different lengths.
+
+    Examples:
+        >>> import tempfile, numpy as np
+        >>> path = tempfile.mkdtemp() + "/pixel.model"
+        >>> write_ascii_model(path, np.array([-1.0, 0.0]), np.array([5000.0, 6400.0]),
+        ...                   np.zeros(2), np.array([100.0, 150.0]))
+        >>> open(path).read().splitlines()[0]
+        'Format version: 1.0'
+    """
     # Write a NICOLE Format-version-1.0 ASCII .model file.
     # MUISCA convention: logtau ascending (top -> bottom).
     # NICOLE convention: rows ordered by descending logtau (deepest -> top).
@@ -875,6 +1019,45 @@ def write_binary_model_cube(
     el_p_seed=1.0,
     gas_p=None,
 ):
+    """Write a whole ``(nx, ny)`` field of atmospheres as one NICOLE binary cube (``nicole2.3bm``).
+
+    NICOLE then synthesizes the whole frame in a single run, looping over pixels in
+    Fortran, instead of one subprocess per pixel. The file is the exact inverse of
+    ``read_model``'s ``nicole2.3`` branch (see the comment block below for the record
+    layout).
+
+    Args:
+        filepath: Output path. Parent folders are created.
+        logtau: Shared log tau_500 grid, shape ``(nz,)``, ascending.
+        T: Temperature in K, shape ``(nx, ny, nz)``.
+        v_los_kms: LOS velocity in km/s, shape ``(nx, ny, nz)``. It is written in cm/s.
+        b_long_G: Longitudinal field in G, shape ``(nx, ny, nz)``.
+        v_mic_cms: Microturbulence in cm/s, broadcast to ``(nx, ny, nz)``.
+        v_mac_cms: Macroturbulence in cm/s, the same for every pixel.
+        stray_light: Stray-light fraction, the same for every pixel.
+        el_p: Electron pressure in dyn cm^-2, ``(nx, ny, nz)``, or None for the seed.
+        el_p_seed: Seed electron pressure when ``el_p`` is None.
+        gas_p: Optional gas pressure in dyn cm^-2, ``(nx, ny, nz)``. Pair it with
+            "Input density = Pgas" and "Impose hydrostatic equilibrium = N" so NICOLE uses
+            it as given.
+
+    Raises:
+        ValueError: If the shapes are inconsistent.
+
+    Note:
+        Today only B_long is written; the transverse slots are zero, so NICOLE gives
+        Q = U = 0. The slot naming in the comment below (``b_los_x``, ``b_los_y``, ``b_x``,
+        ``b_y``, ``b_z``) differs from ``read_model``'s (``b_x``, ``b_y``, ``bl_x``,
+        ``bl_y``, ``bl_z``). At disk centre the two frames coincide.
+
+    Examples:
+        >>> import tempfile, numpy as np
+        >>> path = tempfile.mkdtemp() + "/cube.model"
+        >>> T = np.full((2, 3, 4), 5500.0)
+        >>> write_binary_model_cube(path, np.linspace(-2, 1, 4), T, np.zeros_like(T), np.zeros_like(T))
+        >>> check_model(path)
+        ['nicole2.3', 2, 3, 4]
+    """
     # Write a whole (nx, ny) field of model atmospheres in NICOLE's native
     # "nicole2.3bm" binary cube format, so NICOLE can synthesize the entire
     # frame in ONE run_nicole.py invocation (its Fortran loops over pixels
@@ -976,6 +1159,26 @@ def write_binary_model_cube(
 
 
 def write_prof_cube(filepath, iquv):
+    """Write a field of Stokes profiles as a NICOLE binary profile cube (``nicole2.3bp``).
+
+    Used as "Observed profiles=" input for NICOLE inversions. It is the exact inverse of
+    ``read_prof``'s ``nicole2.3`` branch.
+
+    Args:
+        filepath: Output path. Parent folders are created.
+        iquv: Array of shape ``(nx, ny, 4, n_wl)``, Stokes-major (I, Q, U, V) and
+            wavelength-minor per pixel, the layout ``NicoleRunner.run_cube`` returns.
+
+    Raises:
+        ValueError: If ``iquv`` does not have shape ``(nx, ny, 4, n_wl)``.
+
+    Examples:
+        >>> import tempfile, numpy as np
+        >>> path = tempfile.mkdtemp() + "/obs.prof"
+        >>> write_prof_cube(path, np.ones((1, 1, 4, 3)))
+        >>> np.reshape(read_prof(path, "nicole2.3", 1, 1, 3, 0, 0), (3, 4)).T[0].tolist()
+        [1.0, 1.0, 1.0]
+    """
     # Write a whole (nx, ny) field of Stokes profiles in NICOLE's native
     # "nicole2.3bp" binary profile-cube format, for use as inversion mode's
     # "Observed profiles=" input (the exact inverse of read_prof's nicole2.3

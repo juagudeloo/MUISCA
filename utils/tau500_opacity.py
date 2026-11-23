@@ -1,5 +1,22 @@
 """Approximate continuum opacity at 500 nm (tau_500), for the --tau500 experiment.
 
+This module now defines the optical depth scale of all training data: the
+``nicole_tau500`` cubes are remapped onto log(tau_500) with ``kappa_500`` (see
+``scripts/synthesis/tau500_multi_step_regen.compute_logtau500``). Validation:
+integrating ``kappa_500`` hydrostatically over the HSRA, anchored at log tau = -4,
+reproduces the HSRA's own log tau within 0.04 dex for -3 <= log tau <= 0.5, and falls
+0.09 / 0.17 dex short at log tau = 1.0 / 1.4 (``tests/test_tau500_opacity.py``).
+
+Examples:
+    >>> import numpy as np
+    >>> T, P = np.array([5000.0, 6500.0]), np.array([1.0e5, 1.0e5])   # K, dyn cm^-2
+    >>> rho = P * 1.3 * 1.6735e-24 / (K_BOLTZMANN * T)                 # g cm^-3
+    >>> k = kappa_500(T, P, rho)                                      # cm^2 g^-1
+    >>> bool(k[1] > k[0] > 0)
+    True
+
+Original design notes follow.
+
 This is a targeted, deliberately-scoped experiment (see docs discussion),
 NOT a general-purpose stellar-atmosphere opacity code. It exists to test a
 specific hypothesis: that utils/muram_data.py's existing optical-depth
@@ -60,19 +77,38 @@ CHI_HMINUS_EV = 0.754  # H- electron affinity
 
 
 def _saha_phi(T: np.ndarray) -> np.ndarray:
-    """(2 pi m_e k T / h^2)^1.5 -- the T-dependent part of the Saha equation."""
+    """Temperature factor of the Saha equation, ``(2 pi m_e k T / h^2)^1.5``, in cm^-3.
+
+    Args:
+        T: Temperature in K.
+
+    Returns:
+        Array with the shape of ``T``, in cm^-3.
+
+    Examples:
+        >>> f"{_saha_phi(5000.0):.3e}"
+        '8.537e+20'
+    """
     return (2.0 * np.pi * M_ELECTRON * K_BOLTZMANN * T / H_PLANCK**2) ** 1.5
 
 
 def _load_hsra_pe_fit():
-    """Build a log(Pe) vs T interpolator from HSRA's monotonic deep branch.
+    """Build a log10(Pe) vs T interpolator from the HSRA's monotonic deep branch.
 
-    Reads data/csv/hsra_pel.model (electron pressure) and
-    data/csv/hsra_pgas.model (gas pressure) -- the same HSRA reference
-    atmosphere, in NICOLE's own ASCII .model format, differing only in
-    which density variable occupies column 3 (El_p vs Gas_p). Column 1 is
-    log(tau_500), column 2 is T. Only used to build Pe(T); Pgas from these
-    files is not otherwise used (MURaM's own Pgas is used downstream).
+    Reads ``data/csv/hsra_pel.model``, the HSRA in NICOLE's ASCII .model format, where
+    column 1 is log(tau_500), column 2 is T (K) and column 3 is the electron pressure
+    (dyn cm^-2). Only points with log tau >= -4 are used, where T rises monotonically
+    with depth, so Pe(T) is single-valued. ``hsra_pgas.model`` has the same layout with
+    the gas pressure and is not used here (MURaM's own Pgas is used downstream).
+
+    Returns:
+        ``scipy.interpolate.interp1d`` mapping T (K) to log10(Pe / dyn cm^-2), linear,
+        extrapolating outside the HSRA range of 4170-9560 K.
+
+    Examples:
+        >>> fit = _load_hsra_pe_fit()
+        >>> round(float(10 ** fit(6000.0)), 1)   # dyn cm^-2  # doctest: +SKIP
+        24.5
     """
     csv_dir = Path(__file__).resolve().parent.parent / "data" / "csv"
     pel_path = csv_dir / "hsra_pel.model"
@@ -108,17 +144,52 @@ _PE_FIT = _load_hsra_pe_fit()
 
 
 def electron_pressure_hsra(T: np.ndarray) -> np.ndarray:
-    """Empirical Pe(T) [dyn/cm^2] from HSRA's deep/monotonic branch (see module docstring)."""
+    """Electron pressure as a function of temperature, from the HSRA.
+
+    It replaces a multi-species ionization balance (H plus metals, which actually set
+    Pe in the photosphere) with the empirical Pe(T) relation of the HSRA. It reproduces
+    the HSRA's own Pe to < 0.1 % on its deep branch.
+
+    Args:
+        T: Temperature in K (array-like).
+
+    Returns:
+        Pe in dyn cm^-2, float64 array.
+
+    Examples:
+        >>> import numpy as np
+        >>> pe = electron_pressure_hsra(np.array([5000.0, 6500.0]))
+        >>> bool(pe[1] > pe[0] > 0)
+        True
+    """
     T = np.asarray(T, dtype=np.float64)
     return 10.0 ** _PE_FIT(T)
 
 
 def _h_ionization_fractions(T: np.ndarray, Pe: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (n_HI/n_Htot, n_Hminus/n_Htot) via two independent Saha equations.
+    """Neutral-H and H- fractions of all hydrogen, from two Saha equations.
 
-    n_Hplus * n_e / n_HI = phi(T) * exp(-chi_H/kT)          [2*g_HII/g_HI = 1]
-    n_HI * n_e / n_Hminus = 4 * phi(T) * exp(-chi_H-/kT)    [2*g_HI/g_H- = 4]
-    n_e = Pe / (k T)
+    Uses::
+
+        n_H+ n_e / n_HI  = phi(T) exp(-chi_H / kT)          (2 g_HII / g_HI = 1)
+        n_HI n_e / n_H-  = 4 phi(T) exp(-chi_H- / kT)       (2 g_HI / g_H- = 4)
+        n_e = Pe / (k T)
+
+    with chi_H = 13.5984 eV and chi_H- = 0.754 eV.
+
+    Args:
+        T: Temperature in K.
+        Pe: Electron pressure in dyn cm^-2.
+
+    Returns:
+        ``(n_HI / n_Htot, n_H- / n_Htot)``, both dimensionless. In the photosphere the
+        first is ~1 and the second ~1e-8.
+
+    Examples:
+        >>> import numpy as np
+        >>> p1, p10 = _h_ionization_fractions(np.array([5800.0]), np.array([30.0]))
+        >>> bool(p1[0] > 0.99 and 0 < p10[0] < 1e-6)
+        True
     """
     kT = K_BOLTZMANN * T
     n_e = Pe / kT
@@ -138,12 +209,29 @@ def _h_ionization_fractions(T: np.ndarray, Pe: np.ndarray) -> tuple[np.ndarray, 
 
 def _hminus_opacity_per_Htot(T: np.ndarray, Pe: np.ndarray, p1: np.ndarray, p10: np.ndarray,
                               lambda_angstrom: float = 5000.0) -> np.ndarray:
-    """H- bound-free + free-free opacity per H-total particle, at fixed lambda.
+    """H- bound-free plus free-free opacity per hydrogen particle, at one wavelength.
 
-    Ported directly from NICOLE_v16.06/forward/wittmann_opac.f90 lines 209-251
-    (the H- block of Wittmann_opac), evaluated at lambda_angstrom=5000 (i.e.
-    tau_500). Returns units matching the Fortran's `kac` before the final
-    `*phtot/(bk*t)` conversion -- caller applies that conversion.
+    A line-by-line port of the H- block of NICOLE's ``Wittmann_opac``
+    (``NICOLE_v16.06/forward/wittmann_opac.f90``, lines 209-251), including the
+    stimulated-emission factor ``1 - exp(-h c / (lambda k T))``.
+
+    Args:
+        T: Temperature in K.
+        Pe: Electron pressure in dyn cm^-2.
+        p1: n_HI / n_Htot (from ``_h_ionization_fractions``).
+        p10: n_H- / n_Htot.
+        lambda_angstrom: Wavelength in A. 5000 for tau_500.
+
+    Returns:
+        Opacity per H-total particle, in the units of the Fortran ``kac`` before its
+        final ``* P_Htot / (k T)`` conversion, which ``kappa_500`` applies.
+
+    Examples:
+        >>> import numpy as np
+        >>> T = np.array([5800.0]); pe = np.array([30.0])
+        >>> p1, p10 = _h_ionization_fractions(T, pe)
+        >>> bool(_hminus_opacity_per_Htot(T, pe, p1, p10)[0] > 0)
+        True
     """
     lam_cm = lambda_angstrom * 1.0e-8
     theta = 5040.0 / T
@@ -178,16 +266,37 @@ def _hminus_opacity_per_Htot(T: np.ndarray, Pe: np.ndarray, p1: np.ndarray, p10:
 
 
 def kappa_500(T: np.ndarray, Pgas: np.ndarray, rho: np.ndarray) -> np.ndarray:
-    """H--only approximate mass opacity at 500 nm, in cm^2/g.
+    """H--only mass opacity at 5000 A, used to build the tau_500 scale of the training data.
 
-    T : Kelvin. Pgas : dyn/cm^2 (gas pressure). rho : g/cm^3 (mass density).
-    All broadcastable arrays. See module docstring for the approximation
-    chain (HSRA-empirical Pe, pure-H Saha ionization/H- fractions, Wittmann
-    H- bf+ff formula). Mirrors kappa.0.dat's own (T, P) -> cm^2/g interface
-    (utils/muram_data.py's MhdData.load_opacity_table / compute_optical_depth),
-    except rho is passed explicitly here (kappa.0.dat's Rosseland table is
-    read off a fixed grid and multiplied by rho by the caller; this H- opacity
-    is computed on the fly per point, so it converts to mass opacity itself).
+    The chain: Pe(T) from the HSRA, then pure-hydrogen Saha fractions, then the Wittmann
+    H- bound-free and free-free opacity per H particle, then the volume opacity
+    ``kac * n_Htot`` (cm^-1), with ``n_Htot = (Pgas - Pe) / kT``, then divided by rho.
+    Pe is capped at ``0.999 * Pgas``. The optical depth then follows as
+    ``tau_500(z) = int_z^top kappa_500 rho dz'``.
+
+    Args:
+        T: Temperature in K.
+        Pgas: Gas pressure in dyn cm^-2.
+        rho: Mass density in g cm^-3.
+
+        All three are broadcastable arrays.
+
+    Returns:
+        Mass opacity in cm^2 g^-1, float64.
+
+    Note:
+        Only H- is included, with no He-, H2-, metals or scattering. That is accurate in
+        the photosphere (see the HSRA test in the module docstring) and underestimates
+        tau below log tau ~ 1. The interface mirrors the Rosseland ``kappa.0.dat`` path
+        of ``MhdData``, except that rho is passed in, because this opacity is computed per
+        point.
+
+    Examples:
+        >>> import numpy as np
+        >>> T, P = np.array([6000.0]), np.array([1.0e5])
+        >>> rho = P * 1.3 * 1.6735e-24 / (K_BOLTZMANN * T)
+        >>> f"{kappa_500(T, P, rho)[0]:.3f}"   # cm^2 g^-1
+        '0.381'
     """
     T = np.asarray(T, dtype=np.float64)
     Pgas = np.asarray(Pgas, dtype=np.float64)

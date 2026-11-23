@@ -1,9 +1,26 @@
-"""
-Physics-based inversion and approximation methods for solar magnetometry.
+"""Fast physical approximations used as targets of the physics-informed loss terms.
 
-This module provides classes for computing line-of-sight (LOS) magnetic field
-and velocity from spectropolarimetric observations using weak-field approximation
-(WFA) and Doppler shift methods.
+Each approximation maps the Stokes profiles of a pixel to a single value of one
+atmospheric quantity, which the training then compares with the network prediction at
+one chosen optical depth:
+
+* weak-field approximation (WFA): Stokes V vs dI/dlambda of Fe I 6301.5 A gives B_LOS (G);
+* Doppler: the centre of a Gaussian fitted to Stokes I of Fe I 6301.5 A gives v_LOS (km/s);
+* black body: exact Planck inversion of the continuum gives a brightness temperature (K).
+
+The module-level helpers reproduce NICOLE's HSRA disk-centre continuum (``conhsra``), which
+is the reference that the training Stokes profiles are normalized to.
+
+Examples:
+    >>> import numpy as np
+    >>> import astropy.units as u
+    >>> from utils.hinode_wavelengths import hinode_wavelength_grid
+    >>> wl = hinode_wavelength_grid()
+    >>> I = 1 - 0.6 * np.exp(-(wl - 6301.52) ** 2 / (2 * 0.05 ** 2))   # line redshifted by 20 mA
+    >>> inv = ApproxInversions({"I": I[None, None], "V": np.zeros((1, 1, wl.size))},
+    ...                        wl, 6301.5 * u.Angstrom, lande_factor=1.67)
+    >>> round(float(inv.compute_vlos_doppler([15, 60]).value[0, 0]), 3)   # km/s, + = redshift
+    0.951
 """
 
 import numpy as np
@@ -37,7 +54,26 @@ _CONHSRA_C4_RANGE_AA = (6250.0, 8300.0)
 
 
 def hsra_continuum_intensity(wavelength: u.Quantity) -> u.Quantity:
-    """HSRA disk-centre continuum intensity per unit wavelength, from NICOLE's `conhsra` fit."""
+    """HSRA disk-centre continuum intensity per unit wavelength, from NICOLE's ``conhsra`` fit.
+
+    A Python port of the 6250-8300 A segment of NICOLE's polynomial fit to the HSRA
+    continuum (``NICOLE/forward/forward.f90``, array ``c4``; max error 0.125 %). It is
+    the absolute value that NICOLE's ``Continuum reference = 1`` divides by.
+
+    Args:
+        wavelength: Quantity (scalar or array) with length units.
+
+    Returns:
+        Intensity in erg s^-1 cm^-2 cm^-1 sr^-1 (per unit wavelength).
+
+    Raises:
+        ValueError: If any wavelength is outside [6250, 8300) A.
+
+    Examples:
+        >>> import astropy.units as u
+        >>> f"{hsra_continuum_intensity(6302.0 * u.Angstrom).value:.4e}"
+        '2.9538e+14'
+    """
     lam = wavelength.to(u.Angstrom).value
     lo, hi = _CONHSRA_C4_RANGE_AA
     if not np.all((lam >= lo) & (lam < hi)):
@@ -48,7 +84,28 @@ def hsra_continuum_intensity(wavelength: u.Quantity) -> u.Quantity:
 
 
 def planck_brightness_temperature(intensity: u.Quantity, wavelength: u.Quantity) -> u.Quantity:
-    """Exact inversion of the Planck function per unit wavelength: T such that B_lambda(T) = I."""
+    """Exact inverse of the Planck function per unit wavelength (no linearization).
+
+    Solves ``B_lambda(T) = I`` for T::
+
+        T = (h c / (lambda k_B)) / ln(1 + 2 h c^2 / (lambda^5 I)).
+
+    Args:
+        intensity: Specific intensity per unit wavelength, e.g. erg s^-1 cm^-2 cm^-1 sr^-1.
+            Scalar or array Quantity.
+        wavelength: Wavelength Quantity.
+
+    Returns:
+        Brightness temperature in K, with the shape of ``intensity``.
+
+    Examples:
+        >>> import astropy.units as u
+        >>> from astropy.modeling.physical_models import BlackBody
+        >>> lam = 6303.2 * u.Angstrom
+        >>> b = BlackBody(temperature=6000 * u.K, scale=1 * u.erg / (u.s * u.cm**2 * u.cm * u.sr))
+        >>> round(planck_brightness_temperature(b(lam), lam).to_value(u.K), 3)
+        6000.0
+    """
     from astropy.constants import h, k_B
 
     radiance = intensity * u.sr  # strip the per-steradian so the log argument is dimensionless
@@ -57,50 +114,64 @@ def planck_brightness_temperature(intensity: u.Quantity, wavelength: u.Quantity)
 
 
 def hsra_brightness_temperature(wavelength: u.Quantity = HSRA_REFERENCE_WAVELENGTH) -> u.Quantity:
-    """Brightness temperature of the HSRA disk-centre continuum (~6125 K at 6302 A)."""
+    """Brightness temperature of the HSRA disk-centre continuum.
+
+    It is the temperature that the black-body approximation assigns to a pixel with
+    HSRA-normalized continuum exactly 1.
+
+    Args:
+        wavelength: Wavelength Quantity. Defaults to ``HSRA_REFERENCE_WAVELENGTH``
+            (6302.0 A, the NICOLE normalization wavelength of the training cubes).
+
+    Returns:
+        Temperature in K.
+
+    Examples:
+        >>> round(hsra_brightness_temperature().to_value("K"))
+        6125
+    """
     return planck_brightness_temperature(hsra_continuum_intensity(wavelength), wavelength)
 
 
 class ApproxInversions:
+    """Per-pixel physical approximations of B_LOS, v_LOS and T from Stokes profiles.
+
+    Every ``compute_*`` method returns a 2D map, shape ``(nx, ny)``, and stores it on the
+    instance (``blos``, ``vlos``, ``temperature``). Training computes these maps once per
+    simulation step and caches them (``approximations/*`` in the step HDF5 cache).
+
+    Attributes:
+        stokes: Dict of plain arrays ``(nx, ny, n_wl)``, continuum-normalized. Quantities
+            are stripped to their values.
+        wavelength: Wavelength axis in Angstrom, shape ``(n_wl,)``.
+        central_wavelength: Rest wavelength of the line used by the WFA and Doppler terms
+            (Fe I 6301.5 A in training).
+        lande_factor: Effective Landé factor of that line (1.67 for Fe I 6301.5 A).
+        blos: Last WFA map, Quantity in G, or None.
+        vlos: Last Doppler map, Quantity in km/s, or None.
+        temperature: Last black-body map, Quantity in K, or None.
+
+    Examples:
+        >>> import numpy as np
+        >>> import astropy.units as u
+        >>> wl = np.linspace(6300.9, 6303.3, 112)
+        >>> inv = ApproxInversions({"I": np.ones((2, 3, 112)), "V": np.zeros((2, 3, 112))},
+        ...                        wl, 6301.5 * u.Angstrom, lande_factor=1.67)
+        >>> inv.compute_temperature_blackbody(cont_indices=[108, 109, 110, 111]).shape
+        (2, 3)
     """
-    Class for computing approximate line-of-sight (LOS) magnetic field and velocity
-    from Stokes polarimetric data using weak-field approximation (WFA) and Doppler methods.
-    
-    Attributes
-    ----------
-    stokes : dict
-        Dictionary containing Stokes I, Q, U, V profiles with shape (nx, ny, n_wavelengths)
-    wavelength : np.ndarray
-        Wavelength array in Angstroms
-    central_wavelength : astropy.units.Quantity
-        Central wavelength of the spectral line (e.g., 6301.5*u.Angstrom)
-    lande_factor : float
-        Effective Landé g-factor for the spectral line
-    blos : Optional[np.ndarray]
-        Computed B_LOS map (2D)
-    vlos : Optional[np.ndarray]
-        Computed V_LOS map (2D)
-    temperature : Optional[np.ndarray]
-        Computed temperature map (2D)
-    """
-    
+
     def __init__(self, stokes: Dict[str, np.ndarray], wavelength: np.ndarray,
                  central_wavelength: u.Quantity, lande_factor: float):
-        """
-        Initialize ApproxInversions with Stokes parameters.
-        
-        Parameters
-        ----------
-        stokes : dict
-            Dictionary with keys 'I', 'Q', 'U', 'V'. Each should be a 3D array
-            with shape (nx, ny, n_wavelengths). Values can be Quantities or plain arrays.
-        wavelength : np.ndarray or Quantity
-            Wavelength axis. If Quantity, will be converted to Angstroms.
-            If plain array, assumed to be in Angstroms.
-        central_wavelength : Quantity
-            Central wavelength of the spectral line (e.g., 6301.5*u.Angstrom)
-        lande_factor : float
-            Effective Landé g-factor (dimensionless)
+        """Store the profiles and line parameters; no computation happens here.
+
+        Args:
+            stokes: Dict with at least ``'I'``, plus ``'V'`` for the WFA. Each entry is an
+                array or Quantity of shape ``(nx, ny, n_wl)``.
+            wavelength: Wavelength axis, either a Quantity (converted to Angstrom) or a
+                plain array already in Angstrom.
+            central_wavelength: Rest wavelength of the line, as a Quantity.
+            lande_factor: Effective Landé factor (dimensionless).
         """
         # Store Stokes data (extract values if Quantities)
         self.stokes = {}
@@ -123,31 +194,53 @@ class ApproxInversions:
         self.temperature: Optional[np.ndarray] = None
     
     def compute_blos_wfa(self, wl_range: List[int]) -> u.Quantity:
-        """
-        Compute line-of-sight magnetic field using weak-field approximation (WFA).
-        
-        The WFA follows:
-        V ≈ -(e / 4πm_e c) · λ₀² · g_λ · B_LOS · dI/dλ
-        
-        Parameters
-        ----------
-        wl_range : list of int
-            [start_index, end_index] for the wavelength range to use in the WFA
-            
-        Returns
-        -------
-        astropy.units.Quantity
-            Line-of-sight magnetic field map with shape (nx, ny) in Gauss
+        """B_LOS from the weak-field approximation, by per-pixel least squares.
+
+        The WFA (e.g. del Toro Iniesta 2016) states::
+
+            V(lambda) = -C lambda0^2 g_eff B_LOS dI/dlambda,   C = e / (4 pi m_e c^2)
+                      = 4.67e-13 A^-1 G^-1.
+
+        For each pixel, ``V = p0 * dI/dlambda + p1`` is fitted over the window (the
+        offset ``p1`` absorbs any constant V bias), and then
+        ``B_LOS = -p0 / (C lambda0^2 g_eff)``. ``dI/dlambda`` uses ``np.gradient`` on the
+        window's own wavelengths.
+
+        Args:
+            wl_range: ``[start, stop)`` wavelength indices of the window. Training uses
+                ``[15, 60]``, i.e. 6301.20-6302.14 A on the Hinode grid, which covers
+                Fe I 6301.5 A.
+
+        Returns:
+            B_LOS map, shape ``(nx, ny)``, in G. Also stored in ``self.blos``.
+
+        Examples:
+            >>> import numpy as np
+            >>> import astropy.units as u
+            >>> from astropy.constants import c, e, m_e
+            >>> from utils.hinode_wavelengths import hinode_wavelength_grid
+            >>> wl = hinode_wavelength_grid()
+            >>> I = 1 - 0.6 * np.exp(-(wl - 6301.5) ** 2 / (2 * 0.05 ** 2))
+            >>> C = (e.si / (4 * np.pi * m_e * c)).to(1 / u.G / u.Angstrom).value
+            >>> V = -C * 6301.5 ** 2 * 1.67 * 500.0 * np.gradient(I) / np.gradient(wl)
+            >>> inv = ApproxInversions({"I": I[None, None], "V": V[None, None]}, wl,
+            ...                        6301.5 * u.Angstrom, 1.67)
+            >>> round(float(inv.compute_blos_wfa([15, 60]).value[0, 0]), 3)
+            500.0
         """
         # WFA constant: e / (4π m_e c) with proper units
         wfa_constant = e.si / (4 * np.pi * m_e * c)
         wfa_constant = wfa_constant.to(1 / u.G / u.Angstrom)
         
         def estimate_B(dI_dl: np.ndarray, V: np.ndarray) -> u.Quantity:
-            """
-            Estimate B_LOS from intensity gradient and Stokes V using least-squares fit.
-            
-            Solves: V = (dI/dλ) · B_LOS + offset
+            """Least-squares fit of ``V = p0 * dI/dlambda + p1``, returning ``B = -p0 / (C lambda0^2 g)`` in G.
+
+            Args:
+                dI_dl: dI/dlambda over the window, per Angstrom.
+                V: Stokes V over the window.
+
+            Returns:
+                B_LOS of the pixel as a Quantity in G.
             """
             ND = len(V)
             a = np.zeros([ND, 2])
@@ -185,34 +278,53 @@ class ApproxInversions:
         return self.blos
     
     def compute_vlos_doppler(self, wl_range: List[int]) -> u.Quantity:
-        """
-        Compute line-of-sight velocity using Doppler shift method with Gaussian fitting.
-        
-        The velocity is computed by fitting a Gaussian to the Stokes I profile
-        to find the line center wavelength, then applying the Doppler formula:
-        v_LOS = (λ_fit - λ₀) / λ₀ · c
+        """v_LOS from the centre of a Gaussian fitted to Stokes I (Doppler shift).
 
-        Sign convention: positive v_LOS means a redshifted line core. This matches the
-        sign of MURaM's Vz, which is what the network is trained against, and the two must
-        agree for the Doppler physics term to reinforce the MSE rather than fight it.
-        The opposite convention was in place until it was caught empirically: the
-        approximation correlated -0.965 with MURaM's Vz at log(tau) = -1.0, and the
-        doppler_only ablation arm drove the predicted velocity to correlation -0.951 at
-        exactly that height (its vlos_target_logtau) while leaving every other height
-        untouched.
-        
-        Parameters
-        ----------
-        wl_range : list of int
-            [start_index, end_index] for the wavelength range to use for Gaussian fitting
-            
-        Returns
-        -------
-        astropy.units.Quantity
-            Line-of-sight velocity map with shape (nx, ny) in km/s
+        Per pixel, ``a exp(-(x - x0)^2 / (2 sigma^2)) + offset`` is fitted with
+        ``scipy.optimize.curve_fit``, starting from ``[1, lambda0, 0.1, 0]``, and then::
+
+            v_LOS = c (x0 - lambda0) / lambda0.
+
+        Sign convention: positive v_LOS means a redshifted line core, the same as MURaM's
+        Vz, which the network is trained against. The two must agree for the Doppler
+        physics term to reinforce the MSE instead of fighting it. The opposite convention
+        was in place until it was caught empirically: the approximation correlated -0.965
+        with MURaM's Vz at log(tau) = -1.0, and the doppler_only arm drove the predicted
+        velocity to correlation -0.951 at exactly that height.
+
+        Args:
+            wl_range: Only ``wl_range[1]`` is used. The fit runs over indices
+                ``[0, wl_range[1])``, i.e. 6300.87-6302.14 A for the training value
+                ``[15, 60]``, which also contains the blue wing of Fe I 6302.5 A.
+
+        Returns:
+            v_LOS map, shape ``(nx, ny)``, in km/s. NaN where the fit fails. Also stored in
+            ``self.vlos``.
+
+        Examples:
+            >>> import numpy as np
+            >>> import astropy.units as u
+            >>> from utils.hinode_wavelengths import hinode_wavelength_grid
+            >>> wl = hinode_wavelength_grid()
+            >>> I = 1 - 0.6 * np.exp(-(wl - 6301.48) ** 2 / (2 * 0.05 ** 2))   # 20 mA blueshift
+            >>> inv = ApproxInversions({"I": I[None, None], "V": np.zeros((1, 1, wl.size))}, wl,
+            ...                        6301.5 * u.Angstrom, 1.67)
+            >>> round(float(inv.compute_vlos_doppler([15, 60]).value[0, 0]), 3)
+            -0.951
         """
         def gaussian_func(x, a, x0, sigma, offset):
-            """Gaussian function for fitting absorption line profile."""
+            """Gaussian plus offset; ``a`` goes negative when fitted to an absorption line.
+
+            Args:
+                x: Wavelengths (A).
+                a: Amplitude.
+                x0: Centre (A).
+                sigma: Width (A).
+                offset: Constant level.
+
+            Returns:
+                Model values at ``x``.
+            """
             return a * np.exp(-(x - x0)**2 / (2 * sigma**2)) + offset
         
         NX = self.stokes["I"].shape[0]
@@ -258,39 +370,48 @@ class ApproxInversions:
         continuum_wavelength: Optional[u.Quantity] = None,
         hsra_normalized: bool = True,
     ) -> u.Quantity:
-        """
-        Estimate temperature from the Stokes I continuum as a Planck brightness temperature.
+        """Brightness temperature of the Stokes I continuum (exact Planck inversion).
 
         The profiles are assumed normalized to the HSRA disk-centre continuum at
-        `HSRA_REFERENCE_WAVELENGTH` (NICOLE's `Continuum reference = 1`), so the absolute
-        intensity is I_abs = I_norm * I_HSRA and the temperature is the exact inversion
+        ``HSRA_REFERENCE_WAVELENGTH`` (NICOLE's ``Continuum reference = 1``), so the
+        absolute intensity is ``I_abs = I_norm * I_HSRA`` and::
 
-            T = (h c / λ_c k_B) / ln(1 + 2 h c² / (λ_c⁵ I_abs)),
+            T = (h c / (lambda_c k_B)) / ln(1 + 2 h c^2 / (lambda_c^5 I_abs)).
 
-        with no linearization and no anchor temperature: I_norm = 1 returns the HSRA
-        brightness temperature (~6125 K at 6302 Å).
+        There is no linearization and no anchor temperature: ``I_norm = 1`` gives the HSRA
+        brightness temperature (~6125 K at 6302 A).
 
-        Parameters
-        ----------
-        cont_indices : list of int
-            Wavelength indices averaged as the continuum. The default is the red end of the
-            112-point Hinode grid (6303.19-6303.26 Å), the highest points of the quiet-Sun
-            profile; the blue end still sits in the wing of Fe I 6301.5 Å.
-        continuum_wavelength : astropy.units.Quantity, optional
-            Wavelength at which the Planck function is inverted. If None, the mean wavelength
-            of `cont_indices`.
-        hsra_normalized : bool
-            Must be True: the inversion is only meaningful for HSRA-normalized profiles.
+        Args:
+            cont_indices: Wavelength indices averaged as the continuum. The default is the
+                red end of the 112-point Hinode grid (6303.19-6303.26 A), the highest points
+                of the quiet-Sun profile. The blue end still sits in the wing of
+                Fe I 6301.5 A.
+            continuum_wavelength: Wavelength where the Planck function is inverted.
+                ``None`` uses the mean wavelength of ``cont_indices``.
+            hsra_normalized: Must be True. The inversion is only meaningful for
+                HSRA-normalized profiles.
 
-        Returns
-        -------
-        astropy.units.Quantity
-            Temperature map with shape (nx, ny) in Kelvin.
+        Returns:
+            Temperature map, shape ``(nx, ny)``, in K. Also stored in ``self.temperature``.
 
-        Notes
-        -----
-        Assumes LTE (I_c ≈ B_λ(T)) and disk centre (μ ≈ 1). This is a brightness temperature:
-        by Eddington-Barbier it matches T near τ ≈ 2/3 (log τ ≈ -0.2), not at log τ = 0.
+        Raises:
+            ValueError: If ``hsra_normalized`` is False.
+
+        Note:
+            Assumes LTE (``I_c = B_lambda(T)``) and disk centre (mu ~ 1). Being a brightness
+            temperature, by Eddington-Barbier it matches T near tau ~ 2/3
+            (log tau ~ -0.2), not at log tau = 0, hence the comparison height of the
+            Black Body flavor. In cold umbrae the red-end points sit next to a molecular
+            blend at 6303.1 A (Castellanos Durán et al. 2024, Fig. 11).
+
+        Examples:
+            >>> import numpy as np
+            >>> import astropy.units as u
+            >>> from utils.hinode_wavelengths import hinode_wavelength_grid
+            >>> wl = hinode_wavelength_grid()
+            >>> inv = ApproxInversions({"I": np.ones((1, 1, wl.size))}, wl, 6301.5 * u.Angstrom, 1.67)
+            >>> round(float(inv.compute_temperature_blackbody().to_value(u.K)[0, 0]))   # at 6303.2 A
+            6126
         """
         if not hsra_normalized:
             raise ValueError(
@@ -317,39 +438,40 @@ class ApproxInversions:
                          figsize_metrics: Tuple[int, int] = (14, 6),
                          figsize_maps: Tuple[int, int] = (18, 6),
                          save_dir: Optional[str] = None) -> Dict[str, float]:
-        """
-        Compare approximation (B_LOS or V_LOS) with MHD data at different optical depths.
-        
-        Computes and plots:
-        - Relative Root Mean Square Error (RRMSE) vs optical depth
-        - Pearson correlation vs optical depth
-        - Spatial maps at heights of best RRMSE and correlation
-        
-        Parameters
-        ----------
-        mhd_od_data : dict
-            Dictionary with MHD data remapped to optical depth coordinates.
-            Should contain 'Bz' for blos or 'Vz' for vlos.
-        approximation : str
-            "blos" or "vlos" - which approximation to compare
-        logtau_values : np.ndarray, optional
-            Array of log(τ) values corresponding to the optical depth levels.
-            If None, uses indices.
-        figsize_metrics : tuple
-            Figure size for RRMSE and correlation plots
-        figsize_maps : tuple
-            Figure size for spatial comparison maps
-        save_dir : str or Path, optional
-            Directory to save figures
-            
-        Returns
-        -------
-        dict
-            Dictionary with keys:
-            - 'min_rrmse': minimum RRMSE value
-            - 'min_rrmse_logtau': optical depth of minimum RRMSE
-            - 'max_corr': maximum correlation value
-            - 'max_corr_logtau': optical depth of maximum correlation
+        """Compare the WFA or Doppler map with the simulation at every optical depth.
+
+        For each node ``k`` it computes::
+
+            RRMSE_k = sqrt(mean((approx - truth_k)^2)) / mean(|truth_k|)
+
+        and the Pearson correlation, then plots both against log tau and shows the maps
+        at the best-RRMSE and best-correlation heights. This is how the comparison
+        height of each physics term was chosen.
+
+        Args:
+            mhd_od_data: Simulation remapped to optical depth, with ``'Bz'`` (G) or
+                ``'Vz'`` (km/s) of shape ``(nx, ny, n_tau)``.
+            approximation: ``'blos'`` (needs ``compute_blos_wfa`` first) or ``'vlos'``
+                (needs ``compute_vlos_doppler`` first).
+            logtau_values: log tau of each node. ``None`` uses the node indices.
+            figsize_metrics: Figure size of the metrics-vs-log-tau plot, in inches.
+            figsize_maps: Figure size of the maps figure, in inches.
+            save_dir: If given, both figures are saved there as PNG.
+
+        Returns:
+            Dict with ``min_rrmse``, ``min_rrmse_logtau``, ``max_corr``,
+            ``max_corr_logtau`` and the full per-node arrays ``rrmse_values`` and
+            ``correlation_values``.
+
+        Raises:
+            ValueError: If the approximation is unknown or not computed yet, or the
+                matching key is missing from ``mhd_od_data``.
+
+        Examples:
+            >>> metrics = inv.compare_with_mhd(mhd_od_data={"Bz": bz_tau}, approximation="blos",
+            ...                                logtau_values=np.arange(-3.0, 1.41, 0.1))  # doctest: +SKIP
+            >>> metrics["min_rrmse_logtau"]  # doctest: +SKIP
+            -0.8
         """
         # Select approximation
         if approximation.lower() == "blos":

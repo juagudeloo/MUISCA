@@ -1,3 +1,35 @@
+"""Normalization of the network targets (T, Vz, Bz per optical depth) and inputs (Stokes).
+
+The network is trained on normalized quantities so that every target and every input
+channel has a comparable scale:
+
+* :class:`MhdNormalizer` normalizes each atmospheric parameter independently at every
+  log(tau) node. Temperature uses a z-score; Vz is divided by its std ("centered");
+  Bz is first compressed with ``asinh(Bz / B0_tau)``, where ``B0_tau`` is the 60th
+  percentile of ``|Bz|`` at that node, and then divided by the std of the transformed
+  values.
+* :class:`StokesNormalizer` applies one global mean/std per Stokes parameter, over all
+  pixels and wavelengths of the normalization steps.
+
+Statistics are accumulated incrementally (Welford's algorithm) so whole simulation
+steps never have to be in memory at once, and are stored as JSON next to the data
+(``data/normalization_stats/``).
+
+Examples:
+    >>> import contextlib, io, tempfile
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(0)
+    >>> atm = {"T": 5000 + 100 * rng.standard_normal((4, 4, 2)),
+    ...        "Vz": rng.standard_normal((4, 4, 2)),
+    ...        "Bz": 50 * rng.standard_normal((4, 4, 2))}
+    >>> norm = MhdNormalizer(n_tau=2, raw_values_dir=tempfile.mkdtemp())
+    >>> norm.update(atm)
+    >>> with contextlib.redirect_stdout(io.StringIO()):
+    ...     _ = norm.finalize()
+    >>> y = norm.transform(atm)["T"]          # (4, 4, 2), zero mean / unit std per node
+    >>> bool(abs(y[..., 0].mean()) < 1e-6 and abs(y[..., 0].std() - 1) < 1e-6)
+    True
+"""
 import numpy as np
 from pathlib import Path
 import json
@@ -7,21 +39,60 @@ from typing import Dict, Any, Optional, List
 import torch
 
 class MhdNormalizer:
-    """Compute normalization statistics incrementally with per-optical-depth normalization.
-    
-    For Bz: applies per-τ asinh(Bz / B0_τ) transform where B0_τ = P60(|Bz|).
-    Also computes global tail-weighting parameters: B0_w = P90, B1_w = P99.5.
+    """Per-optical-depth normalization of the atmospheric targets T, Vz and Bz.
+
+    Each parameter is normalized independently at every log(tau) node, because the
+    stratification is strong (T goes from ~4600 K at log tau = -2 to ~6400 K at 0), and a
+    single global scale would let the deep layers dominate the loss.
+
+    Transforms per node ``k``:
+
+    * T ("standard"): ``(T - mean_k) / std_k``.
+    * Vz ("centered"): ``Vz / std_k`` (no mean subtraction).
+    * Bz ("asinh"): ``asinh(Bz / B0_k) / std_k`` with ``B0_k = P60(|Bz_k|)`` in gauss.
+      asinh is linear for ``|Bz| << B0`` and logarithmic for ``|Bz| >> B0``, so quiet-Sun
+      fields and kG fields both get usable resolution, and the sign is preserved.
+
+    It also stores the global tail-weighting parameters used by the Huber tail loss:
+    ``B0_weight_start = P90(|Bz|)``, ``B1_weight_saturation = P99.5(|Bz|)`` and
+    ``huber_delta = 0.25 * B0_weight_start`` (all in gauss).
+
+    Usage is ``update()`` for every step, then ``finalize()``, then ``save()``. Training
+    and analysis just ``load()`` the JSON file.
+
+    Note:
+        The "centered" Vz transform does not subtract the mean, but ``denormalize``
+        adds it back, so a round trip shifts Vz by ``+mean_k``. That is ≤ 0.03 km/s at
+        log tau between -2 and 0, and up to ~0.7 km/s at the deepest nodes. This is a
+        known issue, see ``tests/test_normalizer.py``.
+
+    Examples:
+        >>> import contextlib, io, tempfile
+        >>> import numpy as np
+        >>> atm = {"T": np.full((2, 2, 1), 5000.0), "Vz": np.zeros((2, 2, 1)),
+        ...        "Bz": np.array([[[10.0], [-10.0]], [[100.0], [-100.0]]])}
+        >>> norm = MhdNormalizer(n_tau=1, raw_values_dir=tempfile.mkdtemp())
+        >>> norm.update(atm)
+        >>> with contextlib.redirect_stdout(io.StringIO()):
+        ...     stats = norm.finalize()
+        >>> stats["T"][0]["mean"], stats["Bz"][0]["type"]
+        (5000.0, 'asinh')
     """
-    
+
     def __init__(self, n_tau: int = 21, epsilon: float = 1e-8, raw_values_dir: Optional[str] = None, bz_hist_bins: int = 4096):
-        """
-        Initialize normalizer with per-τ statistics.
-        
+        """Create an empty normalizer with one Welford accumulator per parameter and node.
+
         Args:
-            n_tau: number of optical depth levels (default: 21)
-            epsilon: small value to avoid division by zero
-            raw_values_dir: optional directory used to spill raw Bz values to disk
-            bz_hist_bins: number of histogram bins used to estimate percentiles from disk-backed values
+            n_tau: Number of optical depth nodes. The current grid has 45 (log tau from
+                -3.0 to 1.4 in steps of 0.1). The default of 21 is the legacy grid.
+            epsilon: Small constant added to every std to avoid division by zero.
+            raw_values_dir: Directory where a temporary folder holds the raw ``|Bz|``
+                values, one binary file per node, so the percentiles can be computed in
+                ``finalize`` without keeping every value in RAM. ``None`` uses the
+                system temp dir.
+            bz_hist_bins: Number of linear histogram bins between 0 and ``max|Bz|`` used
+                to estimate the ``|Bz|`` percentiles. More bins give more exact
+                percentiles.
         """
         self.n_tau = n_tau
         self.epsilon = epsilon
@@ -63,7 +134,12 @@ class MhdNormalizer:
         self._bz_abs_max = 0.0
 
     def _append_bz_raw_values(self, tau_idx: int, data_flat: np.ndarray) -> None:
-        """Append raw absolute Bz values for one τ level to the on-disk buffer."""
+        """Append ``|Bz|`` values of one node to its on-disk float32 buffer and track the maximum.
+
+        Args:
+            tau_idx: Index of the optical depth node.
+            data_flat: 1D array of Bz values in gauss. The sign is dropped.
+        """
         abs_values = np.asarray(np.abs(data_flat), dtype=np.float32)
         if abs_values.size == 0:
             return
@@ -77,7 +153,16 @@ class MhdNormalizer:
             abs_values.tofile(handle)
 
     def _iter_bz_raw_chunks(self, tau_idx: int, chunk_size: int = 1_000_000):
-        """Yield raw Bz values for one τ level in small chunks from disk."""
+        """Yield the stored ``|Bz|`` values of one node from disk, in chunks.
+
+        Args:
+            tau_idx: Index of the optical depth node.
+            chunk_size: Number of float32 values per yielded chunk.
+
+        Yields:
+            1D float32 arrays of ``|Bz|`` in gauss. Nothing is yielded if the node has
+            no stored values.
+        """
         path = self._bz_raw_paths[tau_idx]
         if not path.exists() or path.stat().st_size == 0:
             return
@@ -91,6 +176,23 @@ class MhdNormalizer:
 
     @staticmethod
     def _percentile_from_histogram(counts: np.ndarray, edges: np.ndarray, percentile: float) -> float:
+        """Estimate a percentile from a histogram by linear interpolation inside the bin.
+
+        Args:
+            counts: Histogram counts, shape ``(n_bins,)``.
+            edges: Bin edges, shape ``(n_bins + 1,)``.
+            percentile: Percentile in [0, 100].
+
+        Returns:
+            The estimated value, in the units of ``edges``. Returns 0.0 for an empty
+            histogram.
+
+        Examples:
+            >>> import numpy as np
+            >>> counts, edges = np.histogram(np.arange(100.0), bins=100, range=(0, 100))
+            >>> round(MhdNormalizer._percentile_from_histogram(counts, edges, 60.0), 6)
+            60.0
+        """
         total = int(counts.sum())
         if total <= 0:
             return 0.0
@@ -113,15 +215,29 @@ class MhdNormalizer:
         return left_edge + fraction * (right_edge - left_edge)
         
     def update(self, od_data: dict):
-        """
-        Update running statistics per optical depth level.
-        
-        For Bz: applies per-τ asinh(Bz / B0_τ) transform where B0_τ will be computed
-        in finalize() from percentiles of collected raw values.
-        
+        """Add one simulation step to the running per-node statistics.
+
+        T and Vz go straight into Welford's running mean and M2. For Bz, the raw ``|Bz|``
+        values are spilled to disk (for the percentiles in ``finalize``) and the running
+        moments are taken on ``asinh(Bz)`` with a placeholder ``B0 = 1``. ``finalize``
+        then replaces them with moments under the final ``B0``.
+
         Args:
-            od_data: dict with keys 'T', 'Vz', 'Bz' 
-                     containing (nx, ny, n_tau) arrays
+            od_data: Dict with keys ``'T'`` (K), ``'Vz'`` (km/s) and ``'Bz'`` (G), each an
+                array or astropy Quantity of shape ``(nx, ny, n_tau)``.
+
+        Raises:
+            RuntimeError: If the normalizer is already finalized.
+            ValueError: If the last axis is not ``n_tau`` long.
+
+        Examples:
+            >>> import tempfile
+            >>> import numpy as np
+            >>> norm = MhdNormalizer(n_tau=1, raw_values_dir=tempfile.mkdtemp())
+            >>> norm.update({"T": np.array([[[4000.0, ]], [[6000.0]]]),
+            ...              "Vz": np.zeros((2, 1, 1)), "Bz": np.ones((2, 1, 1))})
+            >>> norm.stats["T"][0]["n"], norm.stats["T"][0]["mean"]
+            (2, 5000.0)
         """
         if self.finalized:
             raise RuntimeError("Cannot update finalized normalizer.")
@@ -160,15 +276,38 @@ class MhdNormalizer:
                     self.stats[param][tau_idx]['M2'] += delta * delta2
     
     def finalize(self) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Convert accumulated statistics to mean/std for each τ level.
-        
-        For Bz: computes per-τ asinh scaling parameter B0_tr from P60(|Bz|),
-        then rescales accumulated asinh statistics. Also computes global
-        tail-loss parameters: B0_w=P90, B1_w=P99.5, delta=0.25*B0_w.
-        
+        """Turn the accumulated moments into per-node mean/std and the Bz transform scales.
+
+        Steps:
+
+        1. Build per-node histograms of the stored ``|Bz|`` values.
+        2. ``B0_k = P60(|Bz_k|)``, plus the global tail parameters P90 and P99.5.
+        3. Re-derive the Bz std under the final ``B0_k`` from the histogram, as
+           ``sqrt(E[asinh(|Bz| / B0_k)^2])``. The mean is set to 0, because asinh is odd
+           and the field is sign-symmetric. This is the fix of commit 4cb32af.
+        4. Write ``final_stats`` (population std, i.e. ``M2 / n``).
+
+        Calling it twice returns the cached result.
+
         Returns:
-            final_stats: dict with normalization parameters per τ level
+            Dict ``{param: [entry_per_node]}``, where each entry has ``tau_idx``,
+            ``mean``, ``std``, ``n_samples`` and ``type`` (``'standard'`` for T,
+            ``'centered'`` for Vz, ``'asinh'`` for Bz). Bz entries also carry
+            ``B0_transform`` (G) and ``std_placeholder_b0``.
+
+        Raises:
+            ValueError: If no Bz values were collected.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np
+            >>> norm = MhdNormalizer(n_tau=1, raw_values_dir=tempfile.mkdtemp())
+            >>> norm.update({"T": np.array([[[4000.0]], [[6000.0]]]),
+            ...              "Vz": np.zeros((2, 1, 1)), "Bz": np.array([[[5.0]], [[-5.0]]])})
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     stats = norm.finalize()
+            >>> stats["T"][0]["std"]
+            1000.0
         """
         if self.finalized:
             return self.final_stats
@@ -285,22 +424,35 @@ class MhdNormalizer:
         return self.final_stats
 
     def _cleanup_raw_storage(self) -> None:
-        """Remove temporary raw-value files once final statistics have been written."""
+        """Delete the temporary folder with the raw ``|Bz|`` buffers (called by ``save``)."""
         storage_dir = getattr(self, "_bz_raw_storage_dir", None)
         if storage_dir is not None and Path(storage_dir).exists():
             shutil.rmtree(storage_dir, ignore_errors=True)
     
     def transform(self, od_data: dict) -> dict:
-        """
-        Normalize atmospheric parameters per optical depth level.
-        
-        For Bz: applies per-τ asinh(Bz / B0_τ) transform then z-score normalization.
-        
+        """Normalize T, Vz and Bz node by node (see the class docstring for each transform).
+
         Args:
-            od_data: dict with keys 'T', 'Vz', 'Bz'
-            
+            od_data: Dict with keys ``'T'`` (K), ``'Vz'`` (km/s) and ``'Bz'`` (G), each of
+                shape ``(nx, ny, n_tau)``. Astropy Quantities are accepted.
+
         Returns:
-            normalized_data: dict with normalized arrays
+            Dict with the same keys and shapes, float32, dimensionless.
+
+        Raises:
+            RuntimeError: If the normalizer is not finalized or loaded.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np
+            >>> atm = {"T": np.array([[[4000.0]], [[6000.0]]]), "Vz": np.array([[[1.0]], [[-1.0]]]),
+            ...        "Bz": np.array([[[5.0]], [[-5.0]]])}
+            >>> norm = MhdNormalizer(n_tau=1, raw_values_dir=tempfile.mkdtemp())
+            >>> norm.update(atm)
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = norm.finalize()
+            >>> norm.transform(atm)["T"].ravel().round(3).tolist()
+            [-1.0, 1.0]
         """
         if not self.finalized:
             raise RuntimeError("Normalizer not finalized. Call finalize() first.")
@@ -338,23 +490,38 @@ class MhdNormalizer:
         return normalized
     
     def denormalize(self, normalized_data: np.ndarray, param: str) -> np.ndarray:
-        """
-        Denormalize predictions back to physical units (per-τ).
-        
-        For Bz: reverses z-score normalization then applies inverse asinh:
-        Bz = B0_τ * sinh(y_asinh).
-        
-        Parameters
-        ----------
-        normalized_data : np.ndarray
-            Normalized predictions, shape (n_pixels, n_tau) or (n_samples, n_tau)
-        param : str
-            Parameter name ('T', 'Vz', or 'Bz')
-            
-        Returns
-        -------
-        denormalized : np.ndarray
-            Denormalized values in physical units, same shape as input
+        """Map normalized network outputs of one parameter back to physical units.
+
+        For every node: ``x = y * std + mean``, and for Bz additionally
+        ``Bz = B0 * sinh(x)``. The results are clipped to physical ranges for reporting:
+        T to [3000, 15000] K, Vz to [-20, 20] km/s, Bz to [-10000, 10000] G.
+
+        Args:
+            normalized_data: Array of shape ``(n_pixels, n_tau)``.
+            param: ``'T'``, ``'Vz'`` or ``'Bz'``.
+
+        Returns:
+            float32 array of the same shape, in K, km/s or G.
+
+        Raises:
+            RuntimeError: If the normalizer is not finalized or loaded.
+            ValueError: If ``param`` is unknown.
+
+        Note:
+            For Vz this adds ``mean``, which ``transform`` never subtracted. See the
+            class docstring.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np
+            >>> atm = {"T": np.array([[[4000.0]], [[6000.0]]]), "Vz": np.zeros((2, 1, 1)),
+            ...        "Bz": np.array([[[5.0]], [[-5.0]]])}
+            >>> norm = MhdNormalizer(n_tau=1, raw_values_dir=tempfile.mkdtemp())
+            >>> norm.update(atm)
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = norm.finalize()
+            >>> norm.denormalize(np.array([[1.0], [-1.0]]), "T").ravel().tolist()
+            [6000.0, 4000.0]
         """
         if not self.finalized:
             raise RuntimeError("Normalizer not finalized. Call finalize() first.")
@@ -395,7 +562,21 @@ class MhdNormalizer:
         return denormalized
     
     def save(self, filepath: str, logtau_values: Optional[List[float]] = None):
-        """Save finalized normalization statistics with asinh transform parameters."""
+        """Write the final statistics to JSON (version ``'3.0_asinh_per_tau'``) and clean up.
+
+        Finalizes first if needed, writes ``final_stats``, ``B0_transform_per_tau``, the
+        tail-loss parameters and optionally the log(tau) grid, deletes the temporary
+        ``|Bz|`` buffers, and prints a summary.
+
+        Args:
+            filepath: Output JSON path. Parent folders are created.
+            logtau_values: Optional log(tau) value of every node, stored rounded to 6
+                decimals so loaders can check that the grid matches.
+
+        Examples:
+            >>> norm.save("data/normalization_stats/nicole_tau500/mhd_normalization.json",
+            ...           logtau_values=np.arange(-3.0, 1.41, 0.1))  # doctest: +SKIP
+        """
         if not self.finalized:
             print("Warning: Normalizer not finalized. Finalizing...")
             self.finalize()
@@ -450,7 +631,28 @@ class MhdNormalizer:
                 print(f"  τ={tau_idx:2d}: mean={stats['mean']:8.4f}, std={stats['std']:7.4f}, n={stats['n_samples']:,}")
     
     def load(self, filepath: str):
-        """Load normalization statistics from JSON file (asinh version 3.0+ only)."""
+        """Load statistics written by ``save`` (asinh versions 3.0 and 3.1 only).
+
+        Also sets the legacy attribute aliases (``bz_B0_tr_per_tau``, ``bz_B0_w``,
+        ``bz_B1_w``, ``bz_delta``) that older code paths still read.
+
+        Args:
+            filepath: Path to the JSON file.
+
+        Returns:
+            ``self``, so it can be chained: ``MhdNormalizer().load(path)``.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            ValueError: If the file uses the old sign-log Bz transform (versions 1.0 or
+                2.0) or an unknown version.
+
+        Examples:
+            >>> norm = MhdNormalizer().load(
+            ...     "data/normalization_stats/nicole_tau500/mhd_normalization.json")  # doctest: +SKIP
+            >>> norm.n_tau  # doctest: +SKIP
+            45
+        """
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"Not found: {filepath}")
@@ -509,7 +711,20 @@ class MhdNormalizer:
         return self
     
     def save_state(self, filepath: str):
-        """Save intermediate state for resumption (asinh version)."""
+        """Save the running (not yet finalized) accumulators so a long stats run can resume.
+
+        Stores the Welford state, the ``|Bz|`` maximum, the sample counts and the paths of
+        the on-disk ``|Bz|`` buffers, which must still exist when resuming.
+
+        Args:
+            filepath: Output JSON path.
+
+        Raises:
+            RuntimeError: If the normalizer is already finalized.
+
+        Examples:
+            >>> norm.save_state(".normalization_state/mhd_state.json")  # doctest: +SKIP
+        """
         if self.finalized:
             raise RuntimeError("Cannot save state of finalized normalizer.")
         
@@ -540,7 +755,21 @@ class MhdNormalizer:
         print(f"Progress: τ=0 processed {self.stats['T'][0]['n']:,} samples")
     
     def load_state(self, filepath: str):
-        """Load intermediate state to resume computation (asinh version)."""
+        """Restore accumulators written by ``save_state`` and keep updating from there.
+
+        Args:
+            filepath: Path to the state JSON.
+
+        Returns:
+            ``self``.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            ValueError: If the state uses the old sign-log transform or an unknown version.
+
+        Examples:
+            >>> norm = MhdNormalizer(n_tau=45).load_state(".normalization_state/mhd_state.json")  # doctest: +SKIP
+        """
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"Not found: {filepath}")
@@ -589,7 +818,27 @@ class MhdNormalizer:
         return self
 
 class StokesNormalizer:
+    """Global z-score normalization of the Stokes inputs, with one mean/std per parameter.
+
+    The statistics run over every pixel and every wavelength of the normalization steps,
+    so the shape of each profile and the relative amplitude between pixels are preserved.
+    Only the overall scale changes: Stokes I (~1) and V (~1e-3) end up with comparable
+    magnitudes in the network input.
+
+    The transform is ``(S - mean_S) / (std_S + epsilon)`` for every key, including V,
+    whose mean is ~1e-6 (in units of the HSRA continuum).
+
+    Examples:
+        >>> import numpy as np
+        >>> norm = StokesNormalizer()
+        >>> norm.update({"I": np.array([0.8, 1.0, 1.2]), "V": np.array([-1e-3, 0.0, 1e-3])})
+        >>> stats = norm.finalize()
+        >>> round(stats["I"]["mean"], 6), round(stats["V"]["std"], 6)
+        (1.0, 0.000816)
+    """
+
     def __init__(self):
+        """Create empty Welford accumulators for I and V."""
         self.stats = {
             'I': {'n': 0, 'mean': 0.0, 'M2': 0.0},
             'V': {'n': 0, 'mean': 0.0, 'M2': 0.0}
@@ -598,10 +847,22 @@ class StokesNormalizer:
         self.final_stats = None
     
     def update(self, stokes_dict):
-        """Update statistics with new data from one simulation step.
-        
+        """Add one simulation step to the running mean/M2 of I and V.
+
         Args:
-            stokes_dict: {'I': (nx, ny, nλ), 'V': (nx, ny, nλ)}
+            stokes_dict: Dict with ``'I'`` and ``'V'`` arrays of any shape, usually
+                ``(nx, ny, n_wl)``, continuum-normalized (dimensionless). Other keys are
+                ignored.
+
+        Raises:
+            RuntimeError: If already finalized.
+
+        Examples:
+            >>> import numpy as np
+            >>> norm = StokesNormalizer()
+            >>> norm.update({"I": np.ones((2, 3)), "V": np.zeros((2, 3))})
+            >>> norm.stats["I"]["n"]
+            6
         """
         if self.finalized:
             raise RuntimeError("Cannot update finalized normalizer.")
@@ -617,7 +878,19 @@ class StokesNormalizer:
                 self.stats[key]['M2'] += delta * delta2
     
     def finalize(self):
-        """Compute final mean and std."""
+        """Compute the final mean and population std (``sqrt(M2 / n)``) of I and V.
+
+        Returns:
+            ``{'I': {'mean', 'std', 'n_samples'}, 'V': {...}}``. A second call returns the
+            same dict.
+
+        Examples:
+            >>> import numpy as np
+            >>> norm = StokesNormalizer()
+            >>> norm.update({"I": np.array([1.0, 3.0]), "V": np.array([0.0, 0.0])})
+            >>> norm.finalize()["I"]
+            {'mean': 2.0, 'std': 1.0, 'n_samples': 2}
+        """
         if self.finalized:
             return self.final_stats
         
@@ -632,7 +905,14 @@ class StokesNormalizer:
         return self.final_stats
     
     def save(self, filepath):
-        """Save statistics to JSON."""
+        """Write ``final_stats`` to JSON, finalizing first if needed, and print a summary.
+
+        Args:
+            filepath: Output JSON path. Parent folders are created.
+
+        Examples:
+            >>> norm.save("data/normalization_stats/nicole_tau500/stokes_normalization.json")  # doctest: +SKIP
+        """
         if not self.finalized:
             print("Warning: Normalizer not finalized. Finalizing...")
             self.finalize()
@@ -649,7 +929,21 @@ class StokesNormalizer:
             print(f"  {key}: mean={stats['mean']:8.4f}, std={stats['std']:7.4f}, n={stats['n_samples']:,}")
     
     def load(self, filepath):
-        """Load statistics from JSON."""
+        """Load ``final_stats`` written by ``save`` and mark the normalizer finalized.
+
+        Args:
+            filepath: Path to the JSON file.
+
+        Returns:
+            ``self``.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+
+        Examples:
+            >>> norm = StokesNormalizer().load(
+            ...     "data/normalization_stats/nicole_tau500/stokes_normalization.json")  # doctest: +SKIP
+        """
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"Not found: {filepath}")
@@ -662,15 +956,26 @@ class StokesNormalizer:
         return self
     
     def transform(self, stokes_dict: dict, epsilon: float = 1e-8) -> dict:
-        """
-        Normalize Stokes parameters.
-        
+        """Apply ``(S - mean) / (std + epsilon)`` to I and V.
+
         Args:
-            stokes_dict: dict with keys 'I' and 'V' containing arrays
-            epsilon: small value to avoid division by zero
-            
+            stokes_dict: Dict with ``'I'`` and ``'V'`` arrays (or Quantities) of any shape.
+                Other keys are ignored and are **not** returned.
+            epsilon: Added to the std to avoid division by zero.
+
         Returns:
-            normalized_data: dict with normalized arrays
+            Dict with the normalized ``'I'`` and ``'V'``, same shapes as the input.
+
+        Raises:
+            RuntimeError: If not finalized or loaded.
+
+        Examples:
+            >>> import numpy as np
+            >>> norm = StokesNormalizer()
+            >>> norm.update({"I": np.array([1.0, 3.0]), "V": np.array([-1.0, 1.0])})
+            >>> _ = norm.finalize()
+            >>> norm.transform({"I": np.array([3.0]), "V": np.array([0.0])})["I"].round(6).tolist()
+            [1.0]
         """
         if not self.finalized:
             raise RuntimeError("Normalizer not finalized. Call finalize() first.")
@@ -686,15 +991,28 @@ class StokesNormalizer:
         return normalized
     
     def inverse_transform(self, predictions: np.ndarray, param_order: list = ['I', 'V']) -> dict:
-        """
-        Denormalize model predictions back to physical units.
-        
+        """Undo ``transform`` for flattened profiles stacked side by side.
+
         Args:
-            predictions: array from model with shape (n_samples, n_features)
-            param_order: order of parameters in predictions (default: ['I', 'V'])
-            
+            predictions: Array of shape ``(n_samples, n_params * n_wl)``, with the blocks
+                in ``param_order``.
+            param_order: Key of each block, in order.
+
         Returns:
-            denormalized: dict with keys from param_order in physical units
+            Dict ``{key: (n_samples, n_wl)}`` as ``block * std + mean``. ``epsilon`` is not
+            added back, so the relative error is ~1e-8 / std.
+
+        Raises:
+            RuntimeError: If not finalized or loaded.
+
+        Examples:
+            >>> import numpy as np
+            >>> norm = StokesNormalizer()
+            >>> norm.update({"I": np.array([1.0, 3.0]), "V": np.array([-1.0, 1.0])})
+            >>> _ = norm.finalize()
+            >>> out = norm.inverse_transform(np.array([[1.0, 0.0]]))
+            >>> out["I"].tolist(), out["V"].tolist()
+            ([[3.0]], [[0.0]])
         """
         if not self.finalized:
             raise RuntimeError("Normalizer not finalized.")
@@ -716,7 +1034,17 @@ class StokesNormalizer:
         return denormalized
     
     def save_state(self, filepath: str):
-        """Save intermediate state for resumption."""
+        """Save the running accumulators (version ``'1.0_stokes'``) so a stats run can resume.
+
+        Args:
+            filepath: Output JSON path.
+
+        Raises:
+            RuntimeError: If already finalized.
+
+        Examples:
+            >>> norm.save_state(".normalization_state/stokes_state.json")  # doctest: +SKIP
+        """
         if self.finalized:
             raise RuntimeError("Cannot save state of finalized normalizer.")
         
@@ -737,14 +1065,27 @@ class StokesNormalizer:
         print(f"          V processed {self.stats['V']['n']:,} samples")
     
     def load_state(self, filepath: str):
-        """Load intermediate state to resume computation."""
+        """Restore accumulators written by ``save_state``.
+
+        Args:
+            filepath: Path to the state JSON.
+
+        Returns:
+            ``self``.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+
+        Examples:
+            >>> norm = StokesNormalizer().load_state(".normalization_state/stokes_state.json")  # doctest: +SKIP
+        """
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"Not found: {filepath}")
-        
+
         with open(filepath, 'r') as f:
             save_dict = json.load(f)
-        
+
         self.stats = save_dict['stats']
         self.finalized = save_dict.get('finalized', False)
         
