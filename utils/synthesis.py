@@ -1,17 +1,32 @@
-"""MUISCA -> NICOLE forward-synthesis bridge.
+"""MUISCA to NICOLE forward-synthesis bridge.
 
-Implements the components designed in the plan:
-  - SynthesisConfig: runtime configuration shared by exporter, runner, comparator.
-  - PredictionExporter: runs a trained model on requested pixels and persists
-    denormalized T/V_LOS/B_LOS + matched observed Stokes to HDF5.
-  - NicoleRunner: builds per-pixel NICOLE working directories from a
-    persisted predictions HDF5 file and invokes NICOLE in synthesis mode.
-  - SynthesisComparator: overlays synthesized vs observed Stokes and reports
-    per-line chi-square.
+A trained model's predicted atmosphere (T, v_LOS, B_LOS on its log tau nodes) is
+handed to NICOLE, which synthesizes Fe I 6301.5 and 6302.5 A on the Hinode grid. The
+synthetic profiles are compared with the profiles the model was given, as a check that
+the predicted atmosphere reproduces the observation. The same runner also synthesizes the
+MURaM training cubes (``run_cube``) and can run NICOLE inversions (``run_inversion_cube``).
 
-Supports two sources: "modest" (real Hinode/SOT-SP observations) and "muram"
-(synthetic MURaM simulation steps, e.g. one outside the model's training
-window, for an out-of-distribution generalization check).
+* :class:`SynthesisConfig`: settings and output layout shared by the other classes.
+* :class:`PredictionExporter`: runs a trained model on a region and saves the
+  predicted atmospheres and the matching input profiles of chosen pixels to HDF5.
+* :class:`NicoleRunner`: writes NICOLE inputs, runs NICOLE (per pixel or per cube)
+  and reads the profiles back.
+* :class:`SynthesisComparator`: chi-square per pixel and overlay plots.
+
+Two sources are supported: ``"modest"`` (Hinode/SP observations) and ``"muram"`` (a
+simulation step, e.g. the test step 198).
+
+Sign conventions, checked with NICOLE (``tests/test_synthesis.py``): v_LOS > 0 shifts
+the lines to the red, and B_long > 0 gives the V whose weak-field estimate is positive.
+Q and U are zero unless the model carries a transverse field.
+
+Examples:
+    Synthesize the profiles of a few MODEST pixels from a trained model's prediction
+    (needs the model, the MODEST files and NICOLE)::
+
+        cfg = SynthesisConfig(source="modest", experiment_root=root, model_type="wfa_only")
+        h5 = PredictionExporter(cfg, torch.device("cuda")).export([(100, 200), (50, 60)])
+        NicoleRunner(cfg).run_pixels_from_h5(h5)
 """
 from __future__ import annotations
 
@@ -55,13 +70,23 @@ from utils.normalizer import MhdNormalizer, StokesNormalizer
 def _rmtree_retry(path: Path, attempts: int = 5, delay_s: float = 0.2) -> None:
     """Delete a directory tree, retrying past NFS's transient ENOTEMPTY.
 
-    On NFS-mounted scratch (the common case for these workdirs), the client's
-    cached directory-entry count can briefly lag behind reality right after a
-    subprocess closes its file handles, so the final rmdir() inside
-    shutil.rmtree() occasionally raises ENOTEMPTY even though every file
-    underneath has already been removed. Retrying after a short delay clears
-    up once the cache catches up; a real failure (permissions, etc.) still
-    surfaces after the last attempt.
+    On NFS-mounted scratch, the client's cached directory-entry count can briefly lag
+    behind reality right after a subprocess closes its files, so the final ``rmdir`` inside
+    ``shutil.rmtree`` occasionally raises ENOTEMPTY although every file is gone. Retrying
+    after a short delay clears it; a real failure (permissions...) is printed as a warning
+    after the last attempt instead of raised.
+
+    Args:
+        path: Directory to delete.
+        attempts: Number of tries.
+        delay_s: Pause between tries, in s.
+
+    Examples:
+        >>> import tempfile, pathlib
+        >>> d = pathlib.Path(tempfile.mkdtemp()); (d / "f.txt").write_text("x")
+        1
+        >>> _rmtree_retry(d); d.exists()
+        False
     """
     for attempt in range(attempts):
         try:
@@ -76,7 +101,19 @@ def _rmtree_retry(path: Path, attempts: int = 5, delay_s: float = 0.2) -> None:
 
 @dataclass
 class WholeRegionPrediction:
-    """Result of running MUISCA inference over a whole cropped/uncropped region."""
+    """A model's prediction over a whole region, with the profiles it was given.
+
+    Attributes:
+        pred_mhd: ``{"T", "Vz", "Bz"}`` in K, km/s and G, each ``(pred_nx, pred_ny, n_tau)``.
+        prediction_stokes: The model's input ``{"I", "V"}`` before statistical
+            normalization (continuum units), each ``(pred_nx, pred_ny, n_wl)``.
+        wavelength: Wavelength axis in Angstrom.
+        logtau: The model's log tau nodes.
+        pred_nx: Size of the prediction grid along the first axis.
+        pred_ny: Size along the second axis.
+        gt_pressure: MURaM gas pressure on the model's nodes (dyn cm^-2), only with
+            ``add_gt_pressure``; otherwise ``None``.
+    """
     pred_mhd: dict[str, np.ndarray]          # {"T", "Vz", "Bz"}, each (pred_nx, pred_ny, n_tau)
     prediction_stokes: dict[str, np.ndarray] # {"I", "V"}, each (pred_nx, pred_ny, n_wl)
     wavelength: np.ndarray                    # (n_wl,)
@@ -91,6 +128,38 @@ class WholeRegionPrediction:
 
 @dataclass
 class SynthesisConfig:
+    """Settings of a synthesis run and the layout of its output folders.
+
+    The NICOLE wavelength grid defaults to the Hinode grid read from the MODEST FITS
+    header (``utils.hinode_wavelengths``). It used to be hardcoded at 6300.796 A with
+    21.5 mA steps, 0.0776 A (3.7 km/s) off the observed axis.
+
+    Output layout: ``output_root/experiment_root/modest/<model_type>/<region_label>/`` for
+    MODEST and ``output_root/experiment_root/muram/step-<N>[-gt-pressure]/<model_type>/``
+    for MURaM. Each holds ``predictions.h5`` and ``syntheses.h5``.
+
+    Attributes:
+        source: ``"modest"`` or ``"muram"``.
+        experiment_root: Experiment folder name under ``output/experiments``.
+        model_type: Flavor, e.g. ``"wfa_only"``.
+        region_label: MODEST region name (``"whole"``, ``"sunspot"``...).
+        crop_bounds: MODEST crop ``(y0, y1, x0, x1)`` on the observed grid.
+        muram_step: MURaM step for ``source="muram"``.
+        add_gt_pressure: Give NICOLE MURaM's gas pressure instead of solving
+            hydrostatic equilibrium from a flat electron-pressure seed.
+        stokes_v_multiplier: Factor on observed V; -1 by default (see
+            :class:`utils.modest_data.ModestData`).
+        prediction_input_mode: MODEST input grid, ``"upsampled"`` or ``"downsampled"``.
+        wl_first: First wavelength in A (default: from the FITS header).
+        wl_step_mA: Wavelength step in mA (default: from the FITS header).
+        n_wl: Number of wavelengths (112).
+        v_mic_cms: Microturbulence given to NICOLE, in cm/s (MUISCA does not predict it).
+        v_mac_cms: Macroturbulence in cm/s.
+        stray_light: Stray-light fraction.
+        el_p_seed: Flat electron-pressure seed (dyn cm^-2) for hydrostatic equilibrium.
+        python_for_nicole: Interpreter for NICOLE v16.06's Python 2 driver.
+        inference_batch_size: Batch size for the model.
+    """
     source: str  # "modest" or "muram"
     experiment_root: str
     model_type: str
@@ -141,6 +210,7 @@ class SynthesisConfig:
         # Derive the spectral grid from the MODEST FITS header unless explicitly
         # overridden, so synthesis always lands on the same axis the observations
         # are loaded on (see utils.hinode_wavelengths).
+        """Fill the wavelength grid from the MODEST FITS header unless it was given."""
         if self.wl_first is None or self.wl_step_mA is None:
             first, step_mA = hinode_grid_first_and_step_mA(self.n_wl)
             if self.wl_first is None:
@@ -149,6 +219,7 @@ class SynthesisConfig:
                 self.wl_step_mA = step_mA
 
     def _source_root(self) -> Path:
+        """Folder of this source: ``.../modest`` or ``.../muram/step-<N>[-gt-pressure]``."""
         root = self.output_root / self.experiment_root
         if self.source == "muram":
             step_label = f"step-{self.muram_step}"
@@ -160,28 +231,55 @@ class SynthesisConfig:
         return root
 
     def out_dir(self) -> Path:
+        """Folder of this model's predictions and syntheses.
+
+        Returns:
+            ``<source root>/<model_type>/<region_label>`` (MODEST) or
+            ``<source root>/<model_type>`` (MURaM).
+
+        Examples:
+            >>> cfg = SynthesisConfig("muram", "exp", "wfa_only", muram_step=198, output_root=Path("/o"),
+            ...                       wl_first=6300.8736, wl_step_mA=21.477)
+            >>> str(cfg.out_dir())
+            '/o/exp/muram/step-198/wfa_only'
+        """
         root = self._source_root()
         if self.source == "muram":
             return root / self.model_type  # no region_label segment: step-N plays that role
         return root / self.model_type / self.region_label
 
     def region_dir(self) -> Path:
-        """Directory shared across model variants (no model_type segment) --
-        what compare_models.py / aggregate_comparison.py write into."""
+        """Folder shared by all model flavors (where cross-model comparisons are written).
+
+        Returns:
+            ``<source root>/<region_label>`` (MODEST) or ``<source root>`` (MURaM).
+
+        Examples:
+            >>> cfg = SynthesisConfig("modest", "exp", "wfa_only", region_label="sunspot", output_root=Path("/o"),
+            ...                       wl_first=6300.8736, wl_step_mA=21.477)
+            >>> str(cfg.region_dir())
+            '/o/exp/modest/sunspot'
+        """
         root = self._source_root()
         if self.source == "muram":
             return root  # step-N *is* the shared level
         return root / self.region_label
 
     def sampling_dir(self) -> Path:
-        """Directory pixel_selection/ lives under.
+        """Folder whose ``pixel_selection/`` holds the selected pixels.
 
-        sample_pixels.py never takes --add-gt-pressure -- pixel stratification
-        is pressure-independent, so a plain run and its -gt-pressure sibling
-        must sample the SAME pixels for a fair diff. Its output therefore
-        always lives under the plain (non -gt-pressure) step dir, even for
-        SynthesisConfigs built with add_gt_pressure=True. Use this instead of
-        out_dir() whenever locating pixel_selection/selected_pixels.json.
+        The pixel selection does not depend on the gas pressure, so a run with
+        ``add_gt_pressure`` and its plain sibling must use the same pixels; both read them from
+        the plain run's folder.
+
+        Returns:
+            :meth:`out_dir` of the same configuration without ``add_gt_pressure``.
+
+        Examples:
+            >>> cfg = SynthesisConfig("muram", "exp", "base", muram_step=198, add_gt_pressure=True,
+            ...                       output_root=Path("/o"), wl_first=6300.8736, wl_step_mA=21.477)
+            >>> str(cfg.out_dir()), str(cfg.sampling_dir())
+            ('/o/exp/muram/step-198-gt-pressure/base', '/o/exp/muram/step-198/base')
         """
         if self.source == "muram" and self.add_gt_pressure:
             import dataclasses
@@ -189,18 +287,29 @@ class SynthesisConfig:
         return self.out_dir()
 
     def predictions_h5(self) -> Path:
+        """Path of ``predictions.h5`` in :meth:`out_dir`."""
         return self.out_dir() / "predictions.h5"
 
     def syntheses_h5(self) -> Path:
+        """Path of ``syntheses.h5`` in :meth:`out_dir`."""
         return self.out_dir() / "syntheses.h5"
 
 
 class PredictionExporter:
-    """Loads a trained MUISCA model, runs it on the requested region, and
-    persists denormalized predictions + matched observed Stokes to HDF5.
-    """
+    """Run a trained model on a region and save the atmospheres and input profiles of chosen pixels."""
 
     def __init__(self, cfg: SynthesisConfig, device: torch.device):
+        """Check the configuration.
+
+        Args:
+            cfg: Synthesis configuration.
+            device: Torch device for inference.
+
+        Raises:
+            NotImplementedError: For an unknown source.
+            ValueError: If ``muram_step`` is missing for MURaM, or ``add_gt_pressure`` is set
+                for MODEST.
+        """
         if cfg.source not in ("modest", "muram"):
             raise NotImplementedError(
                 f"PredictionExporter supports source in ('modest', 'muram') "
@@ -214,12 +323,22 @@ class PredictionExporter:
         self.device = device
 
     def predict_whole_region(self) -> WholeRegionPrediction:
-        """Run the trained model over the entire cropped/uncropped region.
+        """Run the model over the whole region and return physical-unit atmospheres.
 
-        Returns a WholeRegionPrediction containing denormalized T/Vz/Bz cubes
-        of shape (pred_nx, pred_ny, n_tau) plus matched observed Stokes and
-        wavelength/logtau arrays. This is the core inference step that both
-        export() and external sampling scripts (e.g., pixel_sampling.py) reuse.
+        Loads the checkpoint of ``cfg.model_type``, the normalization statistics of
+        ``TrainingConfig()`` and the region's profiles, normalizes them, predicts and
+        denormalizes.
+
+        Returns:
+            A :class:`WholeRegionPrediction`.
+
+        Raises:
+            RuntimeError: If no model or no log tau grid can be found for the experiment.
+
+        Examples:
+            >>> region = PredictionExporter(cfg, torch.device("cuda")).predict_whole_region()  # doctest: +SKIP
+            >>> region.pred_mhd["T"].shape  # doctest: +SKIP
+            (780, 1716, 45)
         """
         cfg = self.cfg
         out_dir = cfg.out_dir()
@@ -288,10 +407,9 @@ class PredictionExporter:
 
     @staticmethod
     def _load_modest_stokes(cfg: SynthesisConfig) -> tuple[dict[str, np.ndarray], np.ndarray]:
-        """Load MODEST observations and build the prediction-ready Stokes cube.
+        """MODEST profiles prepared as in the analysis (``ModestData.load_all``), and their wavelength axis.
 
-        Returns (prediction_stokes, wavelength) -- the raw, continuum-normalized
-        (but not stats-normalized) {"I","V"} dict and its wavelength axis.
+        Returns the continuum-normalized (not statistically normalized) ``{"I", "V"}`` cubes.
         """
         modest = ModestData(
             circular_polarization_threshold=cfg.polarization_threshold,
@@ -331,16 +449,16 @@ class PredictionExporter:
         model_cfg: dict,
         pred_tau_arr: np.ndarray,
     ) -> tuple[dict[str, np.ndarray], np.ndarray, Optional[np.ndarray]]:
-        """Load a MURaM simulation step and build the prediction-ready Stokes cube.
+        """MURaM profiles of ``cfg.muram_step`` prepared as at training time, and optionally the gas pressure.
 
-        Returns (prediction_stokes, wavelength, gt_pressure). prediction_stokes
-        is the raw, continuum-normalized (but not stats-normalized) {"I","V"}
-        dict, mirroring what _load_modest_stokes returns -- deliberately not
-        reusing scripts.base_training.load_and_prepare_step()/MuramStepDataset,
-        since that helper normalizes Stokes I/V inside its own __init__ and
-        never retains this raw intermediate. gt_pressure is only computed when
-        cfg.add_gt_pressure is set, and only remapped onto pred_tau_arr (the
-        model's own predicted tau grid), never onto a stratification grid.
+        Note:
+            This reads the legacy ``stokes_<step>.npy`` cube (continuum normalization of the
+            old pipeline, Rosseland tau for the pressure) regardless of the checkpoint's data
+            source. For models trained on ``nicole_tau500`` the MURaM input therefore differs
+            from the training profiles (e.g. continuum 0.91 instead of 0.97 at one pixel of
+            step 198). Fixed in the reframe plan, Phase 1d.
+
+        Returns ``(prediction_stokes, wavelength, gt_pressure)``.
         """
         # Reuse the exact per-model config (LSF path, continuum-normalization
         # mode, stokes_mult_factor, ...) the checkpoint was actually trained
@@ -391,6 +509,24 @@ class PredictionExporter:
         return prediction_stokes, wavelength, gt_pressure
 
     def export(self, pixels: Sequence[tuple[int, int]]) -> Path:
+        """Predict the whole region and save the chosen pixels to ``predictions.h5``.
+
+        The file holds ``T`` (K), ``Vz`` (km/s) and ``Bz`` (G) as ``(n, n_tau)``, ``pixels``
+        ``(n, 2)``, ``logtau``, ``wavelengths`` (A), ``stokes_obs`` ``(n, 2, n_wl)`` with the
+        model's input I and V, and ``Pgas_gt`` when requested.
+
+        Args:
+            pixels: ``(ix, iy)`` on the prediction grid (for MODEST, ix is the row).
+
+        Returns:
+            Path of ``predictions.h5``.
+
+        Raises:
+            IndexError: If a pixel is outside the prediction grid.
+
+        Examples:
+            >>> h5 = PredictionExporter(cfg, torch.device("cuda")).export([(100, 200)])  # doctest: +SKIP
+        """
         cfg = self.cfg
 
         # Run inference over the whole region once
@@ -455,11 +591,23 @@ class PredictionExporter:
 
 
 class NicoleRunner:
-    """Builds per-pixel NICOLE working directories from a predictions HDF5 file
-    and invokes NICOLE in synthesis mode.
+    """Write NICOLE inputs, run NICOLE and read its profiles back.
+
+    NICOLE v16.06 is driven through its Python 2 ``run_nicole.py``; the Fortran binary
+    must be built in ``nicole_root/main``. NICOLE's v_LOS is positive for a redshift and its
+    B_long has the sign of the WFA estimate from the synthesized V.
     """
 
     def __init__(self, cfg: SynthesisConfig):
+        """Find the NICOLE templates, line list, binary and driver.
+
+        Args:
+            cfg: Synthesis configuration (``nicole_root`` and ``nicole_assets`` are used).
+
+        Raises:
+            FileNotFoundError: If a template, the line list, the binary or the driver is
+                missing.
+        """
         self.cfg = cfg
         self.template_path = cfg.nicole_assets / "NICOLE.input.template"
         self.inversion_template_path = cfg.nicole_assets / "NICOLE.input_inversion.template"
@@ -480,6 +628,7 @@ class NicoleRunner:
             raise FileNotFoundError(self.run_nicole_py)
 
     def _pixel_workdir(self, ix: int, iy: int) -> Path:
+        """Working folder of one pixel, ``pix_<ix>_<iy>`` in :meth:`SynthesisConfig.out_dir`."""
         return self.cfg.out_dir() / f"pix_{ix:05d}_{iy:05d}"
 
     def prepare_workdir(
@@ -492,6 +641,26 @@ class NicoleRunner:
         b_long_G: np.ndarray,
         gt_pressure: Optional[np.ndarray] = None,
     ) -> Path:
+        """Write one pixel's ASCII model, ``NICOLE.input``, ``LINES`` and the driver link.
+
+        Without ``gt_pressure`` NICOLE solves hydrostatic equilibrium from a flat
+        electron-pressure seed; with it, the gas pressure is used as given.
+
+        Args:
+            ix: Pixel index along the first axis.
+            iy: Pixel index along the second axis.
+            logtau: Nodes, increasing.
+            T: Temperature per node, K.
+            v_los_kms: Line-of-sight velocity per node, km/s (positive = redshift).
+            b_long_G: Longitudinal field per node, G.
+            gt_pressure: Gas pressure per node, dyn cm^-2, or ``None``.
+
+        Returns:
+            The working folder.
+
+        Examples:
+            >>> wd = runner.prepare_workdir(100, 200, logtau, T, v, b)  # doctest: +SKIP
+        """
         workdir = self._pixel_workdir(ix, iy)
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -555,7 +724,21 @@ class NicoleRunner:
         return workdir
 
     def run_pixel(self, workdir: Path) -> np.ndarray:
-        """Invoke NICOLE in synthesis mode and return the (4, n_wl) IQUV array."""
+        """Run NICOLE in a prepared working folder and return the ``(4, n_wl)`` I, Q, U, V profile.
+
+        Args:
+            workdir: Folder from :meth:`prepare_workdir`.
+
+        Returns:
+            The profile in continuum units.
+
+        Raises:
+            RuntimeError: If NICOLE exits with an error.
+            FileNotFoundError: If NICOLE writes no profile.
+
+        Examples:
+            >>> iquv = runner.run_pixel(wd)  # doctest: +SKIP
+        """
         env = os.environ.copy()
         # v16.06's run_nicole.py only initializes inputmodel/outprof when --modelin
         # and --profout are passed explicitly; without them, NameError on line 184.
@@ -617,35 +800,43 @@ class NicoleRunner:
         wl_step_mA: Optional[float] = None,
         v_mic_cms: Optional[float] = None,
     ) -> np.ndarray:
-        """Synthesize a whole (nx, ny) atmosphere cube in ONE NICOLE invocation.
+        """Synthesize a whole ``(nx, ny)`` atmosphere cube in one NICOLE run.
 
-        Writes the cube as a native nicole2.3bm binary model
-        (write_binary_model_cube), renders NICOLE.input for the requested
-        wavelength grid, runs run_nicole.py once (NICOLE's Fortran loops over
-        all pixels internally -- no per-pixel Python/subprocess overhead), and
-        reads the (nx, ny) profile cube back. Returns an (nx, ny, 4, n_wl)
-        IQUV array.
+        Writes the cube as a binary model (``write_binary_model_cube``), renders
+        ``NICOLE.input`` for the wavelength grid, runs NICOLE once (its Fortran loops over the
+        pixels) and reads the profiles back.
 
-        A WARM-UP pixel is prepended internally and discarded. Empirically,
-        NICOLE synthesizes a pixel identically and reproducibly whenever the
-        PRECEDING pixel in the cube is a different atmosphere (the result is
-        independent of which different atmosphere, and of position/count), but
-        gives a slightly different (~3e-3) "isolated" result when the preceding
-        pixel is identical or absent (first pixel). Adjacent MURaM pixels
-        always differ, so every real pixel is in the uniform different-
-        predecessor regime -- except the first, which needs a predecessor.
-        The warm-up is therefore made DISTINCT from the first real pixel (its
-        temperature scaled), so the first real pixel too has a different
-        predecessor. The upshot: every real pixel's result is identical
-        regardless of how the frame is split into chunks (chunk-independent).
+        A warm-up pixel is prepended and discarded. NICOLE gives a slightly different result
+        (about 3e-3) for a pixel whose predecessor is identical or absent, so the warm-up is a
+        copy of the first pixel with T times 1.05; every real pixel then has a different
+        predecessor, and the result does not depend on how a frame is split into chunks.
 
-        By default the flat el_p_seed + hydrostatic-equilibrium path (Y / Pel)
-        is used, matching the validated tau500 experiment. Passing gt_pressure
-        (nx, ny, nz gas pressure, dyn/cm^2) switches to Input density=PGas /
-        hydrostatic=N instead.
+        Without ``gt_pressure`` the flat electron-pressure seed and hydrostatic equilibrium are
+        used (as for the training data); with it, the gas pressure is used as given.
 
-        T/v_los_kms/b_long_G(/gt_pressure) are (nx, ny, nz) on the shared
-        `logtau` grid. wl_first/wl_step_mA/v_mic_cms default to config values.
+        Args:
+            workdir: Folder for NICOLE's files.
+            logtau: Nodes, increasing, shared by all pixels.
+            T: ``(nx, ny, nz)`` temperature, K.
+            v_los_kms: ``(nx, ny, nz)`` line-of-sight velocity, km/s (positive = redshift).
+            b_long_G: ``(nx, ny, nz)`` longitudinal field, G.
+            n_wl: Number of wavelengths.
+            gt_pressure: ``(nx, ny, nz)`` gas pressure, dyn cm^-2, or ``None``.
+            wl_first: First wavelength in A (default: the configuration's).
+            wl_step_mA: Step in mA (default: the configuration's).
+            v_mic_cms: Microturbulence in cm/s (default: the configuration's).
+
+        Returns:
+            ``(nx, ny, 4, n_wl)`` I, Q, U, V in continuum units.
+
+        Raises:
+            RuntimeError: If NICOLE exits with an error.
+            FileNotFoundError: If NICOLE writes no profile.
+
+        Examples:
+            >>> iquv = runner.run_cube(workdir, logtau, T, v, b, 112)  # doctest: +SKIP
+            >>> iquv.shape  # doctest: +SKIP
+            (2, 3, 4, 112)
         """
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
@@ -773,45 +964,42 @@ class NicoleRunner:
         wl_step_mA: Optional[float] = None,
         v_mic_cms: Optional[float] = None,
     ) -> dict:
-        """Invert a whole (nx, ny) cube of observed Stokes profiles in ONE
-        NICOLE invocation, using data/nicole_assets/NICOLE.input_inversion.template
-        (Mode=Inversion, Temperature/Velocity/Bz nodes equispaced across the
-        guess grid, Bx/By/microturbulence/etc fixed at 0).
+        """Invert an ``(nx, ny)`` cube of observed profiles in one NICOLE run.
 
-        nodes_T/nodes_V/nodes_Bz default to the manual's recommended "cycle 2"
-        complexity (8/4/4). For the full 3-cycle progression the manual
-        recommends (1/1/1 -> 8/4/4 -> 10/6/4), call this 3 times with
-        increasing node counts, passing cycle N's returned 'T'/'v_los_kms'/
-        'b_long_G' in as cycle N+1's guess_T/guess_v_los_kms/guess_b_long_G
-        (per-pixel, not the single (nz,) starting guess used for cycle 1) --
-        this reuses the already-verified single-cycle path instead of
-        NICOLE's own native multi-cycle file chaining (NICOLE.input_2/_3 +
-        dummy placeholder files), which has more moving parts and hasn't been
-        exercised here.
+        Uses ``NICOLE.input_inversion.template`` with T, v_LOS and B_z nodes spread evenly
+        over the guess grid and every other quantity fixed. The defaults 8/4/4 are the NICOLE
+        manual's second cycle; for the full 1/1/1, 8/4/4, 10/6/4 progression, call this three
+        times and pass each result as the next guess (per pixel). The same warm-up pixel as in
+        :meth:`run_cube` is used. The atmosphere is read from NICOLE's nicole2.6 model records:
+        T is block 2, v_LOS block 6 (cm/s) and B_long block 8, as checked against a known
+        atmosphere run through :meth:`run_cube`.
 
-        guess_T/guess_v_los_kms/guess_b_long_G are a single (nz,) starting-guess
-        atmosphere on the shared `logtau` grid, broadcast to every pixel (NICOLE
-        would also do this itself given a 1-model file, but broadcasting
-        ourselves keeps the guess and observed cubes the same (npix+1) size,
-        matching the warm-up-pixel convention below rather than depending on
-        NICOLE's own model-padding behavior, which hasn't been checked against
-        that convention). observed_iquv is (nx, ny, 4, n_wl), Stokes-major/
-        wavelength-minor per pixel (same layout run_cube returns).
+        Args:
+            workdir: Folder for NICOLE's files.
+            logtau: Nodes, increasing.
+            guess_T: Starting T in K, ``(nz,)`` for all pixels or ``(nx, ny, nz)``.
+            guess_v_los_kms: Starting v_LOS in km/s, same shapes.
+            guess_b_long_G: Starting B_long in G, same shapes.
+            observed_iquv: ``(nx, ny, 4, n_wl)`` profiles to invert.
+            n_wl: Number of wavelengths.
+            nodes_T: Number of temperature nodes.
+            nodes_V: Number of velocity nodes.
+            nodes_Bz: Number of field nodes.
+            wl_first: First wavelength in A (default: the configuration's).
+            wl_step_mA: Step in mA (default: the configuration's).
+            v_mic_cms: Microturbulence in cm/s (default: the configuration's).
 
-        Same warm-up-pixel trick as run_cube (a distinct, discarded pixel 0
-        prepended so every real pixel has a different-atmosphere predecessor)
-        -- this was only empirically verified necessary for SYNTHESIS mode;
-        inversion's first-iteration synthesis calls may or may not need it.
-        Kept defensively since it costs one extra (discarded) pixel.
+        Returns:
+            Dict with ``"T"`` (K), ``"v_los_kms"``, ``"b_long_G"`` (each ``(nx, ny, nz)``) and
+            ``"fit_iquv"`` ``(nx, ny, 4, n_wl)``.
 
-        Returns a dict with the retrieved atmosphere ('T' (nx,ny,nz) K,
-        'v_los_kms' (nx,ny,nz), 'b_long_G' (nx,ny,nz)) and the fitted profiles
-        ('fit_iquv' (nx,ny,4,n_wl), for residual/chi^2 checks against
-        observed_iquv). T/v_los/b_long indices into NICOLE's native nicole2.6
-        model-record layout (22 depth-variables/record, variable-major) were
-        verified empirically against a known synthetic atmosphere run through
-        run_cube: T is block 2 (index 2*nz:3*nz), v_los is block 6 (cm/s,
-        divide by 1e5 for km/s), b_long is block 8.
+        Raises:
+            ValueError: If ``observed_iquv`` or a guess has the wrong shape.
+            RuntimeError: If NICOLE exits with an error.
+            FileNotFoundError: If NICOLE writes no profile or model.
+
+        Examples:
+            >>> out = runner.run_inversion_cube(wd, logtau, T0, v0, b0, obs, 112)  # doctest: +SKIP
         """
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
@@ -834,6 +1022,7 @@ class NicoleRunner:
             # Accepts a single (nz,) atmosphere (broadcast to every pixel,
             # cycle 1) or a per-pixel (nx, ny, nz) atmosphere (chaining a
             # prior cycle's retrieved result in as this cycle's guess).
+            """Guess as ``(npix, nz)``: tiled from ``(nz,)`` or reshaped from ``(nx, ny, nz)``."""
             arr = np.asarray(arr, dtype=np.float64)
             if arr.shape == (nz,):
                 return np.tile(arr, (npix, 1))
@@ -963,18 +1152,25 @@ class NicoleRunner:
         pixels: Optional[Sequence[tuple[int, int]]] = None,
         cleanup_workdirs: bool = True,
     ) -> Path:
-        """For each requested pixel, prepare a workdir, run NICOLE, and stash the
-        result into syntheses.h5 alongside predictions.h5.
+        """Synthesize the pixels of a ``predictions.h5`` one by one and save ``syntheses.h5``.
 
-        If cleanup_workdirs is True (default), each pixel's workdir is deleted
-        once syntheses.h5 has been fully and successfully written -- the
-        synthesized profile is already captured there (read back via
-        read_prof() during run_pixel()), so the workdir's ASCII/binary
-        intermediates and NICOLE logs are redundant afterwards, and can always
-        be regenerated by re-running this method against the same
-        predictions_h5. Cleanup only ever runs after a successful write, so a
-        mid-run failure never deletes a workdir whose data isn't safely
-        persisted elsewhere.
+        ``syntheses.h5`` holds ``pixels``, ``stokes_synth`` ``(n, 4, n_wl)`` (I, Q, U, V) and
+        ``wavelengths``. Working folders are deleted only after the file is written.
+
+        Args:
+            predictions_h5: File from :meth:`PredictionExporter.export`.
+            pixels: Subset of the exported pixels; ``None`` synthesizes all.
+            cleanup_workdirs: Delete each pixel's working folder at the end.
+
+        Returns:
+            Path of ``syntheses.h5``.
+
+        Raises:
+            KeyError: If a requested pixel was not exported.
+            RuntimeError: If NICOLE returns the wrong number of wavelengths.
+
+        Examples:
+            >>> NicoleRunner(cfg).run_pixels_from_h5(cfg.predictions_h5())  # doctest: +SKIP
         """
         with h5py.File(predictions_h5, "r") as h5:
             pred_pixels = h5["pixels"][...]
@@ -1048,13 +1244,24 @@ class NicoleRunner:
 
 
 def _format_bin_range(lo: float, hi: float) -> str:
+    """Folder-name label of a field bin, 4 significant figures.
+
+    Examples:
+        >>> _format_bin_range(12.345, 1234.5)
+        '12.35-1234'
+    """
     return f"{lo:.4g}-{hi:.4g}"
 
 
 class SynthesisComparator:
-    """Overlay synthesized vs observed Stokes I and V, compute chi-square."""
+    """Compare synthesized and input profiles of the same pixels: chi-square and overlay plots."""
 
     def __init__(self, cfg: SynthesisConfig):
+        """Set up an empty comparator.
+
+        Args:
+            cfg: Synthesis configuration (locates the pixel-selection bins).
+        """
         self.cfg = cfg
         self.predictions_h5: Optional[Path] = None
         self.syntheses_h5: Optional[Path] = None
@@ -1067,6 +1274,15 @@ class SynthesisComparator:
         self._bin_info: dict[tuple[int, int], dict] = {}
 
     def load(self, predictions_h5: Path, syntheses_h5: Path) -> None:
+        """Read the input profiles, predicted Bz and synthesized profiles, and the pixels' field bins.
+
+        Args:
+            predictions_h5: File from :meth:`PredictionExporter.export`.
+            syntheses_h5: File from :meth:`NicoleRunner.run_pixels_from_h5`.
+
+        Examples:
+            >>> comp = SynthesisComparator(cfg); comp.load(cfg.predictions_h5(), cfg.syntheses_h5())  # doctest: +SKIP
+        """
         self.predictions_h5 = predictions_h5
         self.syntheses_h5 = syntheses_h5
         with h5py.File(predictions_h5, "r") as h5:
@@ -1095,24 +1311,28 @@ class SynthesisComparator:
                 }
 
     def _abs_b_los(self, ix: int, iy: int) -> float:
+        """|B_LOS| of a pixel in G: from the pixel selection, else the prediction at the deepest node."""
         info = self._bin_info.get((ix, iy))
         if info is not None:
             return info["abs_bz_gauss"]
         return float(np.abs(self._bz[self._pred_row(ix, iy), -1]))
 
     def _bin_range(self, ix: int, iy: int) -> Optional[tuple[float, float]]:
+        """Field bin ``(lo, hi)`` of a pixel in G, or ``None`` if it was not stratified."""
         info = self._bin_info.get((ix, iy))
         if info is None:
             return None
         return info["bin_lo"], info["bin_hi"]
 
     def _pred_row(self, ix: int, iy: int) -> int:
+        """Row of a pixel in ``predictions.h5``."""
         for i, (a, b) in enumerate(self._pred_pixels.tolist()):
             if a == ix and b == iy:
                 return i
         raise KeyError(f"Pixel ({ix},{iy}) not in predictions.h5")
 
     def _synth_row(self, ix: int, iy: int) -> int:
+        """Row of a pixel in ``syntheses.h5``."""
         for i, (a, b) in enumerate(self._synth_pixels.tolist()):
             if a == ix and b == iy:
                 return i
@@ -1123,6 +1343,21 @@ class SynthesisComparator:
         sigma_I: float = 1e-3,
         sigma_V: float = 1e-3,
     ) -> dict:
+        """Chi-square of I and V per pixel: ``sum(((obs - synth) / sigma)^2)`` over wavelength.
+
+        The input file stores I and V (channels 0 and 1); the synthesis stores I, Q, U, V
+        (V is channel 3). The sums are not divided by the number of points.
+
+        Args:
+            sigma_I: Noise of I in continuum units.
+            sigma_V: Noise of V in continuum units.
+
+        Returns:
+            ``{"ix,iy": {"chi2_I", "chi2_V", "n_wl"}}``.
+
+        Examples:
+            >>> chi = comp.chi_square(sigma_I=1e-3, sigma_V=1e-3)  # doctest: +SKIP
+        """
         out = {}
         for ix, iy in self._synth_pixels.tolist():
             i_obs = self._stokes_obs[self._pred_row(ix, iy), 0]
@@ -1139,6 +1374,20 @@ class SynthesisComparator:
         return out
 
     def plot_overlay(self, ix: int, iy: int, out_dir: Path) -> Path:
+        """Plot input and synthesized I and V of one pixel, saved under its field-bin folder.
+
+        Args:
+            ix: Pixel index along the first axis.
+            iy: Pixel index along the second axis.
+            out_dir: Base folder; the figure goes into a ``<lo>-<hi>`` subfolder when the
+                pixel has a field bin.
+
+        Returns:
+            Path of the PNG.
+
+        Examples:
+            >>> comp.plot_overlay(100, 200, Path("figs"))  # doctest: +SKIP
+        """
         import matplotlib.pyplot as plt
 
         bin_range = self._bin_range(ix, iy)

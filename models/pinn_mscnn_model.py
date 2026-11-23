@@ -1,4 +1,21 @@
-"""Physics-informed MSCNN model definition."""
+"""Physics-informed MSCNN: the MSCNN plus loss terms that compare its output with simple approximations.
+
+Each physics term takes the network's prediction at one node (``single_height``) or
+averaged over linear tau (``tau_averaged``), in physical units, and compares it with an
+approximation computed once per step from the Stokes profiles of the same pixel
+(:class:`utils.physics_utils.ApproxInversions`): the WFA for B_LOS (G), the Doppler shift
+for v_LOS (km/s) and the black-body temperature (K). Each comparison is an RRMSE,
+dimensionless, so the terms can be weighted against the MSE with plain numbers.
+
+The total loss is ``MSE + lambda_wfa L_WFA + lambda_doppler L_Doppler + lambda_temp L_BB``.
+
+Examples:
+    Typical use inside the training loop::
+
+        model.set_physics_context(mhd_norm, logtau, blos_approx=..., vlos_approx=..., temp_approx=...)
+        out = model.compute_loss(model(stokes), targets, spatial_indices)
+        out["loss"].backward()
+"""
 
 from typing import Dict, Optional, Tuple, Any, Literal
 from pathlib import Path
@@ -19,28 +36,23 @@ _SINH_ARG_LIMIT = 20.0
 
 
 class PhysicsInformedMSCNN(MSCNNInversionModel):
-    """MSCNN inversion model with integrated physics-based regularization computed in physical units.
-    
-    Parameters
-    ----------
-    lambda_wfa : float
-        Weight for WFA B_LOS loss term (0.0 to disable)
-    lambda_doppler : float
-        Weight for Doppler V_LOS loss term (0.0 to disable)
-    lambda_temp : float
-        Weight for temperature loss term (0.0 to disable)
-    blos_physics_mode : {'tau_averaged', 'single_height'}, optional
-        Mode for computing B_LOS comparison
-    blos_target_logtau : float, optional
-        Target log(tau) value for B_LOS single_height mode
-    vlos_physics_mode : {'tau_averaged', 'single_height'}, optional
-        Mode for computing V_LOS comparison
-    vlos_target_logtau : float, optional
-        Target log(tau) value for V_LOS single_height mode
-    temp_physics_mode : {'tau_averaged', 'single_height'}, optional
-        Mode for computing temperature comparison (default: 'single_height')
-    temp_target_logtau : float, optional
-        Target log(tau) for temperature single_height mode (default: 0.0, photosphere)
+    """MSCNN with physics regularization computed in physical units.
+
+    Accepts every argument of :class:`models.mscnn_model.MSCNNInversionModel` plus the
+    physics settings below.
+
+    Note:
+        * ``spatial_indices`` are the pixel's ``(x, y)`` as produced by
+          :class:`utils.muram_data.MuramStepDataset`, and the approximation maps are
+          ``(nx, ny)``, so ``approx[x, y]`` is the pixel's own value.
+        * The Vz denormalization adds the node mean, but the normalizer's "centered"
+          transform never subtracted it, so the Vz used by the Doppler term is offset by
+          +mean(tau): at most 0.03 km/s on the paper nodes (strict xfail in
+          ``tests/test_model.py``; fixed in reframe Phase 1).
+        * ``tau_averaged`` weights the nodes by d(tau) in linear tau, so with nodes up to
+          log tau = 1.4 the average is dominated by the deepest few nodes.
+        * The Bz tail parameters (``B0_weight_start``, ``B1_weight_saturation``,
+          ``huber_delta``) are loaded from the normalizer but no loss term uses them.
     """
 
     def __init__(
@@ -57,6 +69,26 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         temp_target_logtau: Optional[float] = 0.0,
         **kwargs: Any,
     ) -> None:
+        """Build the network and store the physics settings.
+
+        Args:
+            lambda_wfa: Weight of the WFA B_LOS term (0 disables it).
+            lambda_doppler: Weight of the Doppler v_LOS term (0 disables it).
+            lambda_temp: Weight of the black-body temperature term (0 disables it).
+            blos_physics_mode: ``"single_height"`` (prediction at ``blos_target_logtau``)
+                or ``"tau_averaged"``.
+            blos_target_logtau: Node for the WFA comparison (the nearest node is used).
+                ``None`` uses the middle node.
+            vlos_physics_mode: Same choice for the Doppler term.
+            vlos_target_logtau: Node for the Doppler comparison; ``None`` uses the middle node.
+            temp_physics_mode: Same choice for the black-body term.
+            temp_target_logtau: Node for the black-body comparison; ``None`` uses
+                log tau = 0.
+            **kwargs: Passed to :class:`MSCNNInversionModel` (``scales``, ``input_length``...).
+
+        Raises:
+            ValueError: For an unknown physics mode.
+        """
         super().__init__(**kwargs)
         
         # Validate physics_mode for each quantity
@@ -110,33 +142,45 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         temp_physics_mode: Optional[Literal['tau_averaged', 'single_height']] = None,
         temp_target_logtau: Optional[float] = None,
     ):
-        """
-        Set physics computation context for the current training step.
-        
-        Parameters
-        ----------
-        mhd_normalizer : MhdNormalizer
-            Normalizer for denormalizing predictions to physical units
-        logtau_values : np.ndarray
-            Log optical depth values (e.g., np.arange(-2.0, 0.1, 0.1))
-        blos_approx : np.ndarray, optional
-            WFA B_LOS approximation map (nx, ny) in Gauss
-        vlos_approx : np.ndarray, optional
-            Doppler V_LOS approximation map (nx, ny) in km/s
-        temp_approx : np.ndarray, optional
-            Black-body temperature approximation map (nx, ny) in Kelvin
-        blos_physics_mode : {'tau_averaged', 'single_height'}, optional
-            Override the blos_physics_mode set at initialization
-        blos_target_logtau : float, optional
-            Override the blos_target_logtau set at initialization
-        vlos_physics_mode : {'tau_averaged', 'single_height'}, optional
-            Override the vlos_physics_mode set at initialization
-        vlos_target_logtau : float, optional
-            Override the vlos_target_logtau set at initialization
-        temp_physics_mode : {'tau_averaged', 'single_height'}, optional
-            Override the temp_physics_mode set at initialization
-        temp_target_logtau : float, optional
-            Override the temp_target_logtau set at initialization
+        """Give the model what the physics terms need for the current step.
+
+        Stores the normalizer (to denormalize predictions), the log tau grid, the step's
+        approximation maps (moved to the model's device), and resolves each single-height
+        target to the nearest node of the grid. Optional mode and target arguments override
+        the ones given to the constructor.
+
+        Args:
+            mhd_normalizer: Fitted :class:`utils.normalizer.MhdNormalizer` of the targets.
+            logtau_values: The model's log tau nodes, increasing.
+            blos_approx: WFA B_LOS map ``(nx, ny)`` in G.
+            vlos_approx: Doppler v_LOS map ``(nx, ny)`` in km/s (NaN where the fit failed).
+            temp_approx: Black-body temperature map ``(nx, ny)`` in K.
+            blos_physics_mode: Override of the B_LOS mode.
+            blos_target_logtau: Override of the B_LOS node.
+            vlos_physics_mode: Override of the v_LOS mode.
+            vlos_target_logtau: Override of the v_LOS node.
+            temp_physics_mode: Override of the temperature mode.
+            temp_target_logtau: Override of the temperature node.
+
+        Raises:
+            ValueError: For an unknown physics mode.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np, torch
+            >>> from utils.normalizer import MhdNormalizer
+            >>> rng = np.random.default_rng(0)
+            >>> atm = {"T": 5000 + 100 * rng.standard_normal((6, 6, 3)), "Vz": rng.standard_normal((6, 6, 3)),
+            ...        "Bz": 100 * rng.standard_normal((6, 6, 3))}
+            >>> norm = MhdNormalizer(n_tau=3, raw_values_dir=tempfile.mkdtemp()); norm.update(atm)
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = norm.finalize()
+            >>> model = PhysicsInformedMSCNN(scales=[1], n_tau_levels=3, lambda_wfa=1.0, lambda_doppler=0.0,
+            ...                              lambda_temp=0.0, blos_physics_mode="single_height",
+            ...                              blos_target_logtau=-1.0)
+            >>> model.set_physics_context(norm, np.array([-2.0, -1.0, 0.0]), blos_approx=np.full((6, 6), 50.0))
+            >>> float(model.blos_target_logtau), model._blos_target_logtau_idx
+            (-1.0, 1)
         """
         self.mhd_normalizer = mhd_normalizer
         self.logtau_values = logtau_values
@@ -220,26 +264,53 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
             self.temp_approx = torch.tensor(temp_approx, dtype=torch.float32, device=device)
 
     def _get_device(self) -> torch.device:
-        """Get device of model parameters."""
+        """Device of the model's parameters (CPU if it has none)."""
         try:
             return next(self.parameters()).device
         except StopIteration:
             return torch.device("cpu")
 
     def _denormalize_predictions(self, predictions: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Denormalize model predictions to physical units.
-        
-        Parameters
-        ----------
-        predictions : torch.Tensor
-            Normalized predictions with shape (batch_size, 3*n_tau) in block order
-            [T(τ...), Vz(τ...), Bz(τ...)] or (batch_size, n_tau, 3)
+        """Convert normalized predictions to physical units with torch ops, so gradients flow.
 
-        Returns
-        -------
-        denorm_dict : Dict[str, torch.Tensor]
-            Dictionary with 'T', 'Vz', 'Bz' in physical units, each of shape (batch_size, n_tau)
+        Per node, T and Vz are ``x std + mean`` (K, km/s) and Bz is
+        ``B0 sinh(x std + mean)`` (G), mirroring :meth:`MhdNormalizer.denormalize`. The sinh
+        argument is clamped to +-20 as an overflow guard only; unlike the numpy path no
+        physical clip in G is applied, so runaway pixels keep their gradient.
+
+        This used to round-trip through numpy, which cut the autograd graph: every physics
+        term contributed zero gradient while still appearing in the logged totals.
+
+        Args:
+            predictions: ``(batch, 3 n_tau)`` in the order T, Vz, Bz, or ``(batch, n_tau, 3)``.
+
+        Returns:
+            ``{"T", "Vz", "Bz"}``, each ``(batch, n_tau)``.
+
+        Raises:
+            RuntimeError: If :meth:`set_physics_context` has not been called.
+            ValueError: For a shape that is not one of the two above, or a node count that
+                differs from the normalizer's.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np, torch
+            >>> from utils.normalizer import MhdNormalizer
+            >>> rng = np.random.default_rng(0)
+            >>> atm = {"T": 5000 + 100 * rng.standard_normal((6, 6, 3)), "Vz": rng.standard_normal((6, 6, 3)),
+            ...        "Bz": 100 * rng.standard_normal((6, 6, 3))}
+            >>> norm = MhdNormalizer(n_tau=3, raw_values_dir=tempfile.mkdtemp()); norm.update(atm)
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = norm.finalize()
+            >>> model = PhysicsInformedMSCNN(scales=[1], n_tau_levels=3, lambda_wfa=1.0, lambda_doppler=0.0,
+            ...                              lambda_temp=0.0, blos_physics_mode="single_height",
+            ...                              blos_target_logtau=-1.0)
+            >>> model.set_physics_context(norm, np.array([-2.0, -1.0, 0.0]), blos_approx=np.full((6, 6), 50.0))
+            >>> y = torch.tensor(norm.transform(atm)["T"].reshape(-1, 3)[:2], dtype=torch.float32)
+            >>> pred = torch.cat([y, torch.zeros(2, 6)], dim=1)
+            >>> out = model._denormalize_predictions(pred)
+            >>> bool(torch.allclose(out["T"], torch.tensor(atm["T"].reshape(-1, 3)[:2], dtype=torch.float32)))
+            True
         """
         if self.mhd_normalizer is None:
             raise RuntimeError("MHD normalizer not set. Call set_physics_context() first.")
@@ -299,7 +370,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         return denorm_torch
 
     def _denorm_params(self, n_tau: int, device, dtype):
-        """Per-tau mean/std/B0 as tensors, cached per (n_tau, device, dtype)."""
+        """Per-node mean, std and B0 as tensors, cached per (n_tau, device, dtype)."""
         key = (n_tau, str(device), str(dtype))
         cached = getattr(self, "_denorm_param_cache", {}).get(key)
         if cached is not None:
@@ -313,6 +384,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
             )
 
         def col(param, field):
+            """One statistic of one quantity for every node, as a tensor."""
             return torch.tensor(
                 [float(stats[param][i][field]) for i in range(n_tau)], dtype=dtype, device=device
             )
@@ -330,19 +402,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         return mean, std, b0
 
     def _compute_tau_averaged_blos(self, bz: torch.Tensor) -> torch.Tensor:
-        """
-        Compute tau-averaged B_LOS from Bz profile.
-        
-        Parameters
-        ----------
-        bz : torch.Tensor
-            Bz values in physical units (batch_size, n_tau=21)
-            
-        Returns
-        -------
-        blos : torch.Tensor
-            Tau-averaged B_LOS (batch_size,)
-        """
+        """Average B_LOS over linear tau: trapezoid of Bz d(tau) divided by (tau_max - tau_min), in G."""
         device = self._get_device()
         
         # Trapezoidal integration
@@ -353,19 +413,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         return integral_bz / self._integral_dtau
 
     def _compute_tau_averaged_vlos(self, vz: torch.Tensor) -> torch.Tensor:
-        """
-        Compute tau-averaged V_LOS from Vz profile.
-        
-        Parameters
-        ----------
-        vz : torch.Tensor
-            Vz values in physical units (batch_size, n_tau=21)
-            
-        Returns
-        -------
-        vlos : torch.Tensor
-            Tau-averaged V_LOS (batch_size,)
-        """
+        """Average v_LOS over linear tau: trapezoid of Vz d(tau) divided by (tau_max - tau_min), in km/s."""
         device = self._get_device()
         
         # Trapezoidal integration
@@ -376,19 +424,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         return integral_vz / self._integral_dtau
 
     def _compute_tau_averaged_temperature(self, temp: torch.Tensor) -> torch.Tensor:
-        """
-        Compute tau-averaged temperature from T profile.
-        
-        Parameters
-        ----------
-        temp : torch.Tensor
-            Temperature values in physical units (batch_size, n_tau=21)
-            
-        Returns
-        -------
-        temp_avg : torch.Tensor
-            Tau-averaged temperature (batch_size,)
-        """
+        """Average T over linear tau: trapezoid of T d(tau) divided by (tau_max - tau_min), in K."""
         device = self._get_device()
         
         # Trapezoidal integration
@@ -399,37 +435,11 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         return integral_temp / self._integral_dtau
 
     def _extract_at_logtau(self, values: torch.Tensor, target_idx: int) -> torch.Tensor:
-        """
-        Extract values at the specified optical depth index.
-        
-        Parameters
-        ----------
-        values : torch.Tensor
-            Values across optical depths (batch_size, n_tau)
-        target_idx : int
-            Target optical depth index
-            
-        Returns
-        -------
-        torch.Tensor
-            Values at target optical depth (batch_size,)
-        """
+        """Column ``target_idx`` of a ``(batch, n_tau)`` tensor."""
         return values[:, target_idx]
 
     def _compute_predicted_blos(self, denorm_pred: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Compute B_LOS from predictions based on blos_physics_mode.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'Bz' (batch_size, n_tau)
-            
-        Returns
-        -------
-        torch.Tensor
-            B_LOS values (batch_size,)
-        """
+        """Predicted B_LOS per sample (G), single-height or tau-averaged as configured."""
         if self.blos_physics_mode == 'tau_averaged':
             return self._compute_tau_averaged_blos(denorm_pred['Bz'])
         else:  # single_height
@@ -438,19 +448,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
             return self._extract_at_logtau(denorm_pred['Bz'], self._blos_target_logtau_idx)
 
     def _compute_predicted_vlos(self, denorm_pred: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Compute V_LOS from predictions based on vlos_physics_mode.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'Vz' (batch_size, n_tau)
-            
-        Returns
-        -------
-        torch.Tensor
-            V_LOS values (batch_size,)
-        """
+        """Predicted v_LOS per sample (km/s), single-height or tau-averaged as configured."""
         if self.vlos_physics_mode == 'tau_averaged':
             return self._compute_tau_averaged_vlos(denorm_pred['Vz'])
         else:  # single_height
@@ -459,19 +457,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
             return self._extract_at_logtau(denorm_pred['Vz'], self._vlos_target_logtau_idx)
 
     def _compute_predicted_temperature(self, denorm_pred: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Compute temperature from predictions based on temp_physics_mode.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'T' (batch_size, n_tau)
-            
-        Returns
-        -------
-        torch.Tensor
-            Temperature values (batch_size,)
-        """
+        """Predicted T per sample (K), single-height or tau-averaged as configured."""
         if self.temp_physics_mode == 'tau_averaged':
             return self._compute_tau_averaged_temperature(denorm_pred['T'])
         else:  # single_height
@@ -480,25 +466,13 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
             return self._extract_at_logtau(denorm_pred['T'], self._temp_target_logtau_idx)
 
     def _compute_rrmse(self, predictions: torch.Tensor, targets: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        """
-        Compute Relative Root Mean Square Error (RRMSE).
-        
-        RRMSE = RMSE / mean(|targets|)
-              = sqrt(mean((pred - target)^2)) / mean(|target|)
-        
-        Parameters
-        ----------
-        predictions : torch.Tensor
-            Predicted values
-        targets : torch.Tensor
-            Target values
-        epsilon : float
-            Small value to prevent division by zero
-            
-        Returns
-        -------
-        torch.Tensor
-            RRMSE value (scalar)
+        """RRMSE = sqrt(mean((pred - target)^2)) / mean(|target|), dimensionless.
+
+        Examples:
+            >>> import torch
+            >>> m = PhysicsInformedMSCNN(scales=[1], n_tau_levels=1)
+            >>> round(float(m._compute_rrmse(torch.tensor([1.0, 3.0]), torch.tensor([2.0, 2.0]))), 6)
+            0.5
         """
         mse = torch.mean((predictions - targets) ** 2)
         rmse = torch.sqrt(mse)
@@ -511,21 +485,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         denorm_pred: Dict[str, torch.Tensor],
         spatial_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute WFA-based B_LOS loss using RRMSE in physical units.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'Bz' (batch_size, n_tau)
-        spatial_indices : torch.Tensor
-            Spatial coordinates (batch_size, 2) as [y, x]
-            
-        Returns
-        -------
-        loss : torch.Tensor
-            WFA RRMSE loss value
-        """
+        """RRMSE between the predicted B_LOS and the WFA map at each sample's pixel ``(x, y)``."""
         if self.blos_approx is None:
             raise RuntimeError("B_LOS approximation not set. Call set_physics_context() first.")
         
@@ -545,20 +505,9 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         denorm_pred: Dict[str, torch.Tensor],
         spatial_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute Doppler-based V_LOS loss using RRMSE in physical units.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'Vz' (batch_size, n_tau)
-        spatial_indices : torch.Tensor
-            Spatial coordinates (batch_size, 2) as [y, x]
-            
-        Returns
-        -------
-        loss : torch.Tensor
-            Doppler RRMSE loss value
+        """RRMSE between the predicted v_LOS and the Doppler map at each sample's pixel, skipping NaN approximations.
+
+        Returns 0 if every approximation in the batch is NaN.
         """
         if self.vlos_approx is None:
             raise RuntimeError("V_LOS approximation not set. Call set_physics_context() first.")
@@ -584,21 +533,7 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         denorm_pred: Dict[str, torch.Tensor],
         spatial_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute temperature loss using RRMSE in physical units.
-        
-        Parameters
-        ----------
-        denorm_pred : Dict[str, torch.Tensor]
-            Denormalized predictions with 'T' (batch_size, n_tau)
-        spatial_indices : torch.Tensor
-            Spatial coordinates (batch_size, 2) as [y, x]
-            
-        Returns
-        -------
-        loss : torch.Tensor
-            Temperature RRMSE loss value
-        """
+        """RRMSE between the predicted T and the black-body map at each sample's pixel ``(x, y)``."""
         if self.temp_approx is None:
             raise RuntimeError("Temperature approximation not set. Call set_physics_context() first.")
         
@@ -619,27 +554,38 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         spatial_indices: torch.Tensor,
         enable_physics: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute physics-based regularization losses using RRMSE in physical units.
-        
-        This method computes all enabled physics losses by:
-        1. Denormalizing predictions to physical units
-        2. Computing tau-averaged or single-height quantities (B_LOS, V_LOS, T)
-        3. Comparing against physics approximations using RRMSE
-        
-        Parameters
-        ----------
-        predictions : torch.Tensor
-            Normalized model predictions (batch_size, 63)
-        spatial_indices : torch.Tensor
-            Spatial coordinates (batch_size, 2) as [y, x]
-            
-        Returns
-        -------
-        total_loss : torch.Tensor
-            Weighted sum of physics losses
-        loss_components : Dict[str, float]
-            Individual loss components for logging
+        """Weighted sum of the enabled physics terms, and the value of each term for logging.
+
+        Args:
+            predictions: Normalized predictions, ``(batch, 3 n_tau)``.
+            spatial_indices: Pixel ``(x, y)`` of each sample, ``(batch, 2)``.
+            enable_physics: Gate for all terms at once (used to delay the physics terms by a
+                number of epochs); False returns zero.
+
+        Returns:
+            ``(total, components)``: the weighted sum as a tensor, and a dict with each
+            enabled term's RRMSE (``"wfa"``, ``"doppler"``, ``"temperature"``), the modes and
+            the target nodes. Both are empty or zero when the gate is closed or every lambda
+            is 0.
+
+        Examples:
+            >>> import contextlib, io, tempfile
+            >>> import numpy as np, torch
+            >>> from utils.normalizer import MhdNormalizer
+            >>> rng = np.random.default_rng(0)
+            >>> atm = {"T": 5000 + 100 * rng.standard_normal((6, 6, 3)), "Vz": rng.standard_normal((6, 6, 3)),
+            ...        "Bz": 100 * rng.standard_normal((6, 6, 3))}
+            >>> norm = MhdNormalizer(n_tau=3, raw_values_dir=tempfile.mkdtemp()); norm.update(atm)
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = norm.finalize()
+            >>> model = PhysicsInformedMSCNN(scales=[1], n_tau_levels=3, lambda_wfa=1.0, lambda_doppler=0.0,
+            ...                              lambda_temp=0.0, blos_physics_mode="single_height",
+            ...                              blos_target_logtau=-1.0)
+            >>> model.set_physics_context(norm, np.array([-2.0, -1.0, 0.0]), blos_approx=np.full((6, 6), 50.0))
+            >>> pred = torch.zeros(2, 9, requires_grad=True)
+            >>> total, parts = model.compute_physics_loss(pred, torch.tensor([[0, 0], [5, 5]]))
+            >>> sorted(k for k in parts if k in ("wfa", "doppler", "temperature")), total.requires_grad
+            (['wfa'], True)
         """
         # Return zero if all physics terms are disabled
         # The gate governs ALL physics terms, not just the WFA. It previously applied only
@@ -700,24 +646,30 @@ class PhysicsInformedMSCNN(MSCNNInversionModel):
         spatial_indices: Optional[torch.Tensor] = None,
         enable_physics: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Compute total loss with optional physics regularization.
-        
-        Parameters
-        ----------
-        predictions : torch.Tensor
-            Model predictions (batch_size, 63)
-        targets : torch.Tensor
-            Ground truth targets (batch_size, 63)
-        spatial_indices : torch.Tensor, optional
-            Spatial coordinates (batch_size, 2) for physics losses
-        enable_physics : bool
-            Enable WFA physics term
-            
-        Returns
-        -------
-        loss_dict : Dict[str, torch.Tensor]
-            Dictionary containing loss terms
+        """Total loss: MSE in normalized space over all outputs, plus the physics terms.
+
+        The MSE weights every node of T, Vz and Bz equally. The physics terms are added only
+        when ``spatial_indices`` is given, the gate is open and at least one lambda is
+        positive.
+
+        Args:
+            predictions: Normalized predictions, ``(batch, 3 n_tau)``.
+            targets: Normalized targets, same shape.
+            spatial_indices: Pixel ``(x, y)`` of each sample, ``(batch, 2)``, or ``None``
+                to skip the physics terms.
+            enable_physics: Gate for all physics terms.
+
+        Returns:
+            Dict with ``"loss"`` (total), ``"mse"``, ``"physics"`` (tensors) and the logging
+            components of :meth:`compute_physics_loss`.
+
+        Examples:
+            >>> import torch
+            >>> m = PhysicsInformedMSCNN(scales=[1], n_tau_levels=1, lambda_wfa=0.0, lambda_doppler=0.0,
+            ...                          lambda_temp=0.0)
+            >>> out = m.compute_loss(torch.ones(4, 3), torch.zeros(4, 3), torch.zeros(4, 2, dtype=torch.long))
+            >>> float(out["loss"]), float(out["mse"]), float(out["physics"])
+            (1.0, 1.0, 0.0)
         """
         # Base supervised MSE loss in normalized space
         mse_loss = F.mse_loss(predictions, targets)

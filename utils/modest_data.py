@@ -1,3 +1,24 @@
+"""Hinode/SP observations from the MODEST catalog (AR 11967 scan) and their SPINOR 2D inversion.
+
+:class:`ModestData` loads the observed Stokes cube (0.32 arcsec pixels, 112 wavelengths,
+continuum-normalized), the SPINOR inversion (atmosphere at log tau = -2.0, -0.8, 0.0 and
+the fitted profiles) and the continuum map, and prepares the model input. The current
+preparation (``load_all``) upsamples to 0.16 arcsec, Wiener-deconvolves with the Hinode
+PSF, smooths 3 points along wavelength and optionally block-averages back to 0.32 arcsec.
+The reframe plan replaces that with the raw observed cube ("native" mode, Phase 1d).
+
+Arrays are ``(ny, nx, n_wl)`` for Stokes cubes and ``(ny, nx)`` for maps: rows are the
+scan's y, columns its x. SPINOR velocities are positive for a redshift and B_LOS is
+B cos(gamma), positive toward the observer.
+
+Examples:
+    Load the whole scene as the analysis does (needs the MODEST files)::
+
+        modest = ModestData()
+        data = modest.load_all(apply_mask=False, prediction_input_mode="downsampled")
+        data["prediction_stokes"]["I"].shape   # (390, 858, 112)
+"""
+
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -28,12 +49,37 @@ def transform_modest_stokes_profiles(
 	invert_direction: bool = False,
 	edge_extrapolation_points: int = 4,
 ) -> Dict[str, np.ndarray]:
-	"""Apply optional spectral transformations to MODEST Stokes I/V profiles.
+	"""Apply optional spectral transformations to MODEST Stokes I and V, in a fixed order.
 
-	Transform order:
-	1) Optional spectral-axis inversion.
-	2) Optional spectral shift in sample positions with edge extrapolation.
-	3) Channel scaling (I and V independently).
+	The order is: reverse the wavelength axis, shift by a (fractional) number of samples,
+	then scale I and V. The shift interpolates linearly; samples that move in from beyond
+	the edges are extrapolated with a straight line fitted to the
+	``edge_extrapolation_points`` outermost samples. With the defaults the output equals
+	the input. Only I and V are returned; other keys are dropped.
+
+	Args:
+	    stokes: Dict with ``"I"`` and ``"V"`` cubes of shape ``(ny, nx, n_wl)``.
+	    wavelength_angstrom: Wavelength axis, 1-D, ``n_wl`` points (used for checks only).
+	    shift_positions: Shift in samples; positive moves features to longer wavelength
+	        (one Hinode sample is 21.5 mA, about 1.02 km/s).
+	    i_scale: Factor applied to I.
+	    v_scale: Factor applied to V.
+	    invert_direction: Reverse the wavelength axis first.
+	    edge_extrapolation_points: Samples used for the edge line fits (at least 2).
+
+	Returns:
+	    ``{"I", "V"}`` float32 cubes; the input is not modified.
+
+	Raises:
+	    KeyError: If I or V is missing.
+	    ValueError: If the shapes disagree with each other or with the wavelength axis.
+
+	Examples:
+	    >>> wl = np.arange(5.0)
+	    >>> stokes = {"I": np.arange(5.0).reshape(1, 1, 5), "V": np.zeros((1, 1, 5))}
+	    >>> out = transform_modest_stokes_profiles(stokes, wl, shift_positions=1.0, i_scale=2.0)
+	    >>> out["I"].ravel().tolist()      # shifted right by one sample, edge extrapolated
+	    [-2.0, 0.0, 2.0, 4.0, 6.0]
 	"""
 	if "I" not in stokes or "V" not in stokes:
 		raise KeyError("stokes dictionary must contain 'I' and 'V' keys")
@@ -62,12 +108,14 @@ def transform_modest_stokes_profiles(
 		V_out = V_out[:, :, ::-1]
 
 	def _fit_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+		"""Slope and intercept of a least-squares line (constant if only one point)."""
 		if x.size < 2:
 			return 0.0, float(y[0]) if y.size > 0 else 0.0
 		a, b = np.polyfit(x, y, 1)
 		return float(a), float(b)
 
 	def _shift_cube(cube: np.ndarray, delta_positions: float) -> np.ndarray:
+		"""Shift every spectrum by ``delta_positions`` samples with linear edge extrapolation."""
 		if abs(delta_positions) < 1e-14:
 			return cube
 
@@ -119,13 +167,22 @@ def transform_modest_stokes_profiles(
 
 
 class ModestData:
-	"""Load, process, and visualize MODEST Hinode/SP data products.
+	"""Load, process and plot one MODEST scan: observed Stokes, SPINOR inversion and continuum.
 
-	The class follows the end-to-end workflow captured in the
-	``4-modest_data.ipynb`` notebook: loading continuum and Stokes data,
-	performing PSF-based Wiener deconvolution, optional smoothing, computing
-	circular polarization masks, loading inverted profiles and SPINOR 2D
-	atmospheres, and producing a handful of diagnostic plots.
+	Attributes:
+	    obs_stokes: Observed I and V, ``(ny, nx, 112)``, continuum units; V times
+	        ``stokes_v_multiplier``.
+	    upsampled_stokes: I and V upsampled by ``upsampling_factor`` (0.16 arcsec).
+	    deconvolved_stokes: Wiener-deconvolved I and V.
+	    smoothed_stokes: 3-point wavelength smoothing of the deconvolved cubes.
+	    prediction_stokes: The model input built by ``load_all``.
+	    inverted_profs: SPINOR's fitted I and V, 250 wavelengths.
+	    inverted_atmos: SPINOR atmosphere planes, ``(23, ny, nx)``.
+	    spinor_atm: ``{"T", "Vlos", "Blos"} -> {log tau: map}`` in K, km/s and G.
+	    wl: Observed wavelength axis (112 points), Quantity in Angstrom.
+	    wl_inv: Axis of the inverted profiles (250 points).
+	    circ_pol: Map of mean |V| / I.
+	    mask: True where ``circ_pol`` is at most the threshold (weakly polarized pixels).
 	"""
 
 	def __init__(
@@ -135,6 +192,20 @@ class ModestData:
 		circular_polarization_threshold: float = 1e-2,
 		stokes_v_multiplier: float = -1.0,
 	) -> None:
+		"""Set paths and options; nothing is read until a ``load_*`` method is called.
+
+		Args:
+		    modest_dir: Folder of the MODEST scan (FITS files).
+		    psf_path: Hinode PSF sampled at 0.16 arcsec (61 x 61), used by the deconvolution.
+		    circular_polarization_threshold: Default threshold of mean |V| / I for the mask.
+		    stokes_v_multiplier: Factor applied to observed and inverted V on loading.
+		        The default -1 was introduced for the legacy MURaM Stokes. Raw Hinode V
+		        already follows NICOLE's convention (verified with the WFA against SPINOR's
+		        B_LOS), so the reframe plan sets it to +1 (Phase 1d).
+
+		Raises:
+		    ValueError: If ``stokes_v_multiplier`` is zero or not finite.
+		"""
 		self.modest_dir = Path(modest_dir)
 		self.psf_path = Path(psf_path)
 		self.circular_polarization_threshold = circular_polarization_threshold
@@ -166,12 +237,40 @@ class ModestData:
 	# Loading helpers
 	# ------------------------------------------------------------------
 	def load_continuum(self, filename: str = "continuum.fits") -> np.ndarray:
+		"""Read the continuum map ``(ny, nx)`` from ``continuum.fits``.
+
+		Args:
+		    filename: File name inside ``modest_dir``.
+
+		Returns:
+		    The map, also stored in ``self.continuum``.
+
+		Examples:
+		    >>> ModestData().load_continuum().shape  # doctest: +SKIP
+		    (390, 858)
+		"""
 		path = self.modest_dir / filename
 		with fits.open(path) as hdul:
 			self.continuum = hdul[0].data
 		return self.continuum
 
 	def load_obs_stokes(self, filename: str = "inverted_obs.1.fits") -> Dict[str, np.ndarray]:
+		"""Read the observed Stokes cube and keep I and V.
+
+		The file is ``(ny, nx, 4, 112)`` with the Stokes parameters in the order I, V, Q, U
+		(verified against SPINOR's azimuth). Q and U are not kept yet (reframe Phase 1d).
+		V is multiplied by ``stokes_v_multiplier``.
+
+		Args:
+		    filename: File name inside ``modest_dir``.
+
+		Returns:
+		    ``{"I", "V"}`` float32 cubes, also stored in ``self.obs_stokes``.
+
+		Examples:
+		    >>> ModestData().load_obs_stokes()["I"].shape  # doctest: +SKIP
+		    (390, 858, 112)
+		"""
 		path = self.modest_dir / filename
 		with fits.open(path) as hdul:
 			cube = hdul[0].data  # (ny, nx, 4, nwl)
@@ -183,6 +282,18 @@ class ModestData:
 		return self.obs_stokes
 
 	def load_inverted_profs(self, filename: str = "inverted_profs.1.fits") -> Dict[str, np.ndarray]:
+		"""Read SPINOR's fitted profiles (250 wavelengths) and keep I and V (V times the multiplier).
+
+		Args:
+		    filename: File name inside ``modest_dir``.
+
+		Returns:
+		    ``{"I", "V"}`` float32 cubes, also stored in ``self.inverted_profs``.
+
+		Examples:
+		    >>> ModestData().load_inverted_profs()["V"].shape  # doctest: +SKIP
+		    (390, 858, 250)
+		"""
 		path = self.modest_dir / filename
 		with fits.open(path) as hdul:
 			cube = hdul[0].data  # (ny, nx, 4, nwl_inv)
@@ -193,12 +304,26 @@ class ModestData:
 		return self.inverted_profs
 
 	def load_inverted_atmos(self, filename: str = "inverted_atmos.fits") -> np.ndarray:
+		"""Read the SPINOR 2D atmosphere planes ``(23, ny, nx)`` as float32.
+
+		Args:
+		    filename: File name inside ``modest_dir``.
+
+		Returns:
+		    The planes, also stored in ``self.inverted_atmos``. See
+		    :meth:`build_spinor_atmosphere` for which plane is which.
+
+		Examples:
+		    >>> ModestData().load_inverted_atmos().shape  # doctest: +SKIP
+		    (23, 390, 858)
+		"""
 		path = self.modest_dir / filename
 		with fits.open(path) as hdul:
 			self.inverted_atmos = hdul[0].data.astype(np.float32)
 		return self.inverted_atmos
 
 	def _load_psf(self) -> np.ndarray:
+		"""Read the PSF from ``psf_path`` as float32 and normalize it to sum 1."""
 		with fits.open(self.psf_path) as hdul:
 			psf = hdul[0].data
 		psf = np.ascontiguousarray(psf, dtype=np.float32)
@@ -212,6 +337,21 @@ class ModestData:
 		# (CRVAL1=6302.0/CDELT1=0.0215/CRPIX1=57) drifted 0.0776 A from the real
 		# header, injecting a spurious ~3.7 km/s blueshift into every model
 		# trained against it.
+		"""Set the observed (112-point) and inverted-profile (250-point) wavelength axes.
+
+		Both come from the MODEST FITS header through :mod:`utils.hinode_wavelengths`, the
+		single source of truth shared with the training side. There is no fallback on purpose:
+		the hardcoded axis that used to live here drifted 0.0776 A from the header, a spurious
+		3.7 km/s blueshift for every model trained against it.
+
+		Returns:
+		    ``(wl, wl_inv)`` as Quantities in Angstrom, also stored on the instance.
+
+		Examples:
+		    >>> wl, wl_inv = ModestData().compute_wavelength_arrays()  # doctest: +SKIP
+		    >>> wl.size, wl_inv.size  # doctest: +SKIP
+		    (112, 250)
+		"""
 		wl_min_abs, wl_max_abs, wl_ref = read_hinode_wavelength_metadata(self.modest_dir)
 		wl_obs = hinode_wavelength_grid(N_WL_OBSERVED, self.modest_dir)
 		wl_inv = hinode_wavelength_grid(N_WL_INVERTED, self.modest_dir)
@@ -234,7 +374,40 @@ class ModestData:
 		lambda_angstrom: float = 6302.0,
 		seed: Optional[int] = None
 	) -> Dict[str, np.ndarray]:
-		"""Upsample observed Stokes data using FFT-based method with noise injection."""
+		"""Upsample observed I and V by Fourier zero-padding, filling the new frequencies with noise.
+
+		For each wavelength, the map is mirrored into a ``(2 ny, 2 nx)`` tile, Fourier
+		transformed and placed at the centre of a grid ``factor`` times larger. The new outer
+		frequencies get white noise whose amplitude is the median Fourier amplitude outside
+		the telescope cut-off (lambda / D = 0.50 m at 6302 A). The result is cropped to
+		``factor`` times the original size and rescaled so its spatial mean equals the
+		original map's mean.
+
+		Note:
+		    The mean rescaling is well conditioned for I but not for V, whose map mean is
+		    close to zero. On a 128 x 128 crop the V amplitude per wavelength comes out
+		    between 0.72 and 0.99 of the original (0.985 to 0.99 at the lobes). The noise is
+		    unseeded unless ``seed`` is given, and ``load_all`` caches one realization. The
+		    reframe plan stops using this path (native input, Phase 1d).
+
+		Args:
+		    upsampling_factor: Integer factor (2 gives 0.16 arcsec pixels).
+		    aperture_m: Telescope aperture in m (Hinode SOT: 0.50).
+		    pixel_scale_arcsec: Pixel size of the input in arcsec.
+		    lambda_angstrom: Wavelength for the diffraction cut-off, in Angstrom.
+		    seed: Seed for ``np.random`` (global state). ``None`` leaves it unseeded.
+
+		Returns:
+		    ``{"I", "V"}`` float32 cubes of shape ``(factor ny, factor nx, n_wl)``.
+
+		Raises:
+		    ValueError: If observed Stokes are not loaded.
+
+		Examples:
+		    >>> up = modest.upsample_stokes(upsampling_factor=2, seed=0)  # doctest: +SKIP
+		    >>> up["I"].shape  # doctest: +SKIP
+		    (780, 1716, 112)
+		"""
 		if self.obs_stokes is None:
 			raise ValueError("Load observed Stokes before upsampling")
 
@@ -263,6 +436,7 @@ class ModestData:
 		}
 
 		def ellipse_mask(shape, q):
+			"""Normalized radial frequency map: 1 at the diffraction cut-off ``q``."""
 			lfx = shape[1] / q
 			lfy = shape[0] / q
 			y, x = np.ogrid[:shape[0], :shape[1]]
@@ -332,6 +506,27 @@ class ModestData:
 	# ------------------------------------------------------------------
 	@staticmethod
 	def _wiener_deconv(image: np.ndarray, psf_kernel: np.ndarray, noise_level: float) -> np.ndarray:
+		"""Wiener-deconvolve one 2-D map: ``F^-1[ F(image) conj(P) / (|P|^2 + noise_level) ]``.
+
+		The PSF is centred on a zero map of the image's size and shifted to the origin, so the
+		deconvolution is periodic (FFT). At zero frequency |P| = 1, so the mean of the map is
+		multiplied by ``1 / (1 + noise_level)``: 0.990 with the default 0.01, which makes the
+		deconvolved continuum 1 % too dark.
+
+		Args:
+		    image: 2-D map.
+		    psf_kernel: 2-D PSF normalized to sum 1, smaller than ``image``.
+		    noise_level: Regularization constant added to |P|^2.
+
+		Returns:
+		    The deconvolved map, same shape as ``image``.
+
+		Examples:
+		    >>> psf = np.zeros((3, 3)); psf[1, 1] = 1.0          # a delta PSF
+		    >>> out = ModestData._wiener_deconv(np.ones((8, 8)), psf, 0.01)
+		    >>> round(float(out.mean()), 6)                         # 1 / 1.01
+		    0.990099
+		"""
 		psf_padded = np.zeros_like(image)
 		pc = (psf_kernel.shape[0] // 2, psf_kernel.shape[1] // 2)
 		ic = (image.shape[0] // 2, image.shape[1] // 2)
@@ -345,14 +540,21 @@ class ModestData:
 		return np.real(ifft2(img_fft * wiener))
 
 	def deconvolve_stokes(self, noise_level: float = 0.01, use_upsampled: bool = False) -> Dict[str, np.ndarray]:
-		"""Apply Wiener deconvolution to Stokes data.
+		"""Wiener-deconvolve every wavelength map of I and V with the Hinode PSF.
 
-		Parameters
-		----------
-		noise_level : float
-			Noise parameter for Wiener filter
-		use_upsampled : bool
-			If True, use upsampled Stokes as input (must call upsample_stokes first)
+		Args:
+		    noise_level: Regularization constant of :meth:`_wiener_deconv`.
+		    use_upsampled: Deconvolve ``upsampled_stokes`` (the PSF is sampled at
+		        0.16 arcsec, so this is the consistent choice) instead of ``obs_stokes``.
+
+		Returns:
+		    ``{"I", "V"}`` float32 cubes, also stored in ``self.deconvolved_stokes``.
+
+		Raises:
+		    ValueError: If the requested input is not available.
+
+		Examples:
+		    >>> modest.deconvolve_stokes(use_upsampled=True)  # doctest: +SKIP
 		"""
 		if use_upsampled:
 			if not hasattr(self, 'upsampled_stokes') or self.upsampled_stokes is None:
@@ -375,6 +577,29 @@ class ModestData:
 		return self.deconvolved_stokes
 
 	def smooth_stokes(self, window_size: int = 3, use_deconvolved: bool = True) -> Dict[str, np.ndarray]:
+		"""Running mean of ``window_size`` samples along wavelength (``uniform_filter1d``).
+
+		Note:
+		    The 3-point smoothing makes the line cores shallower (0.320 to 0.341 and 0.394 to
+		    0.423 in the quiet-Sun mean profile), because the training profiles are not
+		    smoothed. This is one cause of the temperature bias on MODEST.
+
+		Args:
+		    window_size: Number of wavelength samples averaged.
+		    use_deconvolved: Smooth ``deconvolved_stokes`` instead of ``obs_stokes``.
+
+		Returns:
+		    The smoothed cubes, also stored in ``self.smoothed_stokes``.
+
+		Raises:
+		    ValueError: If the input is not available.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.obs_stokes = {"I": np.array([[[1.0, 1.0, 0.4, 1.0, 1.0]]])}
+		    >>> m.smooth_stokes(3, use_deconvolved=False)["I"].round(2).ravel().tolist()
+		    [1.0, 0.8, 0.8, 0.8, 1.0]
+		"""
 		source = self.deconvolved_stokes if use_deconvolved else self.obs_stokes
 		if source is None:
 			raise ValueError("Stokes data not available for smoothing")
@@ -385,6 +610,23 @@ class ModestData:
 		return self.smoothed_stokes
 
 	def compute_circular_polarization(self, epsilon: float = 1e-10) -> np.ndarray:
+		"""Map of mean |V| / I over wavelength (dimensionless), with I floored at ``epsilon``.
+
+		Args:
+		    epsilon: Lower bound on I to avoid division by zero.
+
+		Returns:
+		    ``(ny, nx)`` map, also stored in ``self.circ_pol``.
+
+		Raises:
+		    ValueError: If observed Stokes are not loaded.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.obs_stokes = {"I": np.ones((1, 1, 2)), "V": np.array([[[0.02, -0.04]]])}
+		    >>> m.compute_circular_polarization().round(3).tolist()
+		    [[0.03]]
+		"""
 		if self.obs_stokes is None:
 			raise ValueError("Load observed Stokes before computing circular polarization")
 
@@ -393,6 +635,20 @@ class ModestData:
 		return self.circ_pol
 
 	def create_mask_from_circular_polarization(self, threshold: Optional[float] = None) -> np.ndarray:
+		"""Boolean mask that is True for weakly polarized pixels (mean |V| / I at most the threshold).
+
+		Args:
+		    threshold: Threshold of mean |V| / I. Default: the instance's threshold (0.01).
+
+		Returns:
+		    ``(ny, nx)`` mask, also stored in ``self.mask``.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.circ_pol = np.array([[0.005, 0.02]])
+		    >>> m.create_mask_from_circular_polarization().tolist()
+		    [[True, False]]
+		"""
 		if self.circ_pol is None:
 			self.compute_circular_polarization()
 
@@ -401,6 +657,19 @@ class ModestData:
 		return self.mask
 
 	def apply_mask_to_data(self) -> None:
+		"""Set strongly polarized pixels (mask False) to NaN in every loaded product.
+
+		Stokes cubes on other grids (e.g. upsampled) get the mask repeated to their shape.
+		Builds the mask first if needed.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.obs_stokes = {"I": np.ones((1, 2, 3))}
+		    >>> m.mask = np.array([[True, False]])
+		    >>> m.apply_mask_to_data()
+		    >>> np.isnan(m.obs_stokes["I"][0, :, 0]).tolist()
+		    [False, True]
+		"""
 		if self.mask is None:
 			self.create_mask_from_circular_polarization()
 
@@ -409,6 +678,7 @@ class ModestData:
 			self.continuum[~self.mask] = np.nan
 
 		def _mask_stokes(stokes: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[str, np.ndarray]]:
+			"""Copy of a Stokes dict with masked-out pixels set to NaN (``None`` passes through)."""
 			if stokes is None:
 				return None
 			masked = {k: v.copy() for k, v in stokes.items()}
@@ -446,6 +716,24 @@ class ModestData:
 	# Sampling and spinor reconstruction
 	# ------------------------------------------------------------------
 	def find_sample_pixels(self) -> Dict[str, Dict[str, float]]:
+		"""Pick four diagnostic pixels: brightest and darkest continuum, strongest and weakest polarization.
+
+		Returns:
+		    ``{name: {"y", "x", "label"}}`` for ``max_continuum``, ``min_continuum``,
+		    ``max_polarization`` and ``min_polarization``, also stored in
+		    ``self.sample_pixels``.
+
+		Raises:
+		    ValueError: If the continuum is not loaded.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.continuum = np.array([[1.0, 0.2], [1.3, 0.9]])
+		    >>> m.circ_pol = np.array([[0.0, 0.3], [0.01, 0.02]])
+		    >>> s = m.find_sample_pixels()
+		    >>> (s["max_continuum"]["y"], s["max_continuum"]["x"]), (s["max_polarization"]["y"], s["max_polarization"]["x"])
+		    ((1.0, 0.0), (0.0, 1.0))
+		"""
 		if self.continuum is None:
 			raise ValueError("Continuum not loaded")
 		if self.circ_pol is None:
@@ -478,6 +766,35 @@ class ModestData:
 		mag_field_indices: Tuple[int, int, int] = (8, 9, 10),
 		gamma_indices: Tuple[int, int, int] = (11, 12, 13),
 	) -> Dict[str, Dict[float, np.ndarray]]:
+		"""Pick T, v_LOS and B_LOS at three log tau nodes out of the SPINOR planes.
+
+		B_LOS is ``B cos(gamma)`` with gamma the inclination in degrees. The default plane
+		indices follow the header of ``inverted_atmos.fits`` (1-based there): node log tau 3-5,
+		TEMPE 6-8, BFIEL 9-11, GAMMA 12-14, AZIMU 15-17, VELOS 18-20, VMICI 21. Getting the
+		first index wrong reads the next parameter block silently, because every plane is a
+		plausible float.
+
+		Args:
+		    tau_values: The node log tau values, in the order of the planes.
+		    temp_indices: 0-based planes of T (K).
+		    vel_indices: 0-based planes of v_LOS (km/s, positive = redshift).
+		    mag_field_indices: 0-based planes of |B| (G).
+		    gamma_indices: 0-based planes of the inclination (degrees).
+
+		Returns:
+		    ``{"T", "Vlos", "Blos"} -> {log tau: (ny, nx) map}``, also stored in
+		    ``self.spinor_atm``.
+
+		Raises:
+		    ValueError: If the atmosphere is not loaded.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.inverted_atmos = np.zeros((23, 1, 1), np.float32)
+		    >>> m.inverted_atmos[9] = 1000.0; m.inverted_atmos[12] = 60.0   # |B| and gamma at -0.8
+		    >>> round(float(m.build_spinor_atmosphere()["Blos"][-0.8][0, 0]), 1)
+		    500.0
+		"""
 		if self.inverted_atmos is None:
 			raise ValueError("Load inverted atmosphere first")
 
@@ -496,6 +813,32 @@ class ModestData:
 	def extract_region(
 		self, y_start: int, y_end: int, x_start: int, x_end: int
 	) -> Dict[str, object]:
+		"""Crop every loaded product to ``[y_start:y_end, x_start:x_end]`` (bounds on the observed grid).
+
+		Bounds are given on the native 0.32 arcsec grid (the continuum's shape). Stokes cubes
+		on other grids (upsampled, deconvolved, smoothed, prediction) are cropped with the
+		bounds scaled to their grid; maps and the SPINOR atmosphere use the bounds as given.
+
+		Args:
+		    y_start: First row (scan y).
+		    y_end: Row after the last.
+		    x_start: First column (scan x).
+		    x_end: Column after the last.
+
+		Returns:
+		    Dict with the cropped products that are loaded (``continuum``, ``obs_stokes``,
+		    ``deconvolved_stokes``, ``smoothed_stokes``, ``prediction_stokes``,
+		    ``inverted_profs``, ``inverted_atmos``, ``spinor_atm``, ``mask``).
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.continuum = np.zeros((4, 6))
+		    >>> m.obs_stokes = {"I": np.zeros((4, 6, 3))}
+		    >>> m.smoothed_stokes = {"I": np.zeros((8, 12, 3))}        # upsampled x2
+		    >>> r = m.extract_region(1, 3, 2, 5)
+		    >>> r["obs_stokes"]["I"].shape, r["smoothed_stokes"]["I"].shape
+		    ((2, 3, 3), (4, 6, 3))
+		"""
 		region: Dict[str, object] = {}
 		base_bounds = (y_start, y_end, x_start, x_end)
 
@@ -508,6 +851,7 @@ class ModestData:
 			ref_shape = None
 
 		def _crop_stokes_dict(stokes: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[str, np.ndarray]]:
+			"""Crop a Stokes dict, scaling the bounds to the dict's own grid."""
 			if stokes is None:
 				return None
 			any_key = next(iter(stokes))
@@ -551,7 +895,12 @@ class ModestData:
 		source_shape: Tuple[int, int],
 		target_shape: Tuple[int, int],
 	) -> Tuple[int, int, int, int]:
-		"""Scale (y_start, y_end, x_start, x_end) from source grid to target grid."""
+		"""Scale ``(y_start, y_end, x_start, x_end)`` from one grid to another, rounding outward.
+
+		Examples:
+		    >>> ModestData()._scale_region_bounds((1, 3, 2, 5), (4, 6), (8, 12))
+		    (2, 6, 4, 10)
+		"""
 		y_start, y_end, x_start, x_end = region_bounds
 		sy = target_shape[0] / max(source_shape[0], 1)
 		sx = target_shape[1] / max(source_shape[1], 1)
@@ -571,6 +920,7 @@ class ModestData:
 	# Plotting helpers
 	# ------------------------------------------------------------------
 	def _ensure_samples(self) -> Dict[str, Dict[str, float]]:
+		"""Return the sample pixels, finding them first if needed."""
 		if self.sample_pixels is None:
 			self.find_sample_pixels()
 		return self.sample_pixels
@@ -583,6 +933,22 @@ class ModestData:
 		disk_center: Optional[Tuple[float, float]] = None,
 		arrow_params: Optional[Tuple[float, float, float, float]] = None,
 	) -> None:
+		"""Show the continuum map with the four sample pixels and optional FOV and disk-centre markers.
+
+		Args:
+		    save_path: Save the figure there (300 dpi) instead of showing it.
+		    x_center_fov_pixel: Column of the field-of-view centre to mark.
+		    y_center_fov_pixel: Row of the field-of-view centre to mark.
+		    disk_center: ``(x, y)`` of the disk centre in pixels, marked if inside the map.
+		    arrow_params: ``(x, y, dx, dy)`` of an arrow toward the disk centre, drawn when
+		        it is outside the map.
+
+		Raises:
+		    ValueError: If the continuum is not loaded.
+
+		Examples:
+		    >>> modest.plot_continuum(save_path="figs/continuum.png")  # doctest: +SKIP
+		"""
 		if self.continuum is None:
 			raise ValueError("Continuum not loaded")
 
@@ -633,6 +999,19 @@ class ModestData:
 		title: str = "Stokes Profiles",
 		save_path: Optional[Union[Path, str]] = None,
 	) -> None:
+		"""Plot I and V of the four sample pixels (2 x 4 panels), marking one wavelength.
+
+		Args:
+		    stokes_data: Dict with ``"I"`` and ``"V"`` cubes ``(ny, nx, n_wl)``.
+		    wl: Wavelength axis in Angstrom.
+		    sample_wavelength_idx: Index of the wavelength to mark.
+		    stokes_labels: Labels of the two rows.
+		    title: Figure title.
+		    save_path: Save the figure there instead of showing it.
+
+		Examples:
+		    >>> modest.plot_stokes_profiles(modest.obs_stokes, modest.wl, 50)  # doctest: +SKIP
+		"""
 		samples = self._ensure_samples()
 		fig, axes = plt.subplots(2, 4, figsize=(16, 8))
 
@@ -668,6 +1047,19 @@ class ModestData:
 		title: str = "Stokes Parameters",
 		save_path: Optional[Union[Path, str]] = None,
 	) -> None:
+		"""Show the I and V maps at one wavelength with the sample pixels marked.
+
+		Args:
+		    stokes_data: Dict with ``"I"`` and ``"V"`` cubes ``(ny, nx, n_wl)``.
+		    wl: Wavelength axis in Angstrom.
+		    sample_wavelength_idx: Index of the wavelength to show.
+		    stokes_labels: Panel titles.
+		    title: Figure title (the wavelength is appended).
+		    save_path: Save the figure there instead of showing it.
+
+		Examples:
+		    >>> modest.plot_stokes_images(modest.obs_stokes, modest.wl, 50)  # doctest: +SKIP
+		"""
 		samples = self._ensure_samples()
 		fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
@@ -721,6 +1113,18 @@ class ModestData:
 		tau_values: Tuple[float, float, float] = (-2.0, -0.8, 0.0),
 		save_dir: Optional[Union[Path, str]] = None,
 	) -> None:
+		"""Show SPINOR's T, v_LOS and B_LOS maps at three nodes (one figure per quantity).
+
+		Args:
+		    tau_values: The log tau nodes to show (keys of ``spinor_atm``).
+		    save_dir: Save the figures there instead of showing them.
+
+		Raises:
+		    ValueError: If the SPINOR atmosphere has not been built.
+
+		Examples:
+		    >>> modest.plot_spinor_atmosphere(save_dir="figs/spinor")  # doctest: +SKIP
+		"""
 		if self.spinor_atm is None:
 			raise ValueError("Build SPINOR atmosphere before plotting")
 
@@ -729,6 +1133,7 @@ class ModestData:
 		save_dir_path = Path(save_dir) if save_dir is not None else None
 
 		def _plot_parameter(param_key: str, cmap: str, label: str, norm=None, cbar_label: str = "") -> None:
+			"""Draw one quantity at the three nodes, with a symmetric range for signed ones."""
 			fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 			for i, (ax, tau) in enumerate(zip(axes, tau_values)):
 				data = self.spinor_atm[param_key][tau]
@@ -782,7 +1187,24 @@ class ModestData:
 	# Orchestration
 	# ------------------------------------------------------------------
 	def get_sorted_tau_values(self, param_key: str = "T") -> Tuple[float, ...]:
-		"""Return sorted optical-depth keys for SPINOR; used for tau-grid overlap checks."""
+		"""Sorted log tau nodes of one SPINOR quantity, used to check overlap with the model's grid.
+
+		Args:
+		    param_key: ``"T"``, ``"Vlos"`` or ``"Blos"``.
+
+		Returns:
+		    The nodes in increasing order.
+
+		Raises:
+		    ValueError: If the SPINOR atmosphere has not been built.
+		    KeyError: For an unknown key.
+
+		Examples:
+		    >>> m = ModestData()
+		    >>> m.spinor_atm = {"T": {0.0: None, -2.0: None, -0.8: None}}
+		    >>> m.get_sorted_tau_values()
+		    (-2.0, -0.8, 0.0)
+		"""
 		if self.spinor_atm is None:
 			raise ValueError("SPINOR atmosphere not available")
 		if param_key not in self.spinor_atm:
@@ -798,24 +1220,36 @@ class ModestData:
 		upsampling_factor: int = 2,
 		prediction_input_mode: str = "upsampled",
 	) -> Dict[str, object]:
-		"""Load all MODEST data products with optional upsampling.
+		"""Load and prepare every MODEST product, from the cache when possible, and build the model input.
 
-		Parameters
-		----------
-		region_bounds : tuple, optional
-			(y_start, y_end, x_start, x_end) for spatial subset
-		apply_mask : bool
-			Whether to apply circular polarization mask
-		cache : ModestDataCache, optional
-			If provided and use_cache=True, stores/loads uncropped processed MODEST snapshot
-		use_cache : bool
-			Enable cache usage when cache instance is provided
-		upsampling_factor : int
-			Spatial upsampling factor used before deconvolution
-		prediction_input_mode : str
-			Input grid used later for model prediction: 'upsampled' or 'downsampled'.
-			'upsampled' uses smoothed deconvolved upsampled Stokes directly.
-			'downsampled' reduces smoothed Stokes back to original observed grid.
+		The full products (upsampling, deconvolution, smoothing, SPINOR) are computed once,
+		uncropped and unmasked, and stored in ``cache`` under a hash of the paths, the
+		upsampling factor and the V multiplier. Then the model input is built on the requested
+		grid, the polarization mask is applied if asked, and the region is cropped.
+
+		Args:
+		    region_bounds: ``(y_start, y_end, x_start, x_end)`` on the observed grid.
+		        ``None`` returns the whole scene.
+		    apply_mask: Set strongly polarized pixels to NaN (see
+		        :meth:`create_mask_from_circular_polarization`).
+		    cache: Cache for the processed products.
+		    use_cache: Read and write ``cache`` when it is given.
+		    upsampling_factor: Factor used before the deconvolution.
+		    prediction_input_mode: ``"upsampled"`` (smoothed deconvolved cube at
+		        0.16 arcsec) or ``"downsampled"`` (the same, block-averaged back to the
+		        observed 0.32 arcsec grid).
+
+		Returns:
+		    Dict with the products, ``wl``, ``wl_inv``, ``prediction_input_mode`` and
+		    ``tau_values`` (sorted SPINOR nodes). With ``region_bounds`` the products are
+		    those of :meth:`extract_region`.
+
+		Raises:
+		    ValueError: For an unknown ``prediction_input_mode``.
+
+		Examples:
+		    >>> data = ModestData().load_all(apply_mask=False, cache=ModestDataCache(),
+		    ...                              prediction_input_mode="downsampled")  # doctest: +SKIP
 		"""
 		if prediction_input_mode not in ("upsampled", "downsampled"):
 			raise ValueError("prediction_input_mode must be 'upsampled' or 'downsampled'")
@@ -874,6 +1308,7 @@ class ModestData:
 		}
 
 	def _build_prediction_stokes(self, mode: str) -> Dict[str, np.ndarray]:
+		"""Model input from the smoothed cube: a copy (``"upsampled"``) or block-averaged to the observed grid."""
 		if self.smoothed_stokes is None:
 			raise ValueError("Smoothed Stokes are not available to build prediction input")
 		if mode == "upsampled":
@@ -890,7 +1325,12 @@ class ModestData:
 
 	@staticmethod
 	def _mask_to_target_shape(mask: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
-		"""Map a boolean mask to a target grid using nearest-like integer scaling when possible."""
+		"""Resize a boolean mask to another grid: repeated blocks for integer factors, else nearest pixel.
+
+		Examples:
+		    >>> ModestData._mask_to_target_shape(np.array([[True, False]]), (2, 4)).astype(int).tolist()
+		    [[1, 1, 0, 0], [1, 1, 0, 0]]
+		"""
 		sy, sx = mask.shape
 		ty, tx = target_shape
 		if (sy, sx) == (ty, tx):
@@ -913,7 +1353,13 @@ class ModestData:
 
 	@staticmethod
 	def _downsample_cube_to_shape(cube: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
-		"""Downsample (ny, nx, nwl) cube to target (ny, nx) using block mean when possible."""
+		"""Block-average an ``(ny, nx, n_wl)`` cube to ``(ty, tx)`` (NaN-aware); factors must be integers.
+
+		Examples:
+		    >>> cube = np.arange(16.0).reshape(4, 4, 1)
+		    >>> ModestData._downsample_cube_to_shape(cube, (2, 2))[..., 0].tolist()
+		    [[2.5, 4.5], [10.5, 12.5]]
+		"""
 		ny, nx, nwl = cube.shape
 		ty, tx = target_shape
 		if (ny, nx) == (ty, tx):
@@ -930,6 +1376,7 @@ class ModestData:
 		)
 
 	def _compute_all_products(self, upsampling_factor: int) -> None:
+		"""Run the whole uncropped pipeline: load, upsample, deconvolve, smooth and load SPINOR."""
 		self.load_continuum()
 		self.load_obs_stokes()
 		self.compute_wavelength_arrays()
@@ -947,6 +1394,7 @@ class ModestData:
 		self.build_spinor_atmosphere()
 
 	def _snapshot_payload(self) -> Dict[str, Any]:
+		"""Dict of every product, as stored in the cache."""
 		return {
 			"continuum": self.continuum,
 			"obs_stokes": self.obs_stokes,
@@ -965,6 +1413,7 @@ class ModestData:
 		}
 
 	def _restore_snapshot(self, payload: Dict[str, Any]) -> None:
+		"""Set every product from a cached payload."""
 		self.continuum = payload.get("continuum")
 		self.obs_stokes = payload.get("obs_stokes")
 		self.upsampled_stokes = payload.get("upsampled_stokes")

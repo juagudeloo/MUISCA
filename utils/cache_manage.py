@@ -1,22 +1,32 @@
-"""
-Cache Management System for Processed MURaM Data
-=================================================
+"""HDF5 caches for the training and analysis data, so the expensive preprocessing runs once.
 
-Caches processed Stokes and MHD data in HDF5 format to avoid reprocessing.
-Dramatically reduces training setup time when data has already been processed.
+There are three caches, and they are independent.
 
-Usage:
-    from utils.cache_manage import DataCache
-    
-    cache = DataCache(cache_dir="/path/to/cache")
-    
-    # Check if step is cached
-    if cache.exists(step=100):
-        dataset, approx_data = cache.load(step=100, normalizers=(mhd_norm, stokes_norm))
-    else:
-        # Process and cache
-        dataset, approx_data = load_and_prepare_step(...)
-        cache.save(step=100, dataset=dataset, approx_data=approx_data)
+* :class:`MuramDataCache` (``.muram_cache*``): one file per MURaM step with the degraded
+  Stokes profiles (continuum units, Hinode grid), the atmosphere on the log tau nodes
+  (K, km/s, G) and the physics approximations (``blos``, ``vlos``, ``temp``). The arrays
+  are not normalized; :meth:`MuramDataCache.load` normalizes them when it builds the
+  Dataset. A file is valid for a configuration hash (computed by the caller from every
+  setting that changes its content) and a log tau grid.
+* :class:`BalancedTrainDataCache` (``.muram_balanced_cache*``): the final balanced,
+  normalized training arrays per step, valid for one signature of the whole training
+  configuration.
+* :class:`ModestDataCache` (``.modest_cache``): the processed MODEST scene, uncropped and
+  unmasked, keyed by a hash of its settings.
+
+The two MURaM caches are two layers: the balanced one is built from the per-step one.
+Deleting only the balanced cache leaves stale approximations in the per-step cache, so
+after changing an approximation both must be cleared (or their hashes must change).
+
+Examples:
+    The training loop's use of the per-step cache, in short::
+
+        cache = MuramDataCache(".muram_cache_nicole_tau500")
+        if cache.exists(step, config_hash, logtau_values=logtau):
+            stokes, mhd, approx = cache.load_raw(step)
+        else:
+            ...  # process the step, then
+            cache.save(step, stokes, mhd, approx, config_hash=config_hash, logtau_values=logtau)
 """
 
 import json
@@ -32,13 +42,20 @@ from utils.normalizer import MhdNormalizer, StokesNormalizer
 
 
 class BalancedTrainDataCache:
-    """Cache manager for post-balancing train-ready tensors.
+    """Cache of the balanced, normalized training arrays, one HDF5 file per step.
 
-    This cache stores one file per simulation step containing the final balanced
-    tensors used by training, so balancing logic is not re-run every epoch.
+    All files belong to one signature (a hash of the training configuration). The manifest
+    ``balanced_manifest.json`` records the signature and, per step, the file, the number of
+    samples and its size. A different signature means the cache must be reset before use.
     """
 
     def __init__(self, cache_dir: str = ".muram_balanced_cache", compression: str = "lzf"):
+        """Open (or create) the cache folder and read its manifest.
+
+        Args:
+            cache_dir: Folder of the cache.
+            compression: HDF5 compression filter for the arrays (``"lzf"`` is fast).
+        """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.compression = compression
@@ -46,6 +63,7 @@ class BalancedTrainDataCache:
         self.manifest = self._load_manifest()
 
     def _load_manifest(self) -> dict[str, object]:
+        """Read the manifest, or return an empty one."""
         if self.manifest_path.exists():
             with open(self.manifest_path, "r") as f:
                 return json.load(f)
@@ -60,18 +78,50 @@ class BalancedTrainDataCache:
         }
 
     def _save_manifest(self) -> None:
+        """Write the manifest as indented JSON."""
         with open(self.manifest_path, "w") as f:
             json.dump(self.manifest, f, indent=2)
 
     @staticmethod
     def make_signature_hash(signature: dict) -> str:
+        """First 12 hex digits of the MD5 of the signature as sorted-key JSON.
+
+        Key order does not matter, but every value does: any change gives a new hash.
+
+        Args:
+            signature: JSON-serializable dict describing the training configuration.
+
+        Returns:
+            A 12-character hex string.
+
+        Examples:
+            >>> h1 = BalancedTrainDataCache.make_signature_hash({"a": 1, "b": [2, 3]})
+            >>> h1 == BalancedTrainDataCache.make_signature_hash({"b": [2, 3], "a": 1}), len(h1)
+            (True, 12)
+            >>> h1 == BalancedTrainDataCache.make_signature_hash({"a": 1, "b": [2, 4]})
+            False
+        """
         payload = json.dumps(signature, sort_keys=True)
         return hashlib.md5(payload.encode()).hexdigest()[:12]
 
     def _step_path(self, step: int) -> Path:
+        """Path of the file for ``step``, e.g. ``balanced_step_000110.h5``."""
         return self.cache_dir / f"balanced_step_{step:06d}.h5"
 
     def reset(self, signature: dict, signature_hash: str) -> None:
+        """Delete every step file and start a new manifest for ``signature``.
+
+        Args:
+            signature: The new configuration signature (stored in the manifest).
+            signature_hash: Its hash from :meth:`make_signature_hash`.
+
+        Examples:
+            >>> import tempfile
+            >>> c = BalancedTrainDataCache(tempfile.mkdtemp())
+            >>> c.reset({"lr": 1e-3}, "abc123")
+            >>> c.manifest["signature_hash"], c.manifest["total_steps"]
+            ('abc123', 0)
+        """
         for fp in self.cache_dir.glob("balanced_step_*.h5"):
             fp.unlink()
         self.manifest = {
@@ -86,7 +136,15 @@ class BalancedTrainDataCache:
         self._save_manifest()
 
     def clear(self) -> None:
-        """Remove all balanced cache files and reset manifest."""
+        """Delete every step file and reset the manifest to an empty one with no signature.
+
+        Examples:
+            >>> import tempfile
+            >>> c = BalancedTrainDataCache(tempfile.mkdtemp())
+            >>> c.clear()
+            >>> c.manifest["signature_hash"] is None
+            True
+        """
         for fp in self.cache_dir.glob("balanced_step_*.h5"):
             fp.unlink()
         self.manifest = {
@@ -101,7 +159,22 @@ class BalancedTrainDataCache:
         self._save_manifest()
 
     def ensure_signature(self, signature: dict, signature_hash: str) -> bool:
-        """Return True if the manifest matches this signature hash."""
+        """Return True if the cache belongs to ``signature_hash``; an empty cache adopts it.
+
+        Args:
+            signature: The configuration signature.
+            signature_hash: Its hash.
+
+        Returns:
+            True if the manifest has no signature yet (it is then set) or the same one;
+            False if it holds a different one.
+
+        Examples:
+            >>> import tempfile
+            >>> c = BalancedTrainDataCache(tempfile.mkdtemp())
+            >>> c.ensure_signature({"x": 1}, "h1"), c.ensure_signature({"x": 2}, "h2")
+            (True, False)
+        """
         current_hash = self.manifest.get("signature_hash")
         if current_hash is None:
             self.manifest["signature_hash"] = signature_hash
@@ -111,6 +184,21 @@ class BalancedTrainDataCache:
         return current_hash == signature_hash
 
     def has_step(self, step: int, signature_hash: str) -> bool:
+        """True if ``step`` is cached and valid for ``signature_hash`` and its file exists.
+
+        Args:
+            step: Simulation step.
+            signature_hash: Expected signature hash.
+
+        Returns:
+            Whether the step can be loaded.
+
+        Examples:
+            >>> import tempfile
+            >>> c = BalancedTrainDataCache(tempfile.mkdtemp())
+            >>> c.reset({}, "h"); c.has_step(110, "h")
+            False
+        """
         if self.manifest.get("signature_hash") != signature_hash:
             return False
         entry = self.manifest.get("steps", {}).get(str(step))
@@ -131,6 +219,34 @@ class BalancedTrainDataCache:
         approx_data: dict[str, np.ndarray],
         extra_metadata: dict[str, object] | None = None,
     ) -> Path:
+        """Write one step's balanced arrays and update the manifest.
+
+        Args:
+            step: Simulation step.
+            signature_hash: Must equal the manifest's signature.
+            stokes_input: Normalized model input, ``(n, n_channels, n_wl)``.
+            mhd_targets: Normalized targets, ``(n, 3 n_tau)``.
+            spatial_indices: Pixel ``(x, y)`` per sample, ``(n, 2)``.
+            approx_data: The step's ``(nx, ny)`` approximation maps, indexed by the
+                samples' ``spatial_indices``; must hold ``"blos"`` (G), ``"vlos"`` (km/s) and
+                ``"temp"`` (K). Other keys are ignored.
+            extra_metadata: JSON-serializable info stored in the manifest entry.
+
+        Returns:
+            Path of the written file.
+
+        Raises:
+            ValueError: If the signature does not match (reset first).
+            KeyError: If an approximation is missing.
+
+        Examples:
+            >>> import tempfile
+            >>> c = BalancedTrainDataCache(tempfile.mkdtemp()); c.reset({}, "h")
+            >>> approx = {k: np.zeros((2, 2)) for k in ("blos", "vlos", "temp")}
+            >>> _ = c.save_step(110, "h", np.zeros((3, 2, 5)), np.zeros((3, 6)), np.zeros((3, 2)), approx)
+            >>> c.has_step(110, "h"), c.manifest["total_selected"]
+            (True, 3)
+        """
         if self.manifest.get("signature_hash") != signature_hash:
             raise ValueError("Balanced cache signature mismatch. Reset cache before saving.")
 
@@ -189,6 +305,22 @@ class BalancedTrainDataCache:
         step: int,
         signature_hash: str,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        """Read one step's arrays: ``(stokes_input, mhd_targets, spatial_indices, approx_data)``.
+
+        Args:
+            step: Simulation step.
+            signature_hash: Expected signature hash.
+
+        Returns:
+            float32 input and targets, int64 indices, and a dict with the ``blos``, ``vlos``
+            and ``temp`` maps (float32).
+
+        Raises:
+            FileNotFoundError: If :meth:`has_step` is False.
+
+        Examples:
+            >>> x, y, xy, approx = c.load_step(110, "h")  # doctest: +SKIP
+        """
         if not self.has_step(step, signature_hash):
             raise FileNotFoundError(f"Balanced cache miss for step {step}")
 
@@ -205,6 +337,17 @@ class BalancedTrainDataCache:
         return stokes_input, mhd_targets, spatial_indices, approx_data
 
     def get_stats(self) -> dict[str, object]:
+        """Summary of the manifest: signature, number of steps and samples, size in bytes and MB.
+
+        Returns:
+            Dict with ``cache_dir``, ``signature_hash``, ``total_steps``, ``total_selected``,
+            ``total_bytes``, ``total_size_mb`` and the per-step ``steps`` entries.
+
+        Examples:
+            >>> import tempfile
+            >>> BalancedTrainDataCache(tempfile.mkdtemp()).get_stats()["total_steps"]
+            0
+        """
         return {
             "cache_dir": str(self.cache_dir),
             "signature_hash": self.manifest.get("signature_hash"),
@@ -216,6 +359,11 @@ class BalancedTrainDataCache:
         }
 
     def print_cache_info(self) -> None:
+        """Print :meth:`get_stats` as a table.
+
+        Examples:
+            >>> BalancedTrainDataCache(".muram_balanced_cache").print_cache_info()  # doctest: +SKIP
+        """
         stats = self.get_stats()
         print("\n" + "=" * 80)
         print("BALANCED TRAIN CACHE STATISTICS".center(80))
@@ -229,32 +377,22 @@ class BalancedTrainDataCache:
 
 
 class MuramDataCache:
-    """
-    Cache manager for processed MURaM data using HDF5 format.
-    
-    Stores:
-    - Normalized Stokes data (I, V)
-    - Normalized MHD data (T, Vz, Bz)
-    - Physics approximations (blos, vlos, temp)
-    - Configuration metadata
-    
-    Features:
-    - Efficient HDF5 storage with compression
-    - Configuration hashing to detect incompatible changes
-    - Automatic directory creation
-    - Progress reporting
+    """Per-step cache of the processed MURaM data in HDF5.
+
+    Each file ``step_NNNNNN.h5`` has three groups: ``stokes`` (degraded profiles on the
+    Hinode grid in continuum units, plus the ``mean_continuum``, ``circular_polarization``
+    and ``hinode_wl`` entries), ``mhd`` (``T`` in K, ``Vz`` in km/s, ``Bz`` in G on the log
+    tau nodes) and ``approximations`` (``blos`` in G, ``vlos`` in km/s, ``temp`` in K, one
+    value per pixel). Nothing is normalized. ``metadata.json`` records the configuration
+    hash, shapes and log tau grid of each step, and the cache-wide log tau grid.
     """
     
     def __init__(self, cache_dir: str = ".muram_cache", compression: str = "gzip"):
-        """
-        Initialize cache manager.
-        
-        Parameters
-        ----------
-        cache_dir : str
-            Root directory for cached data
-        compression : str
-            HDF5 compression type ('gzip', 'lzf', or None)
+        """Open (or create) the cache folder and read its metadata.
+
+        Args:
+            cache_dir: Folder of the cache.
+            compression: HDF5 compression filter (``"gzip"``, level 4).
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -265,62 +403,70 @@ class MuramDataCache:
 
     
     def _load_metadata(self) -> dict[str, dict]:
-        """Load metadata file tracking cached steps."""
+        """Read ``metadata.json``, or return an empty dict."""
         if self.metadata_file.exists():
             with open(self.metadata_file, 'r') as f:
                 return json.load(f)
         return {}
     
     def _save_metadata(self):
-        """Save metadata file."""
+        """Write ``metadata.json``."""
         with open(self.metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=2)
     
     @staticmethod
     def _config_hash(config_dict: dict) -> str:
-        """
-        Compute hash of configuration parameters.
-        
-        Parameters
-        ----------
-        config_dict : dict
-            Configuration to hash
-            
-        Returns
-        -------
-        str
-            Hex hash of configuration
+        """First 8 hex digits of the MD5 of ``config_dict`` as sorted-key JSON.
+
+        Examples:
+            >>> MuramDataCache._config_hash({"b": 1, "a": 2}) == MuramDataCache._config_hash({"a": 2, "b": 1})
+            True
         """
         config_str = json.dumps(config_dict, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()[:8]
 
     @staticmethod
     def make_config_hash(config_dict: dict) -> str:
-        """Public helper for shared cache hashing across scripts."""
+        """Configuration hash shared by the training and statistics scripts (8 hex digits).
+
+        Args:
+            config_dict: JSON-serializable dict of every setting that changes a cached file.
+
+        Returns:
+            The hash string.
+
+        Examples:
+            >>> len(MuramDataCache.make_config_hash({"wl_range": [15, 60]}))
+            8
+        """
         return MuramDataCache._config_hash(config_dict)
     
     def _get_cache_path(self, step: int) -> Path:
-        """Get cache file path for a step."""
+        """Path of the file for ``step``, e.g. ``step_000110.h5``."""
         return self.cache_dir / f"step_{step:06d}.h5"
     
     def exists(self, step: int, config_hash: str | None = None, logtau_values: np.ndarray | list[float] | None = None) -> bool:
-        """
-        Check if processed data exists in cache.
-        
-        Parameters
-        ----------
-        step : int
-            Simulation step number
-        config_hash : str, optional
-            Configuration hash to validate. If provided, checks that
-            cached config matches.
-        logtau_values : np.ndarray or list[float], optional
-            Optical-depth grid used during MURaM -> tau remapping.
-            
-        Returns
-        -------
-        bool
-            True if cache exists and is valid
+        """True if ``step`` is cached and, when ``config_hash`` is given, cached with that hash.
+
+        Without ``config_hash`` only the file's existence is checked; the training script uses
+        that relaxed check for the legacy data source only.
+
+        Args:
+            step: Simulation step.
+            config_hash: Expected configuration hash, or ``None`` to skip the check.
+            logtau_values: Expected log tau grid. If given, the cache's grid must match it.
+
+        Returns:
+            Whether the step can be loaded.
+
+        Raises:
+            ValueError: If the cache was built on a different log tau grid.
+
+        Examples:
+            >>> import tempfile
+            >>> c = MuramDataCache(tempfile.mkdtemp())
+            >>> c.exists(110, "abcd1234", logtau_values=[-1.0, 0.0])
+            False
         """
         self._ensure_logtau_compatible(logtau_values)
 
@@ -342,6 +488,10 @@ class MuramDataCache:
         return True
 
     def _ensure_logtau_compatible(self, logtau_values: np.ndarray | list[float] | None) -> None:
+        """Raise if the cache (globally or for any step) was built on a different log tau grid.
+
+        The first call with a grid records it as the cache-wide grid.
+        """
         expected = self._normalize_logtau_values(logtau_values)
         if expected is None:
             return
@@ -373,6 +523,16 @@ class MuramDataCache:
 
     @staticmethod
     def _normalize_logtau_values(logtau_values: np.ndarray | list[float] | None) -> list[float] | None:
+        """Grid as a list of Python floats for comparison and JSON, via float32.
+
+        The values are rounded to 6 decimals but stay float32, so -0.8 becomes
+        -0.800000011920929. Comparisons are consistent because both sides go through
+        this function.
+
+        Examples:
+            >>> MuramDataCache._normalize_logtau_values(np.array([-0.8, 0.0]))
+            [-0.800000011920929, 0.0]
+        """
         if logtau_values is None:
             return None
         arr = np.asarray(logtau_values, dtype=np.float32)
@@ -381,6 +541,7 @@ class MuramDataCache:
         return [float(x) for x in np.round(arr, 6).tolist()]
 
     def _step_keys(self) -> list[str]:
+        """Metadata keys that are step numbers."""
         return [k for k in self.metadata.keys() if k.isdigit()]
 
     def save(
@@ -393,30 +554,31 @@ class MuramDataCache:
         logtau_values: np.ndarray | list[float] | None = None,
         verbose: bool = True,
     ) -> Path:
-        """
-        Save processed data to cache.
-        
-        Parameters
-        ----------
-        step : int
-            Simulation step number
-        stokes_data : dict
-            Processed Stokes data {'I': (nx, ny, nλ), 'V': ...}
-        mhd_data : dict
-            Processed MHD data {'T': (nx, ny, nτ), 'Vz': ..., 'Bz': ...}
-        approx_data : dict
-            Physics approximations {'blos': (nx, ny), 'vlos': ..., 'temp': ...}
-        config_hash : str, optional
-            Configuration hash for validation
-        logtau_values : np.ndarray or list[float], optional
-            Optical-depth grid used during MURaM -> tau remapping.
-        verbose : bool
-            Print progress messages
-            
-        Returns
-        -------
-        Path
-            Path to cache file
+        """Write one step's Stokes, MHD and approximation arrays and update the metadata.
+
+        A partial file is deleted if writing fails, and the error is raised again.
+
+        Args:
+            step: Simulation step.
+            stokes_data: Dict of arrays; ``"I"`` must be ``(nx, ny, n_wl)``. Stored as given.
+            mhd_data: Dict of arrays; ``"T"`` must be ``(nx, ny, n_tau)``. Stored as given.
+            approx_data: Dict of ``(nx, ny)`` approximation maps, or ``None``.
+            config_hash: Configuration hash stored with the step (``"unknown"`` if ``None``).
+            logtau_values: The log tau grid, stored in the file and the metadata.
+            verbose: Print the file size.
+
+        Returns:
+            Path of the written file.
+
+        Examples:
+            >>> import tempfile, contextlib, io
+            >>> c = MuramDataCache(tempfile.mkdtemp())
+            >>> stokes = {"I": np.ones((2, 2, 5))}; mhd = {"T": np.full((2, 2, 3), 5000.0)}
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = c.save(110, stokes, mhd, {"temp": np.full((2, 2), 6000.0)}, "abcd1234", [-1.0, 0.0, 1.0])
+            ...     s, m, a = c.load_raw(110)
+            >>> c.exists(110, "abcd1234", [-1.0, 0.0, 1.0]), float(a["temp"][0, 0])
+            (True, 6000.0)
         """
         cache_path = self._get_cache_path(step)
         
@@ -486,24 +648,22 @@ class MuramDataCache:
         mhd_normalizer: MhdNormalizer,
         verbose: bool = True,
     ) -> tuple[MuramStepDataset, dict[str, np.ndarray]]:
-        """
-        Load processed data from cache and create dataset.
-        
-        Parameters
-        ----------
-        step : int
-            Simulation step number
-        stokes_normalizer : StokesNormalizer
-            Normalizer for Stokes data
-        mhd_normalizer : MhdNormalizer
-            Normalizer for MHD data
-        verbose : bool
-            Print progress messages
-            
-        Returns
-        -------
-        tuple
-            (MuramStepDataset, approx_data_dict)
+        """Read one step and wrap it in a :class:`MuramStepDataset` (normalizing it).
+
+        Args:
+            step: Simulation step.
+            stokes_normalizer: Fitted Stokes normalizer.
+            mhd_normalizer: Fitted MHD normalizer.
+            verbose: Print a message.
+
+        Returns:
+            ``(dataset, approx_data)``.
+
+        Raises:
+            FileNotFoundError: If the step is not cached.
+
+        Examples:
+            >>> dataset, approx = cache.load(110, stokes_norm, mhd_norm)  # doctest: +SKIP
         """
         cache_path = self._get_cache_path(step)
         
@@ -549,9 +709,20 @@ class MuramDataCache:
         step: int,
         verbose: bool = True,
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
-        """
-        Load raw cached arrays (stokes, mhd, approx) without building dataset.
-        Useful for analysis scripts.
+        """Read one step's arrays without building a Dataset: ``(stokes, mhd, approx)``.
+
+        Args:
+            step: Simulation step.
+            verbose: Print a message.
+
+        Returns:
+            Three dicts of NumPy arrays (``approx`` is empty if the file has none).
+
+        Raises:
+            FileNotFoundError: If the step is not cached.
+
+        Examples:
+            >>> stokes, mhd, approx = cache.load_raw(110)  # doctest: +SKIP
         """
         cache_path = self._get_cache_path(step)
         if not cache_path.exists():
@@ -569,15 +740,14 @@ class MuramDataCache:
         return stokes_data, mhd_data, approx_data
     
     def clear(self, step: int | None = None, confirm: bool = True) -> None:
-        """
-        Clear cache files.
-        
-        Parameters
-        ----------
-        step : int, optional
-            If provided, delete only this step. Otherwise, delete all.
-        confirm : bool
-            If True, ask for confirmation before deleting
+        """Delete one step's file, or all files, and their metadata.
+
+        Args:
+            step: Step to delete, or ``None`` for all.
+            confirm: Ask on the terminal before deleting.
+
+        Examples:
+            >>> cache.clear(confirm=False)  # doctest: +SKIP
         """
         if step is not None:
             cache_path = self._get_cache_path(step)
@@ -612,13 +782,16 @@ class MuramDataCache:
             print(f"  ✓ Cleared all cache files")
     
     def get_cache_stats(self) -> dict[str, any]:
-        """
-        Get statistics about cached data.
-        
-        Returns
-        -------
-        dict
-            Statistics including total size, number of steps, etc.
+        """Number of cached steps, total size in MB, step list and cache-wide log tau grid.
+
+        Returns:
+            Dict with ``total_steps_cached``, ``total_size_mb``, ``cache_dir``, ``steps`` and
+            ``cache_logtau_values``.
+
+        Examples:
+            >>> import tempfile
+            >>> MuramDataCache(tempfile.mkdtemp()).get_cache_stats()["total_steps_cached"]
+            0
         """
         cache_files = list(self.cache_dir.glob("step_*.h5"))
         total_size_mb = sum(f.stat().st_size for f in cache_files) / (1024**2)
@@ -633,7 +806,11 @@ class MuramDataCache:
         }
     
     def print_cache_info(self):
-        """Print formatted cache information."""
+        """Print :meth:`get_cache_stats` and a per-step table.
+
+        Examples:
+            >>> MuramDataCache(".muram_cache_nicole_tau500").print_cache_info()  # doctest: +SKIP
+        """
         stats = self.get_cache_stats()
         
         print("\n" + "=" * 80)
@@ -660,40 +837,94 @@ class MuramDataCache:
 
 
 class ModestDataCache:
-    """Cache manager for processed MODEST snapshots (pre-cropping)."""
+    """Cache of the processed MODEST scene (uncropped, unmasked), one HDF5 file per settings hash.
+
+    Note:
+        The SPINOR log tau keys are stored as float32, so after a cache hit -0.8 comes back
+        as -0.800000011920929. Code that takes the keys from ``tau_values`` works; code that
+        indexes with the literal -0.8 (e.g. the default of
+        ``ModestData.plot_spinor_atmosphere``) raises KeyError. Wavelength axes also come
+        back as plain arrays (Angstrom), without units.
+    """
 
     def __init__(self, cache_dir: str = ".modest_cache"):
+        """Open (or create) the cache folder and read its metadata.
+
+        Args:
+            cache_dir: Folder of the cache.
+        """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.cache_dir / "metadata.json"
         self.metadata = self._load_metadata()
 
     def _load_metadata(self) -> dict[str, dict]:
+        """Read ``metadata.json``, or return an empty dict."""
         if self.metadata_file.exists():
             with open(self.metadata_file, 'r') as f:
                 return json.load(f)
         return {}
 
     def _save_metadata(self):
+        """Write ``metadata.json``."""
         with open(self.metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=2)
 
     @staticmethod
     def _config_hash(config_dict: dict) -> str:
+        """First 12 hex digits of the MD5 of ``config_dict`` as sorted-key JSON."""
         payload = json.dumps(config_dict, sort_keys=True)
         return hashlib.md5(payload.encode()).hexdigest()[:12]
 
     @staticmethod
     def make_config_hash(config_dict: dict) -> str:
+        """Hash of the MODEST processing settings (12 hex digits).
+
+        Args:
+            config_dict: JSON-serializable settings (paths, upsampling factor, V multiplier...).
+
+        Returns:
+            The hash string.
+
+        Examples:
+            >>> len(ModestDataCache.make_config_hash({"upsampling_factor": 2}))
+            12
+        """
         return ModestDataCache._config_hash(config_dict)
 
     def _cache_path(self, config_hash: str) -> Path:
+        """Path of the file for a hash, e.g. ``modest_<hash>.h5``."""
         return self.cache_dir / f"modest_{config_hash}.h5"
 
     def exists(self, config_hash: str) -> bool:
+        """True if a file for ``config_hash`` exists.
+
+        Args:
+            config_hash: Hash from :meth:`make_config_hash`.
+        """
         return self._cache_path(config_hash).exists()
 
     def save(self, config_hash: str, payload: dict, config: dict | None = None, verbose: bool = True) -> Path:
+        """Write a processed MODEST payload and record its settings in the metadata.
+
+        Args:
+            config_hash: Hash from :meth:`make_config_hash`.
+            payload: Dict as built by ``ModestData._snapshot_payload``.
+            config: The settings behind the hash, stored for reference.
+            verbose: Print the file size.
+
+        Returns:
+            Path of the written file.
+
+        Examples:
+            >>> import tempfile, contextlib, io
+            >>> c = ModestDataCache(tempfile.mkdtemp())
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = c.save("h", {"continuum": np.ones((2, 3))})
+            ...     back = c.load("h")
+            >>> back["continuum"].shape, back["obs_stokes"]
+            ((2, 3), None)
+        """
         cache_path = self._cache_path(config_hash)
         self._save_hdf5(cache_path, payload)
 
@@ -711,6 +942,21 @@ class ModestDataCache:
         return cache_path
 
     def load(self, config_hash: str, verbose: bool = True) -> dict:
+        """Read a processed MODEST payload.
+
+        Args:
+            config_hash: Hash of the wanted settings.
+            verbose: Print a message.
+
+        Returns:
+            The payload dict (missing products are ``None``).
+
+        Raises:
+            FileNotFoundError: If no file exists for the hash.
+
+        Examples:
+            >>> payload = ModestDataCache().load(h)  # doctest: +SKIP
+        """
         cache_path = self._cache_path(config_hash)
         if not cache_path.exists():
             raise FileNotFoundError(f"MODEST cache not found: {cache_path}")
@@ -723,6 +969,15 @@ class ModestDataCache:
         return payload
 
     def clear(self, config_hash: str | None = None, confirm: bool = True) -> None:
+        """Delete one cached scene, or all, and their metadata.
+
+        Args:
+            config_hash: Hash to delete, or ``None`` for all.
+            confirm: Ask on the terminal before deleting.
+
+        Examples:
+            >>> ModestDataCache().clear(confirm=False)  # doctest: +SKIP
+        """
         if config_hash is not None:
             cache_path = self._cache_path(config_hash)
             if not cache_path.exists():
@@ -752,6 +1007,16 @@ class ModestDataCache:
         print("  ✓ Cleared all MODEST cache files")
 
     def get_cache_stats(self) -> dict[str, any]:
+        """Number of cached scenes, total size in MB and the stored hashes.
+
+        Returns:
+            Dict with ``cache_dir``, ``entries``, ``total_size_mb``, ``hashes`` and ``backend``.
+
+        Examples:
+            >>> import tempfile
+            >>> ModestDataCache(tempfile.mkdtemp()).get_cache_stats()["entries"]
+            0
+        """
         cache_files = list(self.cache_dir.glob("modest_*.h5"))
         total_size_mb = sum(f.stat().st_size for f in cache_files) / (1024**2)
         return {
@@ -763,6 +1028,11 @@ class ModestDataCache:
         }
 
     def print_cache_info(self):
+        """Print :meth:`get_cache_stats`.
+
+        Examples:
+            >>> ModestDataCache().print_cache_info()  # doctest: +SKIP
+        """
         stats = self.get_cache_stats()
         print("\n" + "=" * 80)
         print("MODEST CACHE STATISTICS".center(80))
@@ -775,6 +1045,7 @@ class ModestDataCache:
 
     @staticmethod
     def _array_like(value):
+        """Plain array from an array or Quantity (units dropped); ``None`` passes through."""
         if value is None:
             return None
         if hasattr(value, 'value'):
@@ -782,10 +1053,12 @@ class ModestDataCache:
         return np.asarray(value)
 
     def _save_hdf5(self, cache_path: Path, payload: dict) -> None:
+        """Write the payload: Stokes dicts as groups, SPINOR as one group per quantity, maps as datasets."""
         with h5py.File(cache_path, 'w') as f:
             f.attrs['backend'] = 'hdf5'
 
             def _save_stokes_dict(name: str, data: dict | None):
+                """Write one Stokes dict as a group of datasets (skipped if ``None``)."""
                 if data is None:
                     return
                 grp = f.create_group(name)
@@ -836,9 +1109,11 @@ class ModestDataCache:
                 f.attrs['sample_pixels_json'] = json.dumps(sample_pixels)
 
     def _load_hdf5(self, cache_path: Path) -> dict:
+        """Read a payload written by :meth:`_save_hdf5`."""
         payload: dict = {}
         with h5py.File(cache_path, 'r') as f:
             def _load_stokes_dict(name: str):
+                """Read one Stokes group, or ``None`` if absent."""
                 if name not in f:
                     return None
                 grp = f[name]

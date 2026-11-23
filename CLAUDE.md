@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**MUISCA** — a physics-informed multi-scale CNN that inverts solar spectropolarimetric observations (Stokes I and V profiles) to recover atmospheric stratifications of temperature (T), line-of-sight velocity (V_LOS), and line-of-sight magnetic field (B_LOS) across 21 optical depth levels.
+**MUISCA** — a physics-informed multi-scale CNN that inverts solar spectropolarimetric observations (Stokes I and V profiles) to recover atmospheric stratifications of temperature (T), line-of-sight velocity (V_LOS), and line-of-sight magnetic field (B_LOS) across 45 optical depth nodes (log τ500 from −3.0 to 1.4, step 0.1).
 
 ## Environment
 
@@ -67,7 +67,7 @@ sbatch tools/fine_tune.sh --experiment-name <name> --variations wfa_only,all_phy
 
 **Tests and docstrings:**
 ```bash
-pytest tests/ --doctest-modules utils/            # synthetic tests + docstring examples
+pytest tests/ --doctest-modules utils/ models/    # synthetic tests + docstring examples
 pytest -m "not data" tests/                       # skip tests that need real MURaM/MODEST/HSRA files
 python tools/check_docstrings.py coverage <files> # Google-style docstring with Args/Examples
 python tools/check_docstrings.py same-code <files> # a docs-only edit left the code unchanged
@@ -89,15 +89,16 @@ MURaM 3D simulation cubes (T, Vz, Bz at geometric height)
 
 ### Model Architecture
 
-`MSCNNInversionModel` (`models/mscnn_model.py`) takes `(batch, 2, 112)` — Stokes I and V at 112 wavelengths — and passes it through `MultiScaleFeatureMapping` which coarse-grains the input at scales 1×, 2×, 3×, applies Conv1d+ReLU+MaxPool at each scale, concatenates features, then passes through 4 dense layers to output `(batch, 63)` = 3 parameters × 21 τ levels.
+`MSCNNInversionModel` (`models/mscnn_model.py`) takes `(batch, 2, 112)` — Stokes I and V at 112 wavelengths — and passes it through `MultiScaleFeatureMapping` which coarse-grains the input at scales 1×, 2×, 3×, applies Conv1d+ReLU+MaxPool at each scale, concatenates features, then passes through 4 dense layers to output `(batch, 135)` = 3 parameters × 45 τ nodes (T, then Vz, then Bz).
 
 `PhysicsInformedMSCNN` (`models/pinn_mscnn_model.py`) extends this base with physics regularization losses.
 
 ### Loss Function
 
 ```
-Total = MSE + λ_WFA × WFA_loss + λ_Doppler × Doppler_loss + λ_Temp × Temp_loss + λ_tail × Huber_tail_loss
+Total = MSE + λ_WFA × WFA_loss + λ_Doppler × Doppler_loss + λ_Temp × Temp_loss
 ```
+Each physics term is an RRMSE between the prediction at one node and the approximation of the same pixel. The Bz tail parameters loaded from the normalizer are not used by any loss term.
 
 Physics approximations live in `utils/physics_utils.py` (`ApproxInversions`):
 - **WFA**: relates Stokes V amplitude to B_LOS via Landé g-factor

@@ -1,3 +1,32 @@
+"""MURaM simulation data: atmospheres, synthetic Stokes profiles and the per-step training Dataset.
+
+Two data sources use this module.
+
+* ``nicole_tau500`` (current). ``scripts/synthesis/generate_tau500_stokes.py`` reads the raw
+  cube with :meth:`MhdData.load_step`, builds its own tau_500 scale
+  (``utils/tau500_opacity.py``) and has NICOLE synthesize the profiles. Training then uses
+  :class:`StokesData` only as a container for the Hinode degradation (LSF, resampling) and
+  :class:`MuramStepDataset` to serve normalized pixels.
+* ``muram_legacy``. :meth:`MhdData.compute_optical_depth` integrates a Rosseland-mean opacity
+  table, :meth:`MhdData.remap_to_optical_depth` moves T, Vz and Bz onto that scale and
+  :meth:`StokesData.load_stokes` reads the older ``stokes_<step>.npy`` cubes.
+
+The module also holds the pixel-selection helpers used during training: granulation and
+polarization region masks, region balancing and |B_LOS|-strength balancing.
+
+Sign conventions (verified on step 110): MURaM Vz is positive upward (granules have
+Vz > 0) and Bz is positive upward, i.e. toward the observer at disk centre.
+
+Examples:
+    Typical training-side use with the ``nicole_tau500`` source (needs the cluster files)::
+
+        stokes, mhd = load_source_arrays(step=110, config=TrainingConfig())
+        stokes.load_hinode_lsf(config.data_path / config.lsf_path)
+        stokes.apply_spectral_convolution()
+        stokes.resample_to_hinode()
+        dataset = MuramStepDataset(stokes.data, mhd, stokes_norm, mhd_norm)
+"""
+
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -20,26 +49,28 @@ from utils.normalizer import MhdNormalizer, StokesNormalizer
 
 
 class MhdData:
-    """
-    Class for loading, processing, and visualizing MURAM MHD simulation data.
-    
-    Handles:
-    - Loading simulation steps
-    - Computing optical depth stratification
-    - Remapping to optical depth coordinates
-    - Visualization (surfaces and slices)
+    """Load a MURaM snapshot and, on the legacy path, put it on an optical-depth scale.
+
+    Arrays are ``(nx, ny, nz)`` astropy Quantities in ``self.data`` (geometric height,
+    z index increasing upward, 10 km per layer) and ``(nx, ny, n_logtau)`` Quantities in
+    ``self.od_data`` after :meth:`remap_to_optical_depth`.
+
+    Attributes:
+        data: ``T`` (K), ``P`` (dyn cm^-2), ``rho`` (g cm^-3), ``Vz`` (km/s) and ``Bz`` (G).
+        logtau: log10 tau per cell, ``(nx, ny, nz)``, after :meth:`compute_optical_depth`.
+        od_data: Quantities remapped to the requested log tau grid.
+        z0: Index of the layer whose horizontal mean T is closest to 5780 K.
+        height_levels: Height of each layer relative to ``z0``, in km.
     """
     
     def __init__(self, data_path: str, nx: int = 480, ny: int = 480, nz: int = 256):
-        """
-        Initialize MURAM MHD data processor.
-        
-        Parameters
-        ----------
-        data_path : str
-            Path to the MURAM simulation data directory
-        nx, ny, nz : int
-            Grid dimensions
+        """Set up an empty container for one MURaM run.
+
+        Args:
+            data_path: Folder holding the ``eos.NNN000`` and ``result_k.NNN000`` files.
+            nx: Number of cells along x in the files (480 for this run, 25 km each).
+            ny: Number of cells along y.
+            nz: Number of layers along the vertical in the files (256, 10 km each).
         """
         self.data_path = Path(data_path)
         self.nx = nx
@@ -61,41 +92,61 @@ class MhdData:
     
     @staticmethod
     def to_value(quantity, target_unit):
-        """
-        Extract numeric value from an Astropy Quantity with explicit unit conversion.
-        If quantity is already numeric (no .to() method), return as-is.
-        
-        Parameters
-        ----------
-        quantity : Quantity or float
-            The value to extract.
-        target_unit : Quantity
-            The unit to convert to (e.g., u.cm).
-        
-        Returns
-        -------
-        float
-            The numeric value in the target unit.
+        """Return the number of ``quantity`` in ``target_unit``, or ``quantity`` itself if it has no unit.
+
+        Args:
+            quantity: An astropy Quantity, or a plain number already in ``target_unit``.
+            target_unit: Unit to convert to, e.g. ``u.cm``.
+
+        Returns:
+            The magnitude in ``target_unit`` (plain numbers pass through unchanged).
+
+        Examples:
+            >>> import astropy.units as u
+            >>> MhdData.to_value(10 * u.km, u.cm)
+            1000000.0
+            >>> MhdData.to_value(2.5, u.cm)
+            2.5
         """
         if hasattr(quantity, 'to'):
             return quantity.to(target_unit).value
         return quantity
         
     def load_step(self, step: Union[int, str], z_max: Optional[int] = None) -> Dict[str, np.ndarray]:
-        """
-        Load a simulation step.
-        
-        Parameters
-        ----------
-        step : int or str
-            Step number (e.g., 52 or '052' or '052000')
-        z_max : int, optional
-            Keep only z indices 0..z_max-1 (drop top layers)
-            
-        Returns
-        -------
-        dict
-            Dictionary with arrays: T, P, rho, Vz, Bz
+        """Read one snapshot (T, P, rho, Vz, Bz) from the raw MURaM binaries.
+
+        Reads ``eos`` (T, P), ``result_0`` (rho), ``result_2`` (rho times the vertical
+        velocity) and ``result_6`` (vertical field). The files are float32 in
+        ``(nx, nz, ny)`` order and are transposed to ``(nx, ny, nz)``. Derived fields are
+        ``Vz = result_2 / rho / 1e5`` (cm/s to km/s) and ``Bz = result_6 * sqrt(4 pi)``
+        (code units to G). Also sets ``z0`` and ``height_levels``.
+
+        Note:
+            Vz is positive upward. NICOLE's v_LOS is positive for a redshift, so the
+            velocity handed to NICOLE must be ``-Vz``. The current synthesis passes Vz
+            unchanged, which makes granules redshifted in the training profiles; this is
+            fixed in the reframe plan, Phase 1a. The horizontal field (``result_7`` for Bx,
+            ``result_5`` for By, verified with div B) is not read yet.
+
+        Args:
+            step: Snapshot number. ``110``, ``"110"`` and ``"110000"`` all select the files
+                ending in ``.110000``.
+            z_max: Keep only layers ``0 .. z_max - 1`` (drops the top of the box). ``None``
+                keeps all ``nz`` layers.
+
+        Returns:
+            ``self.data``, a dict of ``(nx, ny, nz)`` Quantities: ``T`` (K), ``P``
+            (dyn cm^-2), ``rho`` (g cm^-3), ``Vz`` (km/s) and ``Bz`` (G).
+
+        Raises:
+            FileNotFoundError: If one of the four required files is missing.
+            ValueError: If ``z_max`` is not in ``1 .. nz``.
+
+        Examples:
+            >>> mhd = MhdData("data/muram-simulation/")  # doctest: +SKIP
+            >>> data = mhd.load_step(110)                 # doctest: +SKIP
+            >>> data["T"].shape, data["Bz"].unit          # doctest: +SKIP
+            ((480, 480, 256), Unit("G"))
         """
         # Normalize step -> suffix "NNN000"
         if isinstance(step, int):
@@ -110,6 +161,7 @@ class MhdData:
                 suffix = s
         
         def _path(name):
+            """Path of file ``name`` for this step, e.g. ``result_0.110000``."""
             return self.data_path / f"{name}.{suffix}"
         
         # Check required files
@@ -129,6 +181,7 @@ class MhdData:
         
         # Helper to read 3D fields (nx, nz, ny)
         def _read3(name):
+            """Read a float32 ``(nx, nz, ny)`` file and return it as ``(nx, ny, nz)``."""
             arr = np.fromfile(str(_path(name)), dtype=np.float32)
             arr = arr.reshape((self.nx, self.nz, self.ny), order="C")
             return arr.transpose(0, 2, 1)
@@ -172,7 +225,7 @@ class MhdData:
         return self.data
     
     def _compute_reference_layer(self, height_step_km: float = 10.0):
-        """Compute reference z-layer where T ~ 5780 K and height levels."""
+        """Set ``z0`` (layer with mean T closest to 5780 K) and ``height_levels`` in km relative to it."""
         if "T" not in self.data:
             raise ValueError("Temperature data not loaded")
         
@@ -184,13 +237,23 @@ class MhdData:
         print(f"  Reference layer (T ~ 5780 K) at z-index {self.z0}")
     
     def load_opacity_table(self, kappa_path: str):
-        """
-        Load and prepare opacity interpolator.
-        
-        Parameters
-        ----------
-        kappa_path : str
-            Path to kappa.0.dat file
+        """Build the Rosseland-mean opacity interpolator kappa(log P, log T) (legacy path only).
+
+        The table ``kappa.0.dat`` has three columns: temperature index, pressure index and
+        opacity in cm^2 g^-1. The indices refer to a fixed grid of 56 values of log10 T (K)
+        from 3.32 to 5.30 and 21 values of log10 P (dyn cm^-2) from -2 to 8. The
+        interpolation is linear in (log P, log T).
+
+        Args:
+            kappa_path: Path to ``kappa.0.dat`` (in the repository at ``data/csv/``).
+
+        Examples:
+            >>> import contextlib, io
+            >>> mhd = MhdData(".")
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     mhd.load_opacity_table("data/csv/kappa.0.dat")  # doctest: +SKIP
+            >>> float(mhd.kappa_interp([[5.0, 3.76]])[0])  # doctest: +SKIP
+            0.75...
         """
         # Temperature and pressure grid from opacity table
         tab_T = np.array([3.32, 3.34, 3.36, 3.38, 3.40, 3.42, 3.44, 3.46, 3.48, 3.50,
@@ -224,21 +287,31 @@ class MhdData:
         print(f"  P range: [{Pk.min():.3f}, {Pk.max():.3f}] (log10 dyne/cm²)")
     
     def compute_optical_depth(self, dz=10*u.km, baseline: float = 1e-5) -> np.ndarray:
-        """
-        Compute log10(optical depth) for loaded data.
-        
-        Parameters
-        ----------
-        dz : Quantity or float
-            Height step. Can be a Quantity (e.g., 10*u.km) or numeric value in cm.
-            Default is 10 km. Will be converted to cm internally.
-        baseline : float
-            Minimum tau value for clipping
-            
-        Returns
-        -------
-        np.ndarray
-            log10(tau) array with shape (nx, ny, nz)
+        """Integrate tau(z) = integral of kappa rho dz from the top of the box down (legacy path only).
+
+        kappa comes from :meth:`load_opacity_table` with T and P clipped to the table range.
+        The integral uses the trapezoidal rule along z from the top layer (tau = 0) to the
+        bottom, and tau is clipped at 1e-30 before taking log10, so the top layer has
+        log tau = -30.
+
+        Note:
+            This Rosseland-mean scale is not the tau_500 scale used by the ``nicole_tau500``
+            data, which ``generate_tau500_stokes.py`` builds from the H- opacity at 5000 A.
+
+        Args:
+            dz: Layer thickness, as a Quantity (default 10 km) or a number in cm.
+            baseline: Unused; kept for backward compatibility.
+
+        Returns:
+            log10 tau, ``(nx, ny, nz)``, also stored in ``self.logtau``.
+
+        Raises:
+            ValueError: If the opacity table or T, P, rho are not loaded, or if a
+                non-positive tau appears.
+
+        Examples:
+            >>> mhd.load_opacity_table("data/csv/kappa.0.dat")  # doctest: +SKIP
+            >>> logtau = mhd.compute_optical_depth(dz=10 * u.km)  # doctest: +SKIP
         """
         if self.kappa_interp is None:
             raise ValueError("Opacity interpolator not loaded. Call load_opacity_table() first.")
@@ -290,20 +363,32 @@ class MhdData:
     
     def remap_to_optical_depth(self, new_logtau: np.ndarray, 
                                 quantities: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
-        """
-        Remap quantities from geometric height to optical depth coordinates.
-        
-        Parameters
-        ----------
-        new_logtau : np.ndarray
-            New optical depth grid (e.g., np.arange(-2.0, 0.1, 0.1))
-        quantities : list of str, optional
-            Quantities to remap (default: ["T", "Vz", "Bz"])
-            
-        Returns
-        -------
-        dict
-            Remapped quantities with shape (nx, ny, n_logtau)
+        """Move quantities from geometric height to a log tau grid, column by column.
+
+        Each (x, y) column is linearly interpolated in log tau (``interp1d``, linear,
+        extrapolating outside the column's range).
+
+        Args:
+            new_logtau: Target log tau values, e.g. ``np.arange(-3.0, 1.45, 0.1)``.
+            quantities: Keys of ``self.data`` to remap. Default ``["T", "Vz", "Bz"]``.
+                Missing keys are skipped with a message.
+
+        Returns:
+            ``self.od_data``: Quantities of shape ``(nx, ny, len(new_logtau))`` with the same
+            units as in ``self.data``.
+
+        Raises:
+            ValueError: If :meth:`compute_optical_depth` has not been run.
+
+        Examples:
+            >>> import contextlib, io
+            >>> mhd = MhdData(".", nx=1, ny=1, nz=4)
+            >>> mhd.logtau = np.array([[[1.0, 0.0, -1.0, -2.0]]])          # z up, tau down
+            >>> mhd.data = {"T": np.array([[[7000.0, 6000.0, 5000.0, 4000.0]]]) * u.K}
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     od = mhd.remap_to_optical_depth(np.array([-1.5, 0.5]), ["T"])
+            >>> od["T"].value.ravel().tolist(), od["T"].unit
+            ([4500.0, 6500.0], Unit("K"))
         """
         if self.logtau is None:
             raise ValueError("Optical depth not computed. Call compute_optical_depth() first.")
@@ -349,37 +434,34 @@ class MhdData:
                       limit_values: Optional[Dict[str, Tuple[float, float]]] = None,
                       save_dir: Optional[str] = None, dpi: int = 150,
                       return_figs: bool = False):
-        """
-        Plot 2D surfaces and vertical profiles or histograms for each quantity.
-        
-        Parameters
-        ----------
-        z_idx : int
-            Z-index for surface plot
-        data_source : str
-            "geometric" or "optical_depth"
-        zero_height : bool
-            Show zero height marker (T ~ 5780 K)
-        pixel_size_km : float
-            Pixel size for scale bar
-        quantities : list of str, optional
-            Quantities to plot
-        second_plot : str
-            Type of second plot: "profile" or "histogram"
-        default_cmap : str
-            Default colormap
-        limit_values : dict, optional
-            {quantity: (vmin, vmax)} for color limits
-        save_dir : str, optional
-            Directory to save figures
-        dpi : int
-            Figure DPI
-        return_figs : bool
-            If True, return list of (quantity, figure) tuples
-            
-        Returns
-        -------
-        list of (str, Figure) or None
+        """Plot a horizontal map of each quantity at one layer, next to its mean profile or histogram.
+
+        rho and P are shown in log10. Signed quantities (B, v) get a symmetric colour range
+        from their 1st and 99th percentiles unless ``limit_values`` is given.
+
+        Args:
+            z_idx: Layer (geometric) or log tau index (optical depth) to map.
+            data_source: ``"geometric"`` for ``self.data`` or ``"optical_depth"`` for
+                ``self.od_data``.
+            zero_height: Mark the T = 5780 K reference height on the profile panel.
+            pixel_size_km: Horizontal cell size for the scale bar, in km.
+            quantities: Keys to plot. Default: all keys of the chosen data.
+            second_plot: ``"profile"`` (horizontal mean against height) or ``"histogram"``
+                (values at ``z_idx``).
+            default_cmap: Colormap for quantities without a preset one.
+            limit_values: ``{key: (vmin, vmax)}`` colour limits in the quantity's units.
+            save_dir: Save PNGs there instead of showing them.
+            dpi: Resolution of saved figures.
+            return_figs: Return the figures instead of showing or saving them.
+
+        Returns:
+            A list of ``(key, Figure)`` if ``return_figs``; otherwise ``None``.
+
+        Raises:
+            ValueError: For an unknown ``data_source`` or ``second_plot``.
+
+        Examples:
+            >>> figs = mhd.plot_surfaces(z_idx=190, quantities=["T"], return_figs=True)  # doctest: +SKIP
         """
         if data_source == "geometric":
             data = self.data
@@ -518,33 +600,24 @@ class MhdData:
                     figsize: Tuple[int, int] = (7, 8),
                     save_dir: Optional[str] = None, dpi: int = 150,
                     return_figs: bool = False):
-        """
-        Plot vertical slices (y, z) with optical depth contour.
-        
-        Parameters
-        ----------
-        x_idx : int
-            X-index for slice
-        pixel_size_km : float
-            Pixel size for scale bar
-        quantities : list of str, optional
-            Quantities to plot
-        default_cmap : str
-            Default colormap
-        dz_km : float
-            Height step in km
-        figsize : tuple
-            Figure size
-        save_dir : str, optional
-            Directory to save figures
-        dpi : int
-            Figure DPI
-        return_figs : bool
-            If True, return list of (quantity, figure) tuples
-            
-        Returns
-        -------
-        list of (str, Figure) or None
+        """Plot vertical (y, z) slices at one x, with the log tau = 0 contour and the T = 5780 K layer.
+
+        Args:
+            x_idx: Column index along x.
+            pixel_size_km: Horizontal cell size for the scale bar, in km.
+            quantities: Keys of ``self.data`` to plot. Default: all.
+            default_cmap: Colormap for quantities without a preset one.
+            dz_km: Layer thickness in km, for the height ticks when ``height_levels`` is unset.
+            figsize: Figure size in inches.
+            save_dir: Save PNGs there instead of showing them.
+            dpi: Resolution of saved figures.
+            return_figs: Return the figures instead of showing or saving them.
+
+        Returns:
+            A list of ``(key, Figure)`` if ``return_figs``; otherwise ``None``.
+
+        Examples:
+            >>> figs = mhd.plot_slices(x_idx=120, quantities=["Vz"], return_figs=True)  # doctest: +SKIP
         """
         if quantities is None:
             quantities = list(self.data.keys())
@@ -672,27 +745,24 @@ class MhdData:
                                 save_dir: Optional[str] = None,
                                 dpi: int = 150,
                                 return_figs: bool = False):
-        """
-        Plot median values of optical depth data versus log(tau) levels.
-        
-        Parameters
-        ----------
-        new_logtau : np.ndarray
-            Optical depth grid values
-        quantities : list of str, optional
-            Quantities to plot (default: all in od_data)
-        figsize : tuple
-            Figure size
-        save_dir : str, optional
-            Directory to save figures
-        dpi : int
-            Figure DPI
-        return_figs : bool
-            If True, return list of (quantity, figure) tuples
-            
-        Returns
-        -------
-        list of (str, Figure) or None
+        """Plot the horizontal median of each remapped quantity against log tau.
+
+        Args:
+            new_logtau: The log tau grid used in :meth:`remap_to_optical_depth`.
+            quantities: Keys of ``self.od_data`` to plot. Default: all.
+            figsize: Figure size in inches.
+            save_dir: Save PNGs there instead of showing them.
+            dpi: Resolution of saved figures.
+            return_figs: Return the figures instead of showing or saving them.
+
+        Returns:
+            A list of ``(key, Figure)`` if ``return_figs``; otherwise ``None``.
+
+        Raises:
+            ValueError: If :meth:`remap_to_optical_depth` has not been run.
+
+        Examples:
+            >>> figs = mhd.plot_medians_vs_logtau(new_logtau, ["T"], return_figs=True)  # doctest: +SKIP
         """
         if not self.od_data:
             raise ValueError("No optical depth data available. Call remap_to_optical_depth() first.")
@@ -821,23 +891,32 @@ logtau = mhd.logtau  # Optical depth map
 # StokesData class
 # ============================================================================
 class StokesData:
-    """
-    Class for loading, processing, and visualizing Stokes polarimetric data from MURaM simulations.
-    
-    Handles:
-    - Loading Stokes cubes (I, Q, U, V)
-    - Continuum normalization
-    - Spectropolarimetry calculations
-    - Spectral convolution with LSF
-    - Resampling to Hinode/SP wavelengths
-    - Optional: Adding realistic Hinode noise
-    - Visualization of spectra and polarimetric maps
-    
-    The final stokes array (self.data) is progressively processed and adapted for Hinode.
+    """Synthetic Stokes profiles of one MURaM step and their degradation to Hinode/SP.
+
+    ``self.data`` maps ``"I"``, ``"Q"``, ``"U"``, ``"V"`` to ``(nx, ny, n_wl)`` arrays on
+    ``self.wl`` (Angstrom). The training pipeline applies, in order,
+    :meth:`load_hinode_lsf`, :meth:`apply_spectral_convolution` and
+    :meth:`resample_to_hinode`, which leaves 112 points on the Hinode grid.
+    :meth:`add_hinode_noise` exists but is not called by training yet.
+
+    Attributes:
+        wl: Current wavelength axis in Angstrom (synthesis grid, then the Hinode grid).
+        mean_continuum: Continuum map ``(nx, ny)`` in units of the reference continuum.
+        circular_polarization: Map of mean |V| / I over wavelength (dimensionless).
+        lsf_kernel: Spectral LSF sampled at the synthesis step, normalized to sum 1.
     """
     
     def __init__(self, data_dir: str, step: Union[int, str], wavelength_range: Tuple[float, float] = (6300.5, 6303.5), 
                  wavelength_step: float = 0.01):
+        """Set up an empty container for one step.
+
+        Args:
+            data_dir: Folder with ``stokes_<step>.npy`` (legacy source).
+            step: Step number; see :meth:`_normalize_step`.
+            wavelength_range: First and end wavelength of the synthesis grid in Angstrom
+                (the end is excluded, as in ``np.arange``).
+            wavelength_step: Synthesis sampling in Angstrom (10 mA for the NICOLE data).
+        """
         self.data_dir = Path(data_dir)
         self.step = self._normalize_step(step)
         self.wl = np.arange(wavelength_range[0], wavelength_range[1], wavelength_step)
@@ -851,6 +930,7 @@ class StokesData:
         self.nwl: Optional[int] = None
 
     def _normalize_step(self, step: Union[int, str]) -> str:
+        """Return the six-digit file suffix of a step: ``110`` or ``"110"`` gives ``"110000"``."""
         if isinstance(step, int):
             return f"{step:03d}000"
         else:
@@ -863,6 +943,22 @@ class StokesData:
                 return s
 
     def load_stokes(self) -> Dict[str, np.ndarray]:
+        """Load the legacy ``stokes_<step>.npy`` cube into I, Q, U, V (legacy source only).
+
+        The file is ``(nx, ny, n_wl, 4)``. Each map is rotated by 90 degrees and flipped
+        to match the orientation of the MHD arrays.
+
+        Returns:
+            ``self.data`` with ``(nx, ny, n_wl)`` arrays for I, Q, U and V.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+
+        Examples:
+            >>> s = StokesData("data/muram-simulation/", 110)  # doctest: +SKIP
+            >>> s.load_stokes()["I"].shape                       # doctest: +SKIP
+            (480, 480, 300)
+        """
         stokes_path = self.data_dir / f"stokes_{self.step}.npy"
         if not stokes_path.exists():
             raise FileNotFoundError(f"Stokes file not found: {stokes_path}")
@@ -887,6 +983,31 @@ class StokesData:
         cont_indices: Optional[List[int]] = None,
         fixed_ic: Optional[float] = None,
     ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """Divide all four Stokes parameters by one continuum level and store the continuum map.
+
+        Args:
+            cont_indices: Wavelength indices treated as continuum. Default ``[0, 1, 2, 3]``.
+            fixed_ic: Continuum level to divide by, in the file's intensity units. ``None``
+                uses this step's spatial mean over ``cont_indices``, so the step's mean
+                continuum becomes exactly 1.
+
+        Returns:
+            ``(self.data, mean_continuum)``, where ``mean_continuum`` is the ``(nx, ny)``
+            continuum map after normalization.
+
+        Raises:
+            ValueError: If no data are loaded, ``cont_indices`` is empty or not 1-D, or
+                ``fixed_ic`` is not finite and positive.
+
+        Examples:
+            >>> import contextlib, io
+            >>> s = StokesData(".", 110)
+            >>> s.data = {"I": np.full((2, 2, 5), 4.0), "V": np.full((2, 2, 5), 0.4)}
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     data, cont = s.continuum_normalization()
+            >>> float(cont.mean()), float(data["V"][0, 0, 0])
+            (1.0, 0.1)
+        """
         if not self.data:
             raise ValueError("Stokes data not loaded. Call load_stokes() first.")
         if cont_indices is None:
@@ -915,6 +1036,25 @@ class StokesData:
         return self.data, mean_continuum
 
     def spectropolarimetry(self, stokes_data: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
+        """Map of circular polarization, the wavelength mean of |V| / I (dimensionless).
+
+        I is floored at 1e-10 to avoid division by zero.
+
+        Args:
+            stokes_data: Dict with ``"I"`` and ``"V"``. Default ``self.data``.
+
+        Returns:
+            ``(nx, ny)`` array, also stored in ``self.circular_polarization``.
+
+        Raises:
+            ValueError: If I or V is missing.
+
+        Examples:
+            >>> s = StokesData(".", 110)
+            >>> I = np.ones((1, 1, 4)); V = np.array([[[0.02, -0.02, 0.0, 0.0]]])
+            >>> s.spectropolarimetry({"I": I, "V": V}).tolist()
+            [[0.01]]
+        """
         if stokes_data is None:
             stokes_data = self.data
         if "V" not in stokes_data or "I" not in stokes_data:
@@ -929,9 +1069,41 @@ class StokesData:
         return circular_pol
 
     def rms_calculation(self, data: np.ndarray) -> float:
+        """Relative RMS (contrast) of a map: std / mean, dimensionless.
+
+        Args:
+            data: Any array, e.g. the continuum map.
+
+        Returns:
+            The population standard deviation divided by the mean.
+
+        Examples:
+            >>> StokesData(".", 110).rms_calculation(np.array([0.9, 1.1]))
+            0.1...
+        """
         return np.sqrt(np.mean((data - data.mean())**2)) / data.mean()
 
     def load_hinode_lsf(self, lsf_path: str) -> np.ndarray:
+        """Read the Hinode/SP spectral LSF and resample it to the synthesis step.
+
+        The file has two columns, offset from line centre (A) and response. The response is
+        normalized, interpolated with a cubic spline on the synthesis step between the file's
+        ends minus 10 mA, and normalized again to sum 1. With the shipped file and a 10 mA
+        step the kernel has 13 points and its centroid sits 0.0075 samples from the centre,
+        i.e. it shifts a line by about 0.004 km/s.
+
+        Args:
+            lsf_path: Path to ``hinode_sp.spline.psf``.
+
+        Returns:
+            The kernel, also stored in ``self.lsf_kernel``.
+
+        Examples:
+            >>> s = StokesData(".", 110)
+            >>> k = s.load_hinode_lsf("data/hinode-MODEST/PSFs/hinode_sp.spline.psf")  # doctest: +SKIP
+            >>> k.size, round(float(k.sum()), 6)  # doctest: +SKIP
+            (13, 1.0)
+        """
         print(f"Loading Hinode LSF from {lsf_path}")
         lsf_data = pd.read_csv(lsf_path, sep=r"\s+", header=None)
         lsf_wl_orig = lsf_data[0].values
@@ -950,6 +1122,28 @@ class StokesData:
         return self.lsf_kernel
 
     def apply_spectral_convolution(self) -> Dict[str, np.ndarray]:
+        """Convolve every Stokes parameter with the LSF along wavelength.
+
+        Uses ``scipy.ndimage.convolve1d`` with ``mode="wrap"``: the spectrum is treated as
+        periodic, so the first and last few samples mix with each other. This is harmless
+        when both ends of the synthesis window are continuum.
+
+        Returns:
+            ``self.data`` with the convolved arrays (same shapes).
+
+        Raises:
+            ValueError: If no data or no kernel is loaded.
+
+        Examples:
+            >>> import contextlib, io
+            >>> s = StokesData(".", 110)
+            >>> s.data = {"I": np.ones((1, 1, 8))}
+            >>> s.lsf_kernel = np.array([0.25, 0.5, 0.25])
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     out = s.apply_spectral_convolution()
+            >>> out["I"].ravel().tolist() == [1.0] * 8   # a flat spectrum stays flat
+            True
+        """
         if not self.data:
             raise ValueError("Stokes data not loaded. Call load_stokes() first.")
         if self.lsf_kernel is None:
@@ -967,19 +1161,32 @@ class StokesData:
         return self.data
 
     def resample_to_hinode(self, hinode_wl: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
-        """Resample the synthesized profiles onto the Hinode/SOT-SP spectral grid.
+        """Resample the synthesized profiles onto the Hinode/SOT-SP spectral grid (112 points).
 
-        The grid defaults to utils.hinode_wavelengths.hinode_wavelength_grid(), i.e.
-        it is derived from the MODEST FITS header -- the same axis the real
-        observations are loaded on. Pass `hinode_wl` only to override with an
-        explicit array.
+        The grid defaults to :func:`utils.hinode_wavelengths.hinode_wavelength_grid`, which is
+        derived from the MODEST FITS header, the same axis the real observations are loaded
+        on. Interpolation is cubic along wavelength.
 
-        This used to build the grid from a hardcoded
-        CRVAL1=6302.0/CDELT1=0.0215/CRPIX1=57 triple, which yielded
-        [6300.7960, 6303.1825] A while the observations were loaded on
-        [6300.8736, 6303.2576] A. That 0.0776 A disagreement (~3.6 spectral
-        pixels) made every model trained here read a spurious ~3.7 km/s
-        blueshift when applied to real MODEST data.
+        This used to build the grid from a hardcoded CRVAL1=6302.0, CDELT1=0.0215,
+        CRPIX1=57 triple, which gave [6300.7960, 6303.1825] A while the observations are on
+        [6300.8736, 6303.2576] A. That 0.0776 A disagreement (about 3.6 spectral pixels)
+        made every model trained here read a spurious 3.7 km/s blueshift on MODEST data.
+
+        Args:
+            hinode_wl: Explicit target grid in Angstrom. It must equal the FITS-derived grid
+                to 1e-9 A; the argument exists only for callers that already hold it.
+
+        Returns:
+            ``self.data`` with ``(nx, ny, 112)`` arrays; ``self.wl`` becomes the Hinode grid.
+
+        Raises:
+            ValueError: If no data are loaded.
+            AssertionError: If ``hinode_wl`` differs from the FITS-derived grid, or if the
+                synthesis grid does not cover it (the cubic interpolation would extrapolate).
+
+        Examples:
+            >>> s.resample_to_hinode()["I"].shape  # doctest: +SKIP
+            (480, 480, 112)
         """
         if not self.data:
             raise ValueError("No Stokes data available. Call load_stokes() first.")
@@ -1026,6 +1233,32 @@ class StokesData:
 
     def add_hinode_noise(self, noise_level: float = 5.9e-4, 
                         continuum_intensity: Optional[float] = None) -> Dict[str, np.ndarray]:
+        """Add white Gaussian noise with sigma = ``noise_level`` times the continuum to all parameters.
+
+        The same sigma is used for I, Q, U and V, and a new realization is drawn on every
+        call (``np.random``, not seeded). Training does not call this yet.
+
+        Args:
+            noise_level: Noise as a fraction of the continuum (5.9e-4 by default).
+            continuum_intensity: Continuum level in the data's units. Default: the mean of I
+                over all pixels and wavelengths.
+
+        Returns:
+            ``self.data`` with noise added.
+
+        Raises:
+            ValueError: If no data are loaded.
+
+        Examples:
+            >>> import contextlib, io
+            >>> s = StokesData(".", 110)
+            >>> s.data = {"V": np.zeros((50, 50, 20))}
+            >>> s.nx, s.ny, s.nwl = 50, 50, 20
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     _ = s.add_hinode_noise(1e-3, continuum_intensity=1.0)
+            >>> bool(abs(s.data["V"].std() - 1e-3) < 5e-5)
+            True
+        """
         if not self.data:
             raise ValueError("Stokes data not available. Call resample_to_hinode() first.")
         if continuum_intensity is None:
@@ -1043,6 +1276,20 @@ class StokesData:
 
     def plot_selected_pixel(self, x: int, y: int, 
                            save_dir: Optional[str] = None, dpi: int = 300) -> None:
+        """Show the map of I at the first wavelength with a box around pixel (x, y).
+
+        Args:
+            x: Pixel index along the first axis.
+            y: Pixel index along the second axis.
+            save_dir: Save ``selected_pixel.png`` there instead of showing it.
+            dpi: Resolution of the saved figure.
+
+        Raises:
+            ValueError: If I is not loaded.
+
+        Examples:
+            >>> s.plot_selected_pixel(100, 200, save_dir="figs")  # doctest: +SKIP
+        """
         if "I" not in self.data:
             raise ValueError("Stokes I not loaded. Call load_stokes() first.")
         fig, ax = plt.subplots(figsize=(5, 5))
@@ -1070,7 +1317,26 @@ class StokesData:
                     wl_index_range: Optional[Tuple[int, int]] = None,
                     scatter: bool = False,
                     **kwargs):
-        """Plot Stokes I and V for a given pixel on provided axes."""
+        """Plot I and V of pixel (x, y) on two given axes.
+
+        Args:
+            ax: Sequence of two Matplotlib axes, for I and V.
+            x: Pixel index along the first axis.
+            y: Pixel index along the second axis.
+            wl_index_range: ``(start, stop)`` wavelength indices to plot. Default: all.
+            scatter: Draw points instead of lines.
+            **kwargs: Passed to ``plot`` or ``scatter`` (e.g. ``label``).
+
+        Returns:
+            The axes.
+
+        Raises:
+            ValueError: If I or V is not loaded.
+
+        Examples:
+            >>> fig, ax = plt.subplots(1, 2)                  # doctest: +SKIP
+            >>> s.plot_stokes(ax, 100, 200, label="MURaM")    # doctest: +SKIP
+        """
         if "I" not in self.data or "V" not in self.data:
             raise ValueError("Stokes I and V must be loaded. Call load_stokes() first.")
 
@@ -1104,7 +1370,24 @@ class StokesData:
         save_dir: Optional[str] = None,
         dpi: int = 150,
     ) -> None:
-        """Plot continuum and circular polarization maps with optional RMS labels."""
+        """Plot the continuum and circular-polarization maps side by side, with their relative RMS.
+
+        Args:
+            continuum_map: ``(nx, ny)`` map. Default ``self.mean_continuum``.
+            polarization_map: ``(nx, ny)`` map. Default ``self.circular_polarization``.
+            titles: Panel titles.
+            rms_values: Values printed in the titles. Default: :meth:`rms_calculation` of
+                each map.
+            quantiles: Lower and upper quantiles that set the polarization colour range.
+            save_dir: Save ``polarizations.png`` there instead of showing it.
+            dpi: Resolution of the saved figure.
+
+        Raises:
+            ValueError: If either map is unavailable.
+
+        Examples:
+            >>> s.plot_polarizations(save_dir="figs")  # doctest: +SKIP
+        """
         continuum = continuum_map if continuum_map is not None else self.mean_continuum
         polarization = polarization_map if polarization_map is not None else self.circular_polarization
 
@@ -1153,7 +1436,23 @@ class StokesData:
 
 
 def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
-    """Compute Otsu threshold for finite values using numpy only."""
+    """Otsu threshold of the finite values: the cut that maximizes the between-class variance.
+
+    Args:
+        values: Any array; NaN and inf are ignored.
+        n_bins: Number of histogram bins.
+
+    Returns:
+        The threshold, a histogram bin centre. A constant array returns its value.
+
+    Raises:
+        ValueError: If there are no finite values.
+
+    Examples:
+        >>> x = np.concatenate([np.full(100, 0.8), np.full(100, 1.2)])
+        >>> 0.8 < _otsu_threshold(x) < 1.2
+        True
+    """
     arr = np.asarray(values, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
@@ -1182,12 +1481,32 @@ def build_granulation_polarization_masks(
     continuum_threshold: Optional[float] = None,
     polarization_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Build granular/intergranular and strong/weak circular-polarization masks.
+    """Split pixels into four regions: granular or intergranular, crossed with strong or weak polarization.
 
-    Notebook-consistent rules:
-    - granular: mean_continuum > Otsu(mean_continuum)
-    - weak polarization: circular_polarization < Otsu(circular_polarization)
+    A pixel is granular if its continuum is above the threshold, and weakly polarized if
+    its circular polarization is below the threshold. Thresholds default to the Otsu
+    threshold of each map.
+
+    Args:
+        mean_continuum: Continuum map ``(nx, ny)``, normalized intensity.
+        circular_polarization: Map of mean |V| / I, same shape.
+        continuum_threshold: Fixed continuum threshold instead of Otsu.
+        polarization_threshold: Fixed polarization threshold instead of Otsu.
+
+    Returns:
+        Dict with ``continuum_threshold``, ``polarization_threshold``, ``masks`` (four
+        boolean maps: ``granular_strong``, ``intergranular_strong``, ``granular_weak``,
+        ``intergranular_weak``) and ``counts`` (pixels per mask).
+
+    Raises:
+        ValueError: If the two maps have different shapes.
+
+    Examples:
+        >>> cont = np.array([[1.1, 0.9], [1.1, 0.9]])
+        >>> pol = np.array([[0.01, 0.01], [0.10, 0.10]])
+        >>> out = build_granulation_polarization_masks(cont, pol, 1.0, 0.05)
+        >>> out["counts"]
+        {'granular_strong': 1, 'intergranular_strong': 1, 'granular_weak': 1, 'intergranular_weak': 1}
     """
     mean_continuum = np.asarray(mean_continuum)
     circular_polarization = np.asarray(circular_polarization)
@@ -1226,7 +1545,34 @@ def build_balanced_region_indices(
     region_masks: Dict[str, np.ndarray],
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[np.ndarray, Dict[str, Dict[str, int]]]:
-    """Return flattened indices with equal samples in the 4 region masks."""
+    """Draw the same number of pixels from each of the four region masks.
+
+    Each region contributes as many pixels as the smallest one has, drawn without
+    replacement; the result is shuffled.
+
+    Args:
+        region_masks: The four boolean maps from :func:`build_granulation_polarization_masks`.
+        rng: Random generator. Default: a fresh unseeded one.
+
+    Returns:
+        ``(indices, info)``: flattened pixel indices (int64) and a dict with
+        ``counts_before`` and ``counts_after`` per region.
+
+    Raises:
+        KeyError: If a region mask is missing.
+        ValueError: If a region is empty.
+
+    Examples:
+        >>> masks = {k: np.zeros((3, 3), bool) for k in
+        ...          ["granular_strong", "intergranular_strong", "granular_weak", "intergranular_weak"]}
+        >>> masks["granular_strong"][0] = True          # 3 pixels
+        >>> masks["intergranular_strong"][1, :2] = True  # 2 pixels
+        >>> masks["granular_weak"][2, 0] = True          # 1 pixel
+        >>> masks["intergranular_weak"][2, 1:] = True    # 2 pixels
+        >>> idx, info = build_balanced_region_indices(masks, np.random.default_rng(0))
+        >>> idx.size, info["counts_after"]["granular_strong"]
+        (4, 1)
+    """
     required = [
         "granular_strong",
         "intergranular_strong",
@@ -1269,23 +1615,43 @@ def build_bz_balance_bin_edges(
     balance_cap: Optional[float] = None,
     bin_scale: str = "log",
 ) -> Tuple[np.ndarray, float]:
-    """Bin edges for |B_LOS|-strength balancing. Returns (edges, cap).
+    """Bin edges for |B_LOS|-strength balancing. Returns ``(edges, cap)``.
 
     Shared by the per-step and global balancers so the two cannot drift apart.
 
-    `bin_scale` matters more than it looks, because MURaM's |Bz| spans four decades with
-    ~90% of pixels under 100 G:
-      - "linear": edges evenly spaced to the max. Nearly every pixel lands in bin 0 and the
-        top bins hold single pixels -- the original scheme, which collapsed the selection to
-        ~96 of 691k pixels.
-      - "quantile": every bin holds the same count, so almost every BIN sits in the weak
-        regime (11 of 13 below 93 G here) and the 100-900 G range the sunspot crops need is
-        squeezed into one already-full bin. Balancing then barely shifts the distribution.
-      - "log" (default): edges spread across the dynamic range, so the decades that matter
-        each get their own bin. This is the one that actually moves the p90 the model sees
-        from ~88 G to ~320 G.
-    All variants cap the top edge at `balance_cap` (default p99.9) and lump everything above
-    it into the final bin, bounding how far the scheme reaches into the degenerate tail.
+    ``bin_scale`` matters more than it looks, because MURaM's |Bz| spans four decades with
+    about 90 % of pixels under 100 G.
+
+    * ``"linear"``: edges evenly spaced up to the cap. Nearly every pixel lands in bin 0
+      and the top bins hold single pixels; this original scheme collapsed the selection
+      to about 96 of 691k pixels.
+    * ``"quantile"``: every bin holds the same count, so almost every bin sits in the weak
+      regime (11 of 13 below 93 G) and the 100 to 900 G range that sunspot crops need is
+      squeezed into one bin. Balancing then barely shifts the distribution.
+    * ``"log"`` (default): edges spread over the dynamic range, so each decade gets its own
+      bin. This moves the 90th percentile the model sees from about 88 G to about 320 G.
+
+    All variants cap the top edge at ``balance_cap`` (default: the 99.9th percentile) and
+    put everything above it in the last bin, which ends at the maximum. Edges are rounded
+    to float32 and deduplicated.
+
+    Args:
+        scores: Per-pixel |B| scores in G.
+        n_bins: Requested number of bins below the cap (at least 2).
+        balance_cap: Cap in G. ``None`` uses the 99.9th percentile.
+        bin_scale: ``"log"``, ``"quantile"`` or ``"linear"``.
+
+    Returns:
+        ``(edges, cap)``: increasing float32 edges from the minimum to the maximum score,
+        and the cap actually used, in G.
+
+    Examples:
+        >>> scores = np.geomspace(1.0, 1000.0, 1000)
+        >>> edges, cap = build_bz_balance_bin_edges(scores, n_bins=4, balance_cap=500.0)
+        >>> float(edges[0]), cap, float(edges[-1])
+        (1.0, 500.0, 1000.0)
+        >>> bool(np.all(np.diff(edges) > 0))
+        True
     """
     scores = np.asarray(scores, dtype=np.float64).ravel()
     score_min, score_max = float(np.min(scores)), float(np.max(scores))
@@ -1328,13 +1694,50 @@ def build_bz_strength_balanced_indices(
     max_oversample_factor: float = 10.0,
     bin_scale: str = "log",
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Return flattened indices balanced across Bz-strength bins.
+    """Resample pixels so that each |B_LOS|-strength bin is about equally represented.
 
-    oversample: equalize bins upward by drawing rare bins with replacement (default),
-        rather than downward to the rarest bin. Set False for the original behavior.
-    balance_cap: |Bz| ceiling (G) above which all pixels share the top bin. Defaults to
-        the p99.9 of the candidate scores. Bounds how far the scheme tries to balance into
-        the tail, where too few distinct pixels exist to learn from.
+    Each pixel gets a score from its |Bz| over the tau nodes (``score_mode``). Scores are
+    binned with :func:`build_bz_balance_bin_edges` and every bin is brought to a target
+    count: the median occupied-bin count when oversampling, else the smallest count. Bins
+    above the target are subsampled without replacement. Bins below it are drawn with
+    replacement, but grow at most ``max_oversample_factor`` times, so a handful of strong
+    pixels is not replicated thousands of times. The result is shuffled.
+
+    Args:
+        mhd_data: Dict with ``"Bz"`` of shape ``(nx, ny, n_tau)``, in G.
+        base_selected_indices: Flattened candidate pixels (e.g. from region balancing).
+            Default: all pixels.
+        n_bins: Requested number of bins.
+        score_mode: ``"mean_abs"`` (mean |Bz| over nodes), ``"max_abs"`` or
+            ``"tau_index"`` (|Bz| at node ``tau_idx``).
+        tau_idx: Node used by ``"tau_index"``. Default: the middle node.
+        rng: Random generator. Default: a fresh unseeded one.
+        oversample: Equalize upward (default) instead of down to the rarest bin.
+        balance_cap: |Bz| in G above which all pixels share the top bin. Default: the
+            99.9th percentile of the candidate scores.
+        max_oversample_factor: Largest growth factor of a bin drawn with replacement.
+        bin_scale: Passed to :func:`build_bz_balance_bin_edges`.
+
+    Returns:
+        ``(indices, info)``: flattened pixel indices (int64, may repeat) and a dict with
+        the bin edges, counts before and after, the target and the settings used.
+
+    Raises:
+        KeyError: If ``"Bz"`` is missing.
+        ValueError: For a non 3-D Bz, an unknown ``score_mode``, an out-of-range
+            ``tau_idx`` or candidate index, or no finite scores.
+
+    Examples:
+        >>> rng = np.random.default_rng(0)
+        >>> bz = np.concatenate([np.full(990, 10.0), np.full(10, 1000.0)])  # 1 % strong pixels
+        >>> bz = (bz + rng.random(1000)).reshape(10, 100, 1)
+        >>> idx, info = build_bz_strength_balanced_indices({"Bz": bz}, n_bins=2, rng=rng,
+        ...                                                 balance_cap=500.0, bin_scale="linear")
+        >>> info["target_per_bin"]     # median of the two bin counts, (990 + 10) / 2
+        500
+        >>> strong = np.abs(bz.reshape(-1)[idx]) > 500
+        >>> int(strong.sum()), int((~strong).sum())   # 10 strong pixels grow at most 10x
+        (100, 500)
     """
     if "Bz" not in mhd_data:
         raise KeyError("mhd_data must contain a 'Bz' array")
@@ -1486,39 +1889,33 @@ def build_bz_strength_balanced_indices(
 # MuramStepDataset class - PyTorch Dataset for training
 # ============================================================================
 class MuramStepDataset(Dataset):
-    """
-    PyTorch Dataset for a single MURaM simulation step.
-    
-    Returns normalized Stokes profiles and MHD targets for each spatial pixel.
-    Also provides spatial indices for physics regularization.
-    
-    Parameters
-    ----------
-    stokes_data : dict
-        Raw Stokes data {'I': (nx, ny, nλ), 'V': (nx, ny, nλ)}
-    mhd_data : dict
-        Raw MHD data {'T': (nx, ny, nτ), 'Vz': ..., 'Bz': ...}
-    stokes_normalizer : StokesNormalizer
-        Fitted normalizer for Stokes data
-    mhd_normalizer : MhdNormalizer
-        Fitted normalizer for MHD data
-        
-    Returns
-    -------
-    tuple
-        (stokes_input, mhd_targets, spatial_indices)
-        - stokes_input: (2, nλ) normalized Stokes I and V
-        - mhd_targets: (3 * nτ,) normalized concatenated T, Vz, Bz
-        - spatial_indices: (2,) [x, y] pixel coordinates
-        
-    Example
-    -------
-    >>> from torch.utils.data import DataLoader
-    >>> dataset = MuramStepDataset(stokes_data, mhd_data, stokes_norm, mhd_norm)
-    >>> dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
-    >>> for stokes, mhd, indices in dataloader:
-    ...     predictions = model(stokes)
-    ...     loss = criterion(predictions, mhd)
+    """PyTorch Dataset of one MURaM step: normalized Stokes input and MHD targets per pixel.
+
+    Every pixel becomes one sample. The constructor normalizes the whole step once with
+    the fitted normalizers and keeps flat arrays; ``selected_flat_indices`` (from region
+    or Bz balancing) then picks, and may repeat, the pixels to serve.
+
+    Each item is a tuple of three tensors:
+
+    * ``stokes_input``: float32, ``(2, n_wl)``, normalized I and V in that order;
+    * ``mhd_targets``: float32, ``(3 * n_tau,)``, normalized T, then Vz, then Bz, each
+      ordered by node as in the normalizer;
+    * ``spatial_indices``: int64, ``(2,)``, the pixel's (x, y) in the step.
+
+    Examples:
+        >>> import contextlib, io, tempfile
+        >>> rng = np.random.default_rng(0)
+        >>> stokes = {"I": 1 + 0.1 * rng.random((3, 2, 5)), "V": 1e-3 * rng.random((3, 2, 5))}
+        >>> mhd = {"T": 5000 + rng.random((3, 2, 4)), "Vz": rng.random((3, 2, 4)),
+        ...        "Bz": 100 * rng.random((3, 2, 4))}
+        >>> sn, mn = StokesNormalizer(), MhdNormalizer(n_tau=4, raw_values_dir=tempfile.mkdtemp())
+        >>> sn.update(stokes); mn.update(mhd)
+        >>> with contextlib.redirect_stdout(io.StringIO()):
+        ...     _ = sn.finalize(); _ = mn.finalize()
+        >>> ds = MuramStepDataset(stokes, mhd, sn, mn, selected_flat_indices=np.array([5, 0, 5]))
+        >>> x, y, xy = ds[0]
+        >>> len(ds), tuple(x.shape), tuple(y.shape), xy.tolist()
+        (3, (2, 5), (12,), [2, 1])
     """
     
     def __init__(
@@ -1531,6 +1928,23 @@ class MuramStepDataset(Dataset):
         region_sampling_info: Optional[Dict[str, Any]] = None,
         bz_balance_info: Optional[Dict[str, Any]] = None,
     ):
+        """Normalize one step and flatten it into per-pixel samples.
+
+        Args:
+            stokes_data: ``{"I", "V"}`` arrays of shape ``(nx, ny, n_wl)`` in continuum
+                units. An optional ``"hinode_wl"`` entry is kept as ``self.hinode_wl``.
+            mhd_data: ``{"T", "Vz", "Bz"}`` arrays of shape ``(nx, ny, n_tau)`` in K, km/s
+                and G.
+            stokes_normalizer: Fitted :class:`StokesNormalizer`.
+            mhd_normalizer: Fitted :class:`MhdNormalizer`.
+            selected_flat_indices: 1-D indices into the ``nx * ny`` flattened pixels; may
+                repeat. ``None`` serves every pixel once.
+            region_sampling_info: Stored as is, for logging.
+            bz_balance_info: Stored as is, for logging.
+
+        Raises:
+            ValueError: If ``selected_flat_indices`` is not 1-D, is empty or is out of range.
+        """
         self.nx, self.ny = stokes_data['I'].shape[:2]
         self.n_pixels_full = self.nx * self.ny
         self.region_sampling_info = region_sampling_info
@@ -1579,9 +1993,11 @@ class MuramStepDataset(Dataset):
         self.n_pixels = int(self.stokes_input.shape[0])
         
     def __len__(self):
+        """Number of samples served (selected pixels, counting repeats)."""
         return self.n_pixels
     
     def __getitem__(self, idx):
+        """Return ``(stokes_input, mhd_targets, spatial_indices)`` tensors for sample ``idx``."""
         return (
             torch.from_numpy(self.stokes_input[idx]).float(),
             torch.from_numpy(self.mhd_targets[idx]).float(),
