@@ -113,3 +113,26 @@ def test_check_prof_on_binary_profiles(tmp_path):
     path = tmp_path / "obs.prof"
     write_prof_cube(path, np.random.default_rng(2).standard_normal((1, 1, 4, 5)))
     check_prof(str(path))
+
+
+# --- Target for reframe Phase 1a: transverse field in the training synthesis -------------
+
+@pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 1a): write_binary_model_cube takes "
+                   "b_x_G and b_y_G so NICOLE can synthesize Q and U. Today the transverse slots are zero.")
+def test_binary_model_cube_writes_the_transverse_field(tmp_path):
+    """Bx and By (G) written to the binary cube read back in NICOLE's transverse-field slots 9 and 10.
+
+    NICOLE's reader names slots 9 to 13 b_x, b_y, bl_x, bl_y, bl_z, while the writer's
+    comment names them b_los_x, b_los_y, b_x, b_y, b_z. At disk centre both pairs describe
+    the same field, so both are filled; the reader's slots 9 and 10 must hold Bx and By.
+    """
+    rng = np.random.default_rng(3)
+    shape = (2, 2, NZ)
+    T, v, b = 5000 + 100 * rng.random(shape), rng.standard_normal(shape), 100 * rng.standard_normal(shape)
+    bx, by = 300 * rng.standard_normal(shape), 300 * rng.standard_normal(shape)
+    path = tmp_path / "cube.model"
+    write_binary_model_cube(path, LOGTAU, T, v, b, b_x_G=bx, b_y_G=by)
+    order = np.argsort(LOGTAU)[::-1]
+    d = read_model(str(path), "nicole2.3", 2, 2, NZ, 1, 0)
+    np.testing.assert_allclose(_var(d, 9), bx[1, 0, order])
+    np.testing.assert_allclose(_var(d, 10), by[1, 0, order])

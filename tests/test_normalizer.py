@@ -190,3 +190,36 @@ def test_stokes_stats_and_round_trip(tmp_path):
     norm.save(path)
     loaded = StokesNormalizer().load(path)
     assert loaded.final_stats == norm.final_stats
+
+
+# --- Target for reframe Phase 1c: Q and U as inputs ---------------------------------------
+
+IQUV_TARGET = ("Agreed in the reframe plan (Phase 1c): Stokes Q and U become model inputs, so the "
+               "Stokes normalizer must handle them. Today it only knows I and V.")
+
+
+@pytest.mark.xfail(strict=True, reason=IQUV_TARGET)
+def test_stokes_normalizer_handles_q_and_u():
+    """StokesNormalizer accumulates, applies and inverts statistics for all four Stokes parameters.
+
+    The polarization channels Q, U and V are divided by their standard deviation without
+    subtracting their mean (their mean is a physical zero, not an offset), as the paper
+    states; I is a z-score. The streamed statistics must match numpy and the round trip
+    must recover the input.
+    """
+    rng = np.random.default_rng(0)
+    data = {"I": 0.9 + 0.1 * rng.standard_normal((5, 4, 7)), "Q": 1e-3 * rng.standard_normal((5, 4, 7)),
+            "U": 2e-3 * rng.standard_normal((5, 4, 7)), "V": 1e-3 * rng.standard_normal((5, 4, 7))}
+    norm = StokesNormalizer()
+    norm.update(data)
+    norm.finalize()
+    for key in ("Q", "U"):
+        assert norm.final_stats[key]["std"] == pytest.approx(data[key].std(), rel=1e-9)
+    t = norm.transform(data)
+    assert set(t) >= {"I", "Q", "U", "V"}
+    for key in ("Q", "U", "V"):
+        np.testing.assert_allclose(t[key], data[key] / norm.final_stats[key]["std"], rtol=1e-5)
+    flat = np.concatenate([t[k].reshape(-1, 7) for k in ("I", "Q", "U", "V")], axis=1)
+    back = norm.inverse_transform(flat)
+    for key in ("Q", "U"):
+        np.testing.assert_allclose(back[key], data[key].reshape(-1, 7), rtol=1e-4, atol=1e-7)
