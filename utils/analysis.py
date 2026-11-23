@@ -96,8 +96,9 @@ def modest_crop_extent(
 ) -> tuple[tuple[float, float, float, float], tuple[str, str]]:
     """Helioprojective extent of a MODEST crop given in native pixels (y0, y1, x0, x1).
 
-    Returned in the transposed orientation the combined image grids draw in (horizontal axis =
-    scan Y, vertical axis = X), and computed from the NATIVE bounds so it is independent of
+    Returned for the UNtransposed orientation (horizontal axis = Solar-X, vertical = Solar-Y),
+    the same one the full-scene and regions-overview figures use, so a map must be drawn with
+    transpose=False to match it. Computed from the NATIVE bounds so it is independent of
     whether the predictions live on the upsampled 0.16" grid or the native 0.32" one."""
     y0, y1, x0, x1 = (float(v) for v in crop_bounds)
     ny, nx = (float(v) for v in scene_shape)
@@ -111,8 +112,8 @@ def modest_crop_extent(
         return y_center + (py - ny / 2.0) * scale
 
     # imshow's extent maps array EDGES, not pixel centres -- hence the half-pixel offset.
-    extent = (to_y(y0 - 0.5), to_y(y1 - 0.5), to_x(x0 - 0.5), to_x(x1 - 0.5))
-    return extent, ("Solar-Y [arcsec]", "Solar-X [arcsec]")
+    extent = (to_x(x0 - 0.5), to_x(x1 - 0.5), to_y(y0 - 0.5), to_y(y1 - 0.5))
+    return extent, ("Solar-X [arcsec]", "Solar-Y [arcsec]")
 
 
 def combined_plot_title(param: str, context: str, tau_val: float, los: bool = False) -> str:
@@ -995,7 +996,7 @@ def plot_combined_images_grid(
     an identical box matching the region's true height/width ratio (not forced square -- MODEST
     crops like plage/negative_region/whole are naturally elongated rectangles, not squares).
 
-    `extent` (already in the transposed panel orientation) puts every panel on a physical
+    `extent` (already in the orientation the panels are drawn in, i.e. after `transpose`) puts every panel on a physical
     coordinate grid -- arcsec for MODEST crops, Mm for MURaM -- with ticks drawn on the ground
     truth panel and the first error panel only, so the figure carries a spatial scale without
     cluttering every cell. Without it the panels keep their old tick-less look."""
@@ -1935,6 +1936,9 @@ class ModestDiagnosticPlots:
                         title_suffix=title_context,
                         tau_val=tau_r,
                         save_path=combined_dir / f"{param}_tau_{tau_r:+.2f}_combined_images.png",
+                        # MODEST maps are (y, x); drawn untransposed so Solar-X runs horizontally,
+                        # matching the full-scene and regions-overview figures.
+                        transpose=False,
                         extent=map_extent,
                         extent_labels=map_extent_labels,
                         los=True,

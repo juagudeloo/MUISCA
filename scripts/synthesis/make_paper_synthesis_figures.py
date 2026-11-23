@@ -27,7 +27,9 @@ from utils.analysis import display_name
 EXPERIMENT_ROOT = "experiment_110_to_130-step_size_10-normal"
 SYNTH_BASE = ROOT / "output" / "synthesis" / EXPERIMENT_ROOT / "modest"
 MODEL_TYPES = ["no_physics", "wfa_only", "doppler_only", "black_body_only"]
-MODEL_COLORS = {"no_physics": "C1", "wfa_only": "C2", "doppler_only": "C3", "black_body_only": "C4"}
+# Same colors as every other paper figure (the metric-vs-tau curves use matplotlib's default
+# cycle in MODEL_CANONICAL_ORDER): baseline C0, WFA C1, Doppler C2, Black Body C3.
+MODEL_COLORS = {"no_physics": "C0", "wfa_only": "C1", "doppler_only": "C2", "black_body_only": "C3"}
 
 # (region_label, ix, iy, display_region_name, output_basename)
 CASES = [
@@ -100,7 +102,7 @@ def make_panel(wl, obs, synth_by_model, stokes_idx, ylabel, region_name, b_label
     ax.set_ylabel(ylabel, fontsize=16)
     ax.tick_params(labelsize=13)
     ax.grid(True, alpha=0.25)
-    ax.set_title(f"{region_name} -- |B$_{{\\rm LOS}}$| = {b_label}", fontsize=14, fontweight="bold")
+    ax.set_title(f"{region_name}, |B$_{{\\rm LOS}}$| = {b_label}", fontsize=14, fontweight="bold")
     # Below the axes, not "best" -- with 5 lines "best" can land on top of the data itself
     # (e.g. a line-core dip that happens to sit in the legend's preferred corner).
     ax.legend(fontsize=10, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=False)
@@ -129,7 +131,8 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for region_label, ix, iy, region_name, basename in CASES:
         wl, i_obs, v_obs, synth_by_model, abs_b_los, chi2_by_model = load_case(region_label, ix, iy)
-        b_label = f"{abs_b_los:.3g} G" if abs_b_los is not None else "?"
+        # Three significant figures in plain notation (1670 G, not 1.67e+03 G), as in the caption.
+        b_label = f"{float(f'{abs_b_los:.3g}'):g} G" if abs_b_los is not None else "?"
         make_panel(wl, i_obs, synth_by_model, 0, r"$I/I_c$", region_name, b_label,
                    chi2_by_model, "chi2_I", OUT_DIR / f"{basename}_I.png")
         make_panel(wl, v_obs, synth_by_model, 1, r"$V/I_c$", region_name, b_label,
