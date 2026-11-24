@@ -265,3 +265,47 @@ def test_ablation_offers_the_mdi_flavor():
     out = subprocess.run([sys.executable, str(ROOT / "scripts" / "experiments" / "ablation_study.py"), "--help"],
                          capture_output=True, text=True, timeout=120)
     assert "mdi_only" in out.stdout and "--lambda_mdi" in out.stdout and "--mdi_target_logtau" in out.stdout
+
+
+class _EchoModel(torch.nn.Module):
+    """Stand-in model whose prediction for each sample is a stored normalized target vector."""
+
+    def __init__(self, outputs: torch.Tensor):
+        """Store the outputs to return, in sample order."""
+        super().__init__()
+        self.outputs = outputs
+        self.pos = 0
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the next ``len(x)`` stored outputs."""
+        out = self.outputs[self.pos:self.pos + len(x)]
+        self.pos += len(x)
+        return out
+
+    def set_physics_context(self, *args, **kwargs):
+        """Accept and ignore the physics context."""
+
+
+@pytest.mark.xfail(strict=True, reason="Agreed with the user (2026-11-23, Phase 1): the per-epoch MURaM test metrics "
+                   "compare predictions with MURaM's atmosphere at the paper nodes, not with the physics approximations.")
+def test_muram_test_metrics_compare_with_the_ground_truth(tmp_path, monkeypatch):
+    """``compute_muram_test_metrics`` scores predictions against MURaM's T, Vz and Bz at each requested node.
+
+    The stand-in model predicts exactly the normalized targets, and the approximation
+    maps are deliberately unrelated (constants). Against the ground truth the correlation
+    must be 1 and the RRMSE 0 at every node; a function scoring against the
+    approximations would fail.
+    """
+    sys.path.insert(0, str(ROOT / "scripts" / "experiments"))
+    import ablation_study
+    norm, ds, _ = _tiny_step(tmp_path, n=60)
+    approx = {"blos": np.zeros((8, 8)), "vlos": np.zeros((8, 8)), "temp": np.full((8, 8), 6000.0)}
+    monkeypatch.setattr(ablation_study, "load_and_prepare_step", lambda **kw: (ds, approx))
+    model = _EchoModel(torch.from_numpy(ds.mhd_targets))
+    cfg = _cfg(tmp_path)
+    metrics = ablation_study.compute_muram_test_metrics(model, [198], cfg, norm, None, nodes=(-2.0, -0.8, 0.0))
+    for q in ("T", "Vz", "Bz"):
+        for node in (-2.0, -0.8, 0.0):
+            assert metrics[q][node]["correlation"] == pytest.approx(1.0, abs=1e-6)
+            assert metrics[q][node]["rrmse"] == pytest.approx(0.0, abs=1e-6)
