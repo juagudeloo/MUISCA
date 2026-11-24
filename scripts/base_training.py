@@ -1,14 +1,27 @@
-"""
-Physics-Informed Neural Network Training Script
-================================================
+"""Training of the physics-informed MSCNN on MURaM simulation steps.
 
-Trains the PINN MSCNN model using interleaved epoch training across multiple
-MURaM simulation steps. Implements proper mini-batch handling, checkpoint saving,
-and physics regularization.
+This module holds the shared machinery; ``scripts/experiments/ablation_study.py`` is the
+entry point used for the paper and calls it.
 
-Usage:
-    python train_pinn_model.py --config config.yaml
-    python train_pinn_model.py --resume checkpoint_epoch_50.pth
+* :class:`TrainingConfig`: every setting, with validation and path defaults.
+* Data: :func:`load_source_arrays` reads one step (``nicole_tau500`` or ``muram_legacy``),
+  :func:`load_and_prepare_step` degrades it to Hinode (LSF, resampling), computes the
+  physics approximations, balances the pixels and builds the Dataset, using the per-step
+  cache when it can. The balanced cache (:func:`build_or_refresh_balanced_cache`) stores
+  the final normalized tensors.
+* Training: :func:`train_epoch` visits the training steps in a random order and makes one
+  full pass over each step's pixels before the next (batches of different steps are not
+  mixed); :func:`train_one_step` does that pass; :func:`validate` computes the loss
+  (MSE plus physics terms, always on) on the validation steps.
+* The physics gate (:func:`initialize_wfa_gate_state`, :func:`update_wfa_gate_state`)
+  switches all physics terms on once the training MSE reaches a threshold or plateaus.
+* Per-epoch diagnostics: maps, scatter plots, trends and videos on one MURaM step and on
+  a MODEST snapshot.
+
+Examples:
+    Train with the defaults of a configuration file (on the cluster)::
+
+        python scripts/base_training.py --config config.json --epochs 100
 """
 
 import sys
@@ -54,7 +67,26 @@ from utils.physics_utils import ApproxInversions, TEMP_BB_METHOD
 
 @dataclass
 class TrainingConfig:
-    """Training configuration parameters."""
+    """Every training setting, validated and completed in ``__post_init__``.
+
+    Defaults worth knowing:
+
+    * ``data_source="nicole_tau500"``: the normalization statistics and caches get
+      ``nicole_tau500`` paths (``normalization_stats/nicole_tau500/...``,
+      ``.muram_cache_nicole_tau500``), and ``stokes_ic_mode`` is forced to ``"per_step"``
+      because those profiles are already normalized to the HSRA continuum.
+    * The log tau grid is -3.0 to 1.4 in steps of 0.1 (45 nodes), the grid the tau_500 data
+      were generated on.
+    * ``temp_continuum_indices`` default to ``[108, 109, 110, 111]`` (6303.19 to 6303.26 A,
+      the red end of the Hinode grid; the blue end lies in the Fe I 6301.5 A wing).
+    * The physics weights default to 0.01; the paper's values (10, 0.5, 2) and target nodes
+      are set by ``tools/run_experiments.sh``.
+
+    Note:
+        ``__post_init__`` creates ``checkpoint_dir`` and ``log_dir`` (relative to the current
+        folder by default), and can read ``MURAM_CACHE_DIR``, ``MURAM_BALANCED_CACHE_DIR`` and
+        ``MODEST_CACHE_DIR`` from the environment.
+    """
     # Data paths
     data_path: str = "/scratchsan/observatorio/juagudeloo/MUISCA/data/"
     mhd_normalizer_path: str = "normalization_stats/mhd_normalization.json"
@@ -213,6 +245,12 @@ class TrainingConfig:
     modest_temp_calibration_clip_quantiles: list[float] | tuple[float, float] | None = None
 
     def __post_init__(self):
+        """Fill defaults, redirect paths for non-legacy data sources, and validate every setting.
+
+        Raises:
+            ValueError: For an unknown data source, continuum mode, gate mode, balancing mode or
+                scope, cache strategy, calibration mode, or an out-of-range value.
+        """
         if self.scales is None:
             self.scales = [1, 2, 3]
         if self.stokes_cont_indices is None:
@@ -372,7 +410,20 @@ class TrainingConfig:
         self.log_dir.mkdir(parents=True, exist_ok=True)
     
     def save(self, path: Path):
-        """Save configuration to JSON."""
+        """Write the configuration as JSON (paths as strings).
+
+        Args:
+            path: Output file.
+
+        Examples:
+            >>> import tempfile
+            >>> tmp = tempfile.mkdtemp()
+            >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
+            >>> import pathlib
+            >>> cfg.save(pathlib.Path(tmp) / "config.json")
+            >>> TrainingConfig.load(pathlib.Path(tmp) / "config.json").lambda_wfa == cfg.lambda_wfa
+            True
+        """
         with open(path, 'w') as f:
             config_dict = asdict(self)
             # Convert Path objects to strings for JSON serialization
@@ -383,7 +434,18 @@ class TrainingConfig:
     
     @classmethod
     def load(cls, path: Path):
-        """Load configuration from JSON."""
+        """Build a configuration from a JSON file, ignoring keys that are not fields.
+
+        Args:
+            path: JSON file written by :meth:`save` (or an ``experiment_config.json``-like dict
+                of fields).
+
+        Returns:
+            A validated :class:`TrainingConfig`.
+
+        Examples:
+            >>> cfg = TrainingConfig.load(Path("output/experiments/exp/checkpoints/config.json"))  # doctest: +SKIP
+        """
         with open(path, 'r') as f:
             config_dict = json.load(f)
         valid_keys = {field.name for field in fields(cls)}
@@ -391,7 +453,26 @@ class TrainingConfig:
         return cls(**filtered_config)
 
     def get_logtau_values(self) -> np.ndarray:
-        """Resolve optical-depth grid for MURaM remapping/physics context."""
+        """The log tau nodes, increasing, rounded to 6 decimals (float32).
+
+        ``logtau_values`` wins if given; otherwise the grid is
+        ``arange(logtau_min, logtau_max + step / 2, step)`` computed in float64 first, so it
+        matches the grid of the tau_500 files exactly.
+
+        Returns:
+            1-D array of nodes.
+
+        Raises:
+            ValueError: For a non-positive step, fewer than 2 nodes or a non-increasing grid.
+
+        Examples:
+            >>> import tempfile
+            >>> tmp = tempfile.mkdtemp()
+            >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
+            >>> g = cfg.get_logtau_values()
+            >>> g.size, g.dtype, [round(float(v), 6) for v in (g[0], g[22], g[-1])]
+            (45, dtype('float32'), [-3.0, -0.8, 1.4])
+        """
         if self.logtau_values is not None:
             logtau = np.asarray(self.logtau_values, dtype=np.float32)
         else:
@@ -417,13 +498,22 @@ class TrainingConfig:
         return np.round(logtau, 6)
 
     def get_n_logtau(self) -> int:
-        """Number of optical-depth levels used by mapping/model output."""
+        """Number of log tau nodes (45 by default)."""
         return int(self.get_logtau_values().shape[0])
 
 class MetricsLogger:
-    """Tracks and logs training metrics."""
+    """Write per-step losses (``batch_log.csv``) and per-epoch losses (``epoch_log.csv``).
+
+    The batch log has one row per training step and epoch, with the losses averaged over
+    that step's batches (the ``batch`` column is always 0).
+    """
     
     def __init__(self, log_dir: Path):
+        """Create the log folder and open both CSV files with their headers.
+
+        Args:
+            log_dir: Folder for the CSV files.
+        """
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -440,7 +530,23 @@ class MetricsLogger:
         self.batch_log.write("epoch,step,batch,loss,mse_loss,physics_loss,wfa_loss,doppler_loss,temperature_loss\n")
     
     def log_batch(self, epoch: int, step: int, batch: int, loss_dict: dict[str, float]):
-        """Log batch-level metrics."""
+        """Append one row of step-averaged losses.
+
+        Args:
+            epoch: Epoch index (0-based).
+            step: Simulation step.
+            batch: Batch index (0 when the row is a step average).
+            loss_dict: Losses with keys ``total_loss``, ``mse_loss``, ``physics_loss``,
+                ``wfa_loss``, ``doppler_loss`` and ``temperature_loss`` (missing keys write 0).
+
+        Examples:
+            >>> import tempfile, pathlib
+            >>> log = MetricsLogger(pathlib.Path(tempfile.mkdtemp()))
+            >>> log.log_batch(0, 110, 0, {"total_loss": 1.5, "mse_loss": 1.0})
+            >>> log.close()
+            >>> (log.log_dir / "batch_log.csv").read_text().splitlines()[1]
+            '0,110,0,1.5,1.0,0.0,0.0,0.0,0.0'
+        """
         self.batch_log.write(
             f"{epoch},{step},{batch},"
             f"{loss_dict.get('total_loss', 0.0)},"
@@ -453,7 +559,21 @@ class MetricsLogger:
         self.batch_log.flush()
     
     def log_epoch(self, epoch: int, train_loss: float, val_loss: float, lr: float):
-        """Log epoch-level metrics."""
+        """Append one row of epoch losses and keep them in memory.
+
+        Args:
+            epoch: Epoch number (1-based in the training loops).
+            train_loss: Mean training loss.
+            val_loss: Validation loss.
+            lr: Learning rate.
+
+        Examples:
+            >>> import tempfile, pathlib
+            >>> log = MetricsLogger(pathlib.Path(tempfile.mkdtemp()))
+            >>> log.log_epoch(1, 0.5, 0.6, 1e-3); log.close()
+            >>> log.epoch_losses
+            [{'epoch': 1, 'train': 0.5, 'val': 0.6}]
+        """
         self.epoch_log.write(f"{epoch},{train_loss},{val_loss},{lr}\n")
         self.epoch_log.flush()
         
@@ -461,11 +581,18 @@ class MetricsLogger:
         self.lr_history.append(lr)
     
     def close(self):
-        """Close file handlers."""
+        """Close both CSV files.
+
+        Examples:
+            >>> import tempfile, pathlib
+            >>> log = MetricsLogger(pathlib.Path(tempfile.mkdtemp())); log.close(); log.epoch_log.closed
+            True
+        """
         self.epoch_log.close()
         self.batch_log.close()
     
     def __del__(self):
+        """Close the files when the logger is garbage-collected."""
         self.close()
 
 def set_global_seed(seed: int) -> None:
@@ -475,9 +602,21 @@ def set_global_seed(seed: int) -> None:
     draw from torch's global RNG, so without it every ablation variation starts from
     different weights and sees batches in a different order: the arms then differ by
     initialization noise on top of whatever the physics terms do, which is exactly the
-    variance an ablation is supposed to exclude. Variations run sequentially in one process,
-    so each consumes the RNG stream the previous one left behind -- reseeding per variation,
-    not once at startup, is what makes them comparable.
+    variance an ablation is supposed to exclude. Variations run one after another in one
+    process, so each consumes the RNG stream the previous one left behind; reseeding per
+    variation, not once at startup, is what makes them comparable.
+
+    Note:
+        The region-mask pixel draw (``build_balanced_region_indices``) uses its own unseeded
+        generator and is not covered; the paper runs do not use the region mask.
+
+    Args:
+        seed: The seed.
+
+    Examples:
+        >>> set_global_seed(0); a = torch.rand(1)
+        >>> set_global_seed(0); bool(torch.equal(a, torch.rand(1)))
+        True
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -487,7 +626,27 @@ def set_global_seed(seed: int) -> None:
 
 
 def build_cache_config_signature(config: TrainingConfig) -> dict:
-    """Shared cache-signature contract across training/ablation/analysis."""
+    """Settings that determine the per-step cache's content (hashed to validate a cached step).
+
+    Args:
+        config: The training configuration.
+
+    Returns:
+        JSON-serializable dict: data source, grid sizes, wavelength settings, log tau grid,
+        continuum normalization and the black-body settings.
+
+    Note:
+        ``lande_factor`` and ``lsf_path`` change the cached content but are missing (strict
+        xfails in ``tests/test_cache_signatures.py``; reframe Phase 1b).
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
+        >>> sig = build_cache_config_signature(cfg)
+        >>> sig["data_source"], sig["wl_range"]
+        ('nicole_tau500', (15, 60))
+    """
     return {
         'data_source': str(config.data_source),
         'nx': config.nx,
@@ -507,10 +666,10 @@ def build_cache_config_signature(config: TrainingConfig) -> dict:
 
 
 def _temperature_approx_signature(config: TrainingConfig) -> dict:
-    """Black-body settings that change the cached `approximations/temp`.
+    """Black-body settings that change the cached ``approximations/temp``.
 
-    `temp_bb_method` names the current algorithm, so a change to the math invalidates caches
-    built by older code instead of silently reusing their temperatures.
+    ``temp_bb_method`` names the current algorithm, so a change to the math invalidates
+    caches built by older code instead of silently reusing their temperatures.
     """
     return {
         'temp_bb_method': TEMP_BB_METHOD,
@@ -522,7 +681,28 @@ def _temperature_approx_signature(config: TrainingConfig) -> dict:
 
 
 def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int]) -> dict:
-    """Signature for post-balancing cache validity."""
+    """Settings that determine the balanced cache's content.
+
+    Args:
+        config: The training configuration.
+        train_steps: The training steps (the cache is valid for one set of steps).
+
+    Returns:
+        JSON-serializable dict: steps, region and Bz balancing settings, log tau grid,
+        continuum normalization and the black-body settings.
+
+    Note:
+        The balanced cache stores normalized tensors and the WFA and Doppler maps, but the
+        normalization statistics, ``wl_range``, ``central_wavelength`` and ``lande_factor``
+        are missing (strict xfails; reframe Phase 1b).
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
+        >>> build_balanced_cache_signature(cfg, [120, 110])["steps"]
+        [110, 120]
+    """
     return {
         "version": 1,
         "data_source": str(config.data_source),
@@ -549,7 +729,19 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
 
 
 def estimate_balanced_cache_sample_bytes(dataset: MuramStepDataset) -> int:
-    """Estimate in-memory bytes needed to preload one balanced sample set."""
+    """Bytes of a dataset's input, target and index arrays (to decide whether to preload).
+
+    Args:
+        dataset: Any dataset with ``stokes_input``, ``mhd_targets`` and ``spatial_indices``.
+
+    Returns:
+        Total size in bytes.
+
+    Examples:
+        >>> ds = BalancedStepTensorDataset(np.zeros((10, 2, 112)), np.zeros((10, 135)), np.zeros((10, 2)))
+        >>> estimate_balanced_cache_sample_bytes(ds)
+        14520
+    """
     return (
         int(dataset.stokes_input.nbytes)
         + int(dataset.mhd_targets.nbytes)
@@ -558,9 +750,23 @@ def estimate_balanced_cache_sample_bytes(dataset: MuramStepDataset) -> int:
 
 
 class BalancedStepTensorDataset(Dataset):
-    """Dataset wrapping cached balanced tensors (already normalized)."""
+    """Dataset over already balanced and normalized tensors (from the balanced cache).
+
+    Items are ``(stokes_input, mhd_targets, spatial_indices)`` tensors, like
+    :class:`utils.muram_data.MuramStepDataset`.
+    """
 
     def __init__(self, stokes_input: np.ndarray, mhd_targets: np.ndarray, spatial_indices: np.ndarray):
+        """Check the shapes and store float32 inputs and targets and int64 indices.
+
+        Args:
+            stokes_input: ``(n, n_channels, n_wl)``.
+            mhd_targets: ``(n, 3 n_tau)``.
+            spatial_indices: ``(n, 2)`` pixel ``(x, y)``.
+
+        Raises:
+            ValueError: If a shape is wrong or the sample counts differ.
+        """
         if stokes_input.ndim != 3:
             raise ValueError(f"Expected stokes_input as 3D array, got shape {stokes_input.shape}")
         if mhd_targets.ndim != 2:
@@ -576,9 +782,11 @@ class BalancedStepTensorDataset(Dataset):
         self.spatial_indices = np.asarray(spatial_indices, dtype=np.int64)
 
     def __len__(self):
+        """Number of samples."""
         return int(self.stokes_input.shape[0])
 
     def __getitem__(self, idx):
+        """Return ``(stokes_input, mhd_targets, spatial_indices)`` tensors for sample ``idx``."""
         return (
             torch.from_numpy(self.stokes_input[idx]).float(),
             torch.from_numpy(self.mhd_targets[idx]).float(),
@@ -595,9 +803,26 @@ def build_or_refresh_balanced_cache(
     global_bz_selection_indices: dict[int, np.ndarray] | None,
     global_bz_balance_metadata: dict[str, Any] | None,
 ) -> tuple[BalancedTrainDataCache, str, dict[str, Any]]:
-    """Build balanced-cache entries for all train steps if needed.
+    """Make sure the balanced cache holds every training step for the current signature.
 
-    Returns cache object, signature hash, and summary report.
+    A different signature (or ``clear_balanced_cache``) resets the cache. Missing steps are
+    built with :func:`load_and_prepare_step` (through the per-step cache) and saved.
+
+    Args:
+        train_steps: Training steps.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        raw_cache: Per-step cache, or ``None``.
+        global_bz_selection_indices: Pixels per step from global Bz balancing, or ``None``.
+        global_bz_balance_metadata: Its metadata, or ``None``.
+
+    Returns:
+        ``(cache, signature_hash, report)``; the report counts built, reused and skipped
+        steps and estimates the RAM needed to preload them.
+
+    Examples:
+        >>> cache, h, report = build_or_refresh_balanced_cache(steps, cfg, mn, sn, raw, None, None)  # doctest: +SKIP
     """
     balanced_cache = BalancedTrainDataCache(cache_dir=config.balanced_cache_dir, compression="lzf")
     signature = build_balanced_cache_signature(config=config, train_steps=train_steps)
@@ -676,7 +901,25 @@ def build_or_refresh_balanced_cache(
 
 
 def choose_balanced_cache_runtime_mode(config: TrainingConfig, estimated_preload_bytes: int) -> str:
-    """Select runtime mode for balanced cache: preload or disk."""
+    """Decide whether the balanced steps are preloaded into RAM or read from disk each epoch.
+
+    ``"preload"`` and ``"disk"`` are honoured as given; ``"auto"`` preloads when the estimate
+    fits in ``balanced_cache_ram_budget_gb`` times ``balanced_cache_ram_fraction``.
+
+    Args:
+        config: The training configuration.
+        estimated_preload_bytes: Bytes needed to preload every step.
+
+    Returns:
+        ``"preload"`` or ``"disk"``.
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
+        >>> choose_balanced_cache_runtime_mode(cfg, 10 * 1024**3), choose_balanced_cache_runtime_mode(cfg, 30 * 1024**3)
+        ('preload', 'disk')
+    """
     requested = str(config.balanced_cache_strategy).lower()
     if requested in {"preload", "disk"}:
         return requested
@@ -692,7 +935,19 @@ def preload_balanced_steps_from_cache(
     balanced_cache: BalancedTrainDataCache,
     signature_hash: str,
 ) -> dict[int, tuple[BalancedStepTensorDataset, dict[str, np.ndarray]]]:
-    """Load all cached balanced steps into RAM once."""
+    """Load every cached balanced step into RAM once.
+
+    Args:
+        train_steps: Training steps.
+        balanced_cache: The balanced cache.
+        signature_hash: Its current signature hash.
+
+    Returns:
+        ``{step: (dataset, approx_maps)}`` for the steps that are cached.
+
+    Examples:
+        >>> loaded = preload_balanced_steps_from_cache(steps, cache, h)  # doctest: +SKIP
+    """
     loaded: dict[int, tuple[BalancedStepTensorDataset, dict[str, np.ndarray]]] = {}
     for step in tqdm(train_steps, desc="Preload balanced cache"):
         if not balanced_cache.has_step(step=step, signature_hash=signature_hash):
@@ -713,17 +968,32 @@ def preload_balanced_steps_from_cache(
 
 
 def _has_active_physics(config: TrainingConfig) -> bool:
-    """Whether any physics term is weighted, and so whether the gate has anything to hold back."""
+    """Whether any physics term has a positive weight (so the gate has something to hold back)."""
     return (config.lambda_wfa > 0) or (config.lambda_doppler > 0) or (config.lambda_temp > 0)
 
 
 def initialize_wfa_gate_state(config: TrainingConfig) -> dict[str, Any]:
-    """Create runtime state for the train-time physics activation gate.
+    """Initial state of the gate that switches the physics terms on during training.
 
-    Opens immediately when no physics term is weighted at all -- there is nothing to gate --
-    but NOT merely because lambda_wfa is zero. That earlier condition made the gate a no-op
-    for doppler_only and black_body_only, so those arms had their term active from epoch 1
-    while wfa_only waited for the MSE plateau: the very asymmetry the gate exists to avoid.
+    The gate starts open when its mode is ``"off"`` or when no physics term is weighted at
+    all; otherwise it starts closed, whichever term is weighted. It used to open whenever
+    ``lambda_wfa`` was 0, which left doppler_only and black_body_only with their term active
+    from epoch 1 while wfa_only waited for the MSE plateau.
+
+    Args:
+        config: The training configuration (``wfa_gate_*`` settings and the lambdas).
+
+    Returns:
+        Dict with ``mode``, ``enabled``, ``best_metric``, ``plateau_epochs``,
+        ``last_metric``, ``trigger_epoch`` and ``trigger_reason``.
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, wfa_gate_mode="plateau",
+        ...                      lambda_wfa=0.0, lambda_doppler=0.5, lambda_temp=0.0)
+        >>> initialize_wfa_gate_state(cfg)["enabled"]
+        False
     """
     gate_mode = str(config.wfa_gate_mode).lower()
     enabled = gate_mode == 'off' or not _has_active_physics(config)
@@ -744,11 +1014,36 @@ def update_wfa_gate_state(
     epoch: int,
     epoch_mse_loss: float,
 ) -> tuple[dict[str, Any], bool, str | None]:
-    """Update the train-time physics gate from epoch train MSE; returns transition info.
+    """Update the gate with an epoch's training MSE and report whether it opened.
 
-    Config keys keep the wfa_gate_* names for backwards compatibility -- finetune.py restores
-    them from a base run's experiment_config.json -- but the gate governs all three physics
-    terms, not just the WFA.
+    Once open, the gate stays open. During the first ``wfa_gate_warmup_epochs`` epochs it
+    only tracks the best MSE. Then, in ``"threshold"`` mode it opens when the MSE is at most
+    ``wfa_gate_threshold``; in ``"plateau"`` mode it opens after ``wfa_gate_patience``
+    consecutive epochs that do not beat the best MSE so far by more than
+    ``wfa_gate_min_delta`` (a slow steady decline therefore keeps resetting the count). The
+    ``wfa_gate_*`` names are kept for old configurations, but the gate governs all physics
+    terms.
+
+    Args:
+        gate_state: State from :func:`initialize_wfa_gate_state` (updated in place).
+        config: The training configuration.
+        epoch: Epoch index (0-based).
+        epoch_mse_loss: Mean training MSE of that epoch.
+
+    Returns:
+        ``(gate_state, opened_now, reason)``.
+
+    Raises:
+        ValueError: For an unknown gate mode.
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, wfa_gate_mode="plateau", wfa_gate_patience=2,
+        ...                      wfa_gate_min_delta=0.01, lambda_wfa=1.0)
+        >>> state = initialize_wfa_gate_state(cfg)
+        >>> [update_wfa_gate_state(state, cfg, e, mse)[1] for e, mse in enumerate([1.0, 0.5, 0.499, 0.498])]
+        [False, False, False, True]
     """
     gate_mode = str(gate_state.get('mode', config.wfa_gate_mode)).lower()
     if gate_mode == 'off' or not _has_active_physics(config):
@@ -808,20 +1103,36 @@ def load_source_arrays(
     config: TrainingConfig,
     ignore_missing_files: bool = False,
 ) -> tuple[StokesData, dict[str, np.ndarray]] | None:
-    """
-    Load raw, per-step MHD + Stokes arrays for `config.data_source`.
+    """Read one step's raw profiles and atmosphere from the configured data source.
 
-    Returns a (stokes, mhd_data) pair with the same downstream contract
-    regardless of source: `stokes` is a StokesData instance with `.data`
-    (fine wavelength grid, I/Q/U/V, pre-LSF/resample) and `.mean_continuum`
-    populated; `mhd_data` maps {'T', 'Vz', 'Bz'} to (nx, ny, n_logtau)
-    Quantities on config.get_logtau_values(). Callers still need to run
-    load_hinode_lsf/apply_spectral_convolution/resample_to_hinode/
-    spectropolarimetry on the returned `stokes` -- those steps are
-    source-agnostic and are not duplicated here.
+    Both sources return the same contract: a :class:`StokesData` whose ``.data`` holds I, Q,
+    U, V on the fine synthesis grid (before LSF and resampling) and whose ``.mean_continuum``
+    is set, and ``{"T", "Vz", "Bz"}`` Quantities (K, km/s, G) of shape
+    ``(nx, ny, n_logtau)`` on :meth:`TrainingConfig.get_logtau_values`. The LSF, resampling
+    and polarization map are applied by the caller.
 
-    Returns None (instead of raising) when required files are missing and
-    ignore_missing_files=True.
+    * ``nicole_tau500``: ``stokes_<step>_nicole_tau500.npy`` (already normalized to the HSRA
+      continuum) and ``atmos_<step>_tau500.npz``; the file's log tau grid must equal the
+      configuration's.
+    * ``muram_legacy``: the raw MURaM cube remapped to Rosseland tau and the old
+      ``stokes_<step>.npy`` cube with its continuum normalization.
+
+    Args:
+        step: Simulation step.
+        config: The training configuration.
+        ignore_missing_files: Return ``None`` instead of raising when files are missing.
+
+    Returns:
+        ``(stokes, mhd_data)``, or ``None`` when files are missing and ignored.
+
+    Raises:
+        FileNotFoundError: If files are missing and not ignored.
+        ValueError: For a log tau grid mismatch or an unknown data source.
+
+    Examples:
+        >>> stokes, mhd = load_source_arrays(110, TrainingConfig())  # doctest: +SKIP
+        >>> stokes.data["I"].shape, mhd["T"].shape  # doctest: +SKIP
+        ((480, 480, 300), (480, 480, 45))
     """
     new_logtau = config.get_logtau_values()
 
@@ -934,32 +1245,39 @@ def load_and_prepare_step(
     global_bz_balance_metadata: dict[str, Any] | None = None,
     ignore_missing_files: bool = False,
 ) -> tuple[MuramStepDataset, dict[str, np.ndarray]] | None:
-    """
-    Load and prepare a single simulation step for training.
-    
-    Uses cache if available to significantly speed up repeated runs.
-    
-    Parameters
-    ----------
-    step : int
-        Simulation step number
-    config : TrainingConfig
-        Training configuration
-    mhd_normalizer : MhdNormalizer
-        MHD data normalizer
-    stokes_normalizer : StokesNormalizer
-        Stokes data normalizer
-    cache : MuramDataCache, optional
-        Cache manager for loading/saving processed data
-    ignore_missing_files : bool
-        If True, return None instead of raising when required input files are missing.
-    
-    Returns
-    -------
-    dataset : MuramStepDataset
-        Dataset containing normalized inputs/targets
-    approx_data : dict
-        Physics approximations {'blos': (nx, ny), 'vlos': (nx, ny), 'temp': (nx, ny)}
+    """Load one step ready for training: degraded profiles, approximations, selected pixels, Dataset.
+
+    If the per-step cache has the step for the current signature, the arrays and
+    approximations come from it. Otherwise the step is read (:func:`load_source_arrays`),
+    convolved with the Hinode LSF, resampled to the 112 Hinode wavelengths, and the WFA
+    (G), Doppler (km/s) and black-body (K) maps are computed and cached. Then the pixels are
+    optionally balanced (region masks, per-step or global Bz balancing) and normalized into
+    a :class:`MuramStepDataset`.
+
+    Args:
+        step: Simulation step.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        cache: Per-step cache, or ``None``.
+        apply_balanced_masks: Draw equal numbers of pixels from the four granulation and
+            polarization regions (unseeded draw).
+        log_region_stats: Print the region counts.
+        apply_bz_balance: Balance pixels by |Bz| within this step.
+        global_bz_selection_indices: Pixels per step from global balancing; takes
+            precedence over the other selections for this step.
+        global_bz_balance_metadata: Metadata of the global balancing, for logging.
+        ignore_missing_files: Return ``None`` instead of raising when files are missing.
+
+    Returns:
+        ``(dataset, approx_maps)`` with ``approx_maps`` holding ``"blos"``, ``"vlos"`` and
+        ``"temp"`` ``(nx, ny)`` maps, or ``None`` if files are missing and ignored.
+
+    Raises:
+        ValueError: If the normalizer has a different number of nodes than the grid.
+
+    Examples:
+        >>> ds, approx = load_and_prepare_step(110, cfg, mhd_norm, stokes_norm, cache=cache)  # doctest: +SKIP
     """
     # Compute configuration hash for cache validation
     config_for_hash = build_cache_config_signature(config)
@@ -1258,10 +1576,29 @@ def compute_global_bz_balancing_indices(
     stokes_normalizer: StokesNormalizer,
     cache: MuramDataCache | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
-    """Build global Bz-bin balancing indices across all training steps.
+    """Balance pixels by |Bz| across all training steps at once and split the selection back per step.
 
-    The balancing score is |Bz| evaluated at the deepest optical-depth level
-    unless bz_balance_tau_idx is explicitly provided.
+    The score is |Bz| (G) at node ``bz_balance_tau_idx``, by default the deepest node
+    (log tau = 1.4). Bins and the per-bin target follow
+    :func:`utils.muram_data.build_bz_balance_bin_edges` and the same oversampling rules as the
+    per-step balancer, with ``bz_balance_seed``. A step left with no pixel keeps one.
+
+    Args:
+        train_steps: Training steps.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer (to recover |Bz| in G from the targets).
+        stokes_normalizer: Fitted Stokes normalizer.
+        cache: Per-step cache, or ``None``.
+
+    Returns:
+        ``(indices_per_step, metadata)``; both empty when Bz balancing is off.
+
+    Raises:
+        ValueError: If ``bz_balance_tau_idx`` is out of range.
+        RuntimeError: If no bin is occupied.
+
+    Examples:
+        >>> sel, meta = compute_global_bz_balancing_indices(steps, cfg, mn, sn, cache)  # doctest: +SKIP
     """
     if not config.apply_bz_bin_balance:
         return {}, {}
@@ -1445,33 +1782,29 @@ def train_one_step(
     logger: MetricsLogger | None,
     enable_physics: bool = True,
 ) -> dict[str, float]:
-    """
-    Train on one simulation step (one epoch through that step's data).
-    
-    Parameters
-    ----------
-    model : PhysicsInformedMSCNN
-        Model with integrated physics computation
-    dataloader : DataLoader
-        DataLoader for this step
-    approx_data : Dict[str, np.ndarray]
-        Physics approximations for this step (blos, vlos, temp)
-    mhd_normalizer : MhdNormalizer
-        Normalizer for denormalization
-    optimizer : torch.optim.Optimizer
-        Optimizer
-    config : TrainingConfig
-        Training configuration
-    epoch : int
-        Current epoch number
-    step_num : int
-        Current simulation step number
-    logger : MetricsLogger
-        Metrics logger
-    Returns
-    -------
-    step_metrics : Dict[str, float]
-        Dictionary containing average loss components for this step
+    """One full pass over one step's pixels: forward, loss, backward, clip, update, per batch.
+
+    The physics context (normalizer, nodes and this step's approximation maps) is set once.
+    Gradients are clipped to ``gradient_clip`` (L2 norm) when it is positive.
+
+    Args:
+        model: The model.
+        dataloader: Batches of this step.
+        approx_data: This step's ``"blos"``, ``"vlos"`` and ``"temp"`` maps.
+        mhd_normalizer: Fitted MHD normalizer.
+        optimizer: Optimizer.
+        config: The training configuration.
+        epoch: Epoch index (0-based).
+        step_num: Simulation step (for logging).
+        logger: Logger, or ``None``.
+        enable_physics: Whether the physics gate is open.
+
+    Returns:
+        The losses averaged over the batches; the physics entries are NaN when the gate is
+        closed.
+
+    Examples:
+        >>> metrics = train_one_step(model, loader, approx, mn, opt, cfg, 0, 110, None)  # doctest: +SKIP
     """
     model.train()
     
@@ -1560,28 +1893,25 @@ def validate(
     stokes_normalizer: StokesNormalizer,
     cache: MuramDataCache | None = None,
 ) -> float:
-    """
-    Validate on a subset of steps.
-    
-    Parameters
-    ----------
-    model : PhysicsInformedMSCNN
-        Model to validate
-    val_steps : List[int]
-        Validation step numbers
-    config : TrainingConfig
-        Training configuration
-    mhd_normalizer : MhdNormalizer
-        MHD normalizer
-    stokes_normalizer : StokesNormalizer
-        Stokes normalizer
-    cache : MuramDataCache, optional
-        Cache manager for data loading
-    
-    Returns
-    -------
-    avg_val_loss : float
-        Average validation loss across all validation steps
+    """Mean loss per pixel over the validation steps, with the physics terms always on.
+
+    All pixels of each step are used (no balancing). Because the physics terms are included
+    from epoch 1, a physics flavor's validation loss is not comparable with the baseline's,
+    which is MSE only. Steps that fail are skipped with a warning.
+
+    Args:
+        model: The model.
+        val_steps: Validation steps.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        cache: Per-step cache, or ``None``.
+
+    Returns:
+        The pixel-weighted mean loss, or NaN if no step could be used.
+
+    Examples:
+        >>> val_loss = validate(model, [150], cfg, mn, sn, cache)  # doctest: +SKIP
     """
     model.eval()
     n_val_samples = 0
@@ -1659,7 +1989,24 @@ def save_checkpoint(
     wfa_gate_state: dict[str, Any] | None = None,
     is_best: bool = False,
 ):
-    """Save training checkpoint."""
+    """Save model, optimizer, losses, configuration and gate state for ``epoch``.
+
+    Writes ``checkpoint_epoch_<epoch>.pth`` in ``config.checkpoint_dir`` and also
+    ``best_model.pth`` when ``is_best``.
+
+    Args:
+        model: The model.
+        optimizer: Optimizer.
+        epoch: Epoch number used in the file name.
+        train_loss: Training loss.
+        val_loss: Validation loss.
+        config: The training configuration (stored as a dict).
+        wfa_gate_state: Gate state, to resume with the same gate.
+        is_best: Also write ``best_model.pth``.
+
+    Examples:
+        >>> save_checkpoint(model, opt, 10, 0.1, 0.2, cfg)  # doctest: +SKIP
+    """
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -1686,14 +2033,19 @@ def load_checkpoint(
     model: PhysicsInformedMSCNN,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[int, float, float, dict[str, Any] | None]:
-    """
-    Load training checkpoint.
-    
-    Returns
-    -------
-    start_epoch : int
-    train_loss : float
-    val_loss : float
+    """Restore model (and optimizer) weights from a checkpoint.
+
+    Args:
+        checkpoint_path: File written by :func:`save_checkpoint`.
+        model: Model to load into.
+        optimizer: Optimizer to load into, or ``None``.
+
+    Returns:
+        ``(start_epoch, train_loss, val_loss, gate_state)``; ``start_epoch`` is the saved
+        epoch plus one.
+
+    Examples:
+        >>> start, tl, vl, gate = load_checkpoint(Path("checkpoint_epoch_010.pth"), model, opt)  # doctest: +SKIP
     """
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -1738,36 +2090,41 @@ def train_epoch(
     balanced_cache_signature_hash: str | None = None,
     preloaded_balanced_steps: dict[int, tuple[BalancedStepTensorDataset, dict[str, np.ndarray]]] | None = None,
 ) -> dict[str, float]:
-    """
-    Train for one epoch across multiple simulation steps.
-    
-    Parameters
-    ----------
-    model : PhysicsInformedMSCNN
-        Model to train
-    train_steps : List[int]
-        List of simulation steps to use for training
-    config : TrainingConfig
-        Training configuration
-    mhd_normalizer : MhdNormalizer
-        MHD data normalizer
-    stokes_normalizer : StokesNormalizer
-        Stokes data normalizer
-    optimizer : torch.optim.Optimizer
-        Optimizer
-    epoch : int
-        Current epoch number (for logging)
-    logger : MetricsLogger, optional
-        Logger for batch-level metrics
-    n_steps_per_epoch : int, optional
-        Maximum number of steps to use per epoch (-1 for all steps)
-    cache : MuramDataCache, optional
-        Cache manager for data loading
-    
-    Returns
-    -------
-    epoch_metrics : Dict[str, float]
-        Aggregated metrics for the epoch
+    """One epoch: every training step once, in a random order, one full pass per step.
+
+    The steps are shuffled with Python's ``random`` (seeded by :func:`set_global_seed`).
+    Each step's samples come from the preloaded balanced cache, the balanced cache on disk,
+    or :func:`load_and_prepare_step`, in that order of preference, and are shuffled into
+    batches of ``config.batch_size``. Batches of different steps are never mixed, so the last
+    step of an epoch is the most recent the model has seen.
+
+    Args:
+        model: The model.
+        train_steps: Training steps.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        optimizer: Optimizer.
+        epoch: Epoch index (0-based).
+        logger: Logger, or ``None``.
+        n_steps_per_epoch: Use only this many of the shuffled steps (-1 for all).
+        cache: Per-step cache, or ``None``.
+        enable_physics: Whether the physics gate is open.
+        global_bz_selection_indices: Pixels per step from global Bz balancing.
+        global_bz_balance_metadata: Its metadata.
+        balanced_cache: Balanced cache to read from disk, or ``None``.
+        balanced_cache_signature_hash: Its signature hash.
+        preloaded_balanced_steps: Steps already in RAM, or ``None``.
+
+    Returns:
+        Losses averaged over the steps (each step weighs the same, whatever its pixel
+        count), plus ``n_steps`` and ``n_pixels_used``.
+
+    Raises:
+        RuntimeError: If no step could be used.
+
+    Examples:
+        >>> metrics = train_epoch(model, [110, 120, 130, 140], cfg, mn, sn, opt, epoch=0)  # doctest: +SKIP
     """
     model.train()
     
@@ -1897,8 +2254,23 @@ def generate_epoch_diagnostic_plots(
     stokes_normalizer: StokesNormalizer,
     cache: MuramDataCache | None = None,
 ) -> None:
-    """
-    Save per-epoch image + jointplot diagnostics for one monitoring step.
+    """Save per-epoch maps and scatter plots of prediction against truth for one MURaM step.
+
+    For each quantity in ``epoch_plot_params`` and node in ``epoch_plot_ods`` (default
+    -1.0, -0.8, 0.0) it writes the true, predicted and error maps and a joint plot, plus a
+    CSV of correlation and RRMSE, under ``log_dir/epoch_diagnostics/step_<step>/epoch_<n>``.
+
+    Args:
+        model: The model.
+        epoch: Epoch index (0-based).
+        step: MURaM step to plot.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        cache: Per-step cache, or ``None``.
+
+    Examples:
+        >>> generate_epoch_diagnostic_plots(model, 0, 150, cfg, mn, sn, cache)  # doctest: +SKIP
     """
     logtau = config.get_logtau_values()
     ods = config.epoch_plot_ods if config.epoch_plot_ods is not None else [-1.0, -0.8, 0.0]
@@ -2107,6 +2479,7 @@ def generate_epoch_diagnostic_plots(
 
 
 def _resize_map_to_shape(arr2d: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """Bilinear resize of a 2-D map to ``target_shape`` (unchanged if it already matches)."""
     if arr2d.shape == target_shape:
         return arr2d
     t = torch.from_numpy(np.asarray(arr2d, dtype=np.float32)).float().unsqueeze(0).unsqueeze(0)
@@ -2118,8 +2491,14 @@ def generate_epoch_metric_trend_plots(
     config: TrainingConfig,
     step: int,
 ) -> None:
-    """
-    Build trend plots (Corr and RRMSE) from per-epoch diagnostic CSVs.
+    """Plot correlation and RRMSE against epoch from the per-epoch diagnostic CSVs of one step.
+
+    Args:
+        config: The training configuration (locates ``log_dir``).
+        step: The monitored MURaM step.
+
+    Examples:
+        >>> generate_epoch_metric_trend_plots(cfg, 150)  # doctest: +SKIP
     """
     step_dir = config.log_dir / "epoch_diagnostics" / f"step_{step}"
     if not step_dir.exists():
@@ -2158,6 +2537,7 @@ def generate_epoch_metric_trend_plots(
     trends_dir.mkdir(parents=True, exist_ok=True)
 
     def _save_metric_plot(metric_name: str, value_index: int, out_name: str, y_label: str) -> None:
+        """Plot one metric column against epoch for every quantity and node, and save it."""
         fig, ax = plt.subplots(figsize=(10, 6))
         for (param, logtau), values in sorted(trend_records.items(), key=lambda item: (item[0][0], item[0][1])):
             values_sorted = sorted(values, key=lambda x: x[0])
@@ -2179,6 +2559,7 @@ def generate_epoch_metric_trend_plots(
 
 
 def _default_modest_temp_calibration_path(config: TrainingConfig) -> Path:
+    """Calibration file: the configured one, else ``log_dir/epoch_diagnostics_modest/temperature_calibration.json``."""
     if config.modest_temp_calibration_file:
         return Path(config.modest_temp_calibration_file)
     return config.log_dir / "epoch_diagnostics_modest" / "temperature_calibration.json"
@@ -2190,6 +2571,12 @@ def _fit_temperature_affine_per_tau(
     true_cube: np.ndarray,
     pred_cube: np.ndarray,
 ) -> dict[str, Any]:
+    """Fit ``T_true = a T_pred + b`` per node on MODEST, for the optional temperature calibration.
+
+    Only nodes with at least ``modest_temp_calibration_min_samples`` finite pairs are fitted,
+    optionally after clipping both to the configured quantiles. Diagnostics only; the paper
+    runs leave the calibration off.
+    """
     min_samples = int(config.modest_temp_calibration_min_samples)
     clip_q = config.modest_temp_calibration_clip_quantiles
     coefficients: dict[str, dict[str, float | int]] = {}
@@ -2251,6 +2638,7 @@ def _fit_temperature_affine_per_tau(
 
 
 def _load_temperature_calibration(path: Path) -> dict[str, Any] | None:
+    """Read a calibration JSON, or ``None`` if the file does not exist."""
     if not path.exists():
         return None
     with open(path, "r", encoding="utf-8") as f:
@@ -2258,12 +2646,19 @@ def _load_temperature_calibration(path: Path) -> dict[str, Any] | None:
 
 
 def _save_temperature_calibration(path: Path, payload: dict[str, Any]) -> None:
+    """Write a calibration JSON, creating its folder."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
 def _find_tau_calibration_coeff(coefficients: dict[str, dict[str, Any]], tau_val: float) -> dict[str, Any] | None:
+    """Coefficients stored for the node ``tau_val`` (matched to 1e-6), or ``None``.
+
+    Examples:
+        >>> _find_tau_calibration_coeff({"-0.800000": {"a": 1.0, "b": 50.0}}, -0.8)
+        {'a': 1.0, 'b': 50.0}
+    """
     for key, coeff in coefficients.items():
         try:
             if np.isclose(float(key), float(tau_val), atol=1e-6, rtol=0.0):
@@ -2278,6 +2673,14 @@ def _apply_temperature_affine_per_tau(
     matches: list[tuple[float, int, int]],
     payload: dict[str, Any],
 ) -> np.ndarray:
+    """Apply ``a T + b`` to the matched nodes of a predicted temperature cube (K); other nodes are unchanged.
+
+    Examples:
+        >>> cube = np.full((1, 1, 2), 6000.0)
+        >>> out = _apply_temperature_affine_per_tau(cube, [(0.0, 0, 1)], {"coefficients": {"0.000000": {"a": 1.0, "b": -100.0}}})
+        >>> out.ravel().tolist()
+        [6000.0, 5900.0]
+    """
     coefficients = payload.get("coefficients", {}) if isinstance(payload, dict) else {}
     out = np.array(pred_cube, copy=True)
     for tau_val, _i_mod, i_pred in matches:
@@ -2295,7 +2698,23 @@ def prepare_modest_epoch_snapshot(
     config: TrainingConfig,
     stokes_normalizer: StokesNormalizer,
 ) -> dict[str, object]:
-    """Load and normalize one MODEST snapshot for repeated per-epoch diagnostics."""
+    """Load and normalize one MODEST scene once, for the per-epoch MODEST metrics and plots.
+
+    The model input is built as in the analysis (``ModestData.load_all``, downsampled or
+    upsampled), divided by its continuum only if it looks un-normalized, and normalized with
+    the Stokes statistics. SPINOR's T, v_LOS and B_LOS at its three nodes are the reference.
+
+    Args:
+        config: The training configuration (MODEST settings).
+        stokes_normalizer: Fitted Stokes normalizer.
+
+    Returns:
+        Dict with ``stokes_input`` ``(n_pix, 2, 112)``, ``pred_nx``, ``pred_ny``,
+        ``modest_logtau`` and ``gt_den`` (SPINOR's ``{"T", "Vz", "Bz"}`` cubes).
+
+    Examples:
+        >>> snap = prepare_modest_epoch_snapshot(cfg, stokes_norm)  # doctest: +SKIP
+    """
     modest = ModestData(
         circular_polarization_threshold=config.modest_polarization_threshold,
         stokes_v_multiplier=config.modest_stokes_v_multiplier,
@@ -2359,7 +2778,21 @@ def generate_epoch_modest_diagnostic_plots(
     mhd_normalizer: MhdNormalizer,
     modest_snapshot: dict[str, object],
 ) -> None:
-    """Save per-epoch image + jointplot diagnostics for one MODEST snapshot."""
+    """Save per-epoch maps and scatter plots of prediction against SPINOR for the MODEST snapshot.
+
+    Optionally fits or applies the temperature calibration first. Output goes to
+    ``log_dir/epoch_diagnostics_modest/epoch_<n>``.
+
+    Args:
+        model: The model.
+        epoch: Epoch index (0-based).
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        modest_snapshot: Output of :func:`prepare_modest_epoch_snapshot`.
+
+    Examples:
+        >>> generate_epoch_modest_diagnostic_plots(model, 0, cfg, mn, snap)  # doctest: +SKIP
+    """
     pred_logtau = config.get_logtau_values()
     modest_logtau = np.asarray(modest_snapshot["modest_logtau"], dtype=np.float32)
 
@@ -2571,9 +3004,16 @@ def generate_epoch_diagnostic_videos(
     config: TrainingConfig,
     step: int | None = None,
 ) -> None:
-    """
-    Build MP4 videos from per-epoch diagnostic PNGs.
-    Creates one video per plot type (param + logtau + style) for each monitored step.
+    """Turn the per-epoch MURaM diagnostic PNGs into MP4 videos (GIF if FFmpeg fails).
+
+    Skipped with a warning if ``imageio`` is not installed.
+
+    Args:
+        config: The training configuration (``log_dir``, ``epoch_plot_video_fps``).
+        step: Monitored step; ``None`` uses every step folder found.
+
+    Examples:
+        >>> generate_epoch_diagnostic_videos(cfg, step=150)  # doctest: +SKIP
     """
     try:
         import imageio.v2 as imageio
@@ -2666,7 +3106,14 @@ def generate_epoch_diagnostic_videos(
     return
 
 def generate_epoch_modest_diagnostic_videos(config: TrainingConfig) -> None:
-    """Build MP4 videos from MODEST per-epoch diagnostic PNGs."""
+    """Turn the per-epoch MODEST diagnostic PNGs into MP4 videos (GIF if FFmpeg fails).
+
+    Args:
+        config: The training configuration.
+
+    Examples:
+        >>> generate_epoch_modest_diagnostic_videos(cfg)  # doctest: +SKIP
+    """
     try:
         import imageio.v2 as imageio
     except Exception as e:
@@ -2748,7 +3195,19 @@ def generate_epoch_modest_diagnostic_videos(config: TrainingConfig) -> None:
             print(f"  ✓ MODEST GIF saved: {out_gif}")
 
 def train_pinn_model(config: TrainingConfig):
-    """Main training loop with interleaved epoch training."""
+    """Stand-alone training loop (the paper uses ``ablation_study.py`` instead).
+
+    Loads the normalizers, builds the model and Adam optimizer, optionally resumes, picks
+    10 % of the steps ``min_step..max_step`` at random as validation steps, optionally runs
+    global Bz balancing and the balanced cache, then trains for ``n_epochs`` with the
+    physics gate, validation, diagnostics and checkpoints.
+
+    Args:
+        config: The training configuration.
+
+    Examples:
+        >>> train_pinn_model(TrainingConfig(n_epochs=2, min_step=110, max_step=130))  # doctest: +SKIP
+    """
     
     print("=" * 70)
     print("PINN MSCNN Training".center(70))
@@ -3152,6 +3611,20 @@ def train_pinn_model(config: TrainingConfig):
 
 
 def main():
+    """Command-line entry point: build a configuration from a file and flags, then train.
+
+    Note:
+        ``data_source`` and ``stokes_ic_mode`` are set after the configuration is built, so
+        ``__post_init__`` does not re-run for them: the default ``--stokes-ic-mode
+        fixed_global`` replaces the ``per_step`` mode forced for ``nicole_tau500``. The NICOLE
+        loader ignores that mode, so only the cache signature differs from
+        ``ablation_study.py``'s.
+
+    Examples:
+        Resume a run for 50 more epochs::
+
+            python scripts/base_training.py --config checkpoints/config.json --resume checkpoints/checkpoint_epoch_100.pth --epochs 150
+    """
     parser = argparse.ArgumentParser(description="Train PINN MSCNN model")
     parser.add_argument('--config', type=str, help='Path to configuration JSON file')
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')

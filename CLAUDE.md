@@ -107,7 +107,7 @@ Physics approximations live in `utils/physics_utils.py` (`ApproxInversions`):
 
 ### Training Pipeline
 
-`scripts/base_training.py` defines `TrainingConfig` (dataclass with all hyperparameters and data paths) and the training loop functions `train_epoch()`, `train_one_step()`, `validate()`, and `MetricsLogger` (CSV logging). Training interleaves batches across multiple simulation timesteps within each epoch.
+`scripts/base_training.py` defines `TrainingConfig` (dataclass with all hyperparameters and data paths) and the training loop functions `train_epoch()`, `train_one_step()`, `validate()`, and `MetricsLogger` (CSV logging). Each epoch visits the training steps in a random order and makes one full pass over each step's pixels before moving to the next (batches of different steps are not mixed). The validation loss includes the physics terms from epoch 1; the saved model is the last epoch (`final_model.pth`).
 
 `scripts/experiments/ablation_study.py` runs 5 configurations: all physics terms, WFA only, Doppler only, Temperature only, and no physics (baseline).
 

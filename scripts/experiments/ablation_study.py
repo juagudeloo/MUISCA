@@ -1,14 +1,26 @@
-"""
-Physics Regularization Ablation Study
-======================================
+"""Ablation study of the physics terms: trains each MUISCA flavor on the same data and compares them.
 
-Compares PINN training with different regularization configurations:
-1. No physics (pure supervised learning)
-2. WFA only
-3. All physics terms (WFA + Gradient smoothness)
+Flavors: ``no_physics`` (baseline, MSE only), ``wfa_only``, ``doppler_only``,
+``black_body_only`` and ``all_physics_terms``. Giving several values to a lambda trains
+one model per value (``wfa-lambda-10``, ...). Every flavor is reseeded with the same
+``--seed`` before its model is built, so the flavors start from the same weights and see
+the same batch order.
 
-Usage:
-    python first_experiment.py --n_epochs 50 --device cuda
+The steps ``--min_step`` to ``--max_step`` (inclusive, every ``--step_size``) minus the
+test steps (198 to 200) are split at random, with ``--seed``, into training steps and
+10 % validation steps (at least one). For the steps 110, 120 and 130 of the paper runs
+that put 130 in validation.
+
+Each flavor writes ``experiment_config.json``, ``final_model.pth`` (the last epoch, not
+the best validation epoch), CSV logs and MLflow runs under
+``<output_dir>/<experiment_name>/<flavor>/``. The tracker then writes
+``experiment_results.json`` and comparison plots, keeping flavors stored by earlier
+submissions.
+
+Examples:
+    The paper runs go through ``tools/run_experiments.sh``; by hand::
+
+        python scripts/experiments/ablation_study.py --experiments wfa_only no_physics --n_epochs 1000 --min_step 110 --max_step 130 --step_size 10 --lambda_wfa 10
 """
 
 import sys
@@ -55,17 +67,17 @@ from scripts.base_training import (
 
 
 def _series_for_log_plot(values) -> np.ndarray:
-    """Convert non-positive values to NaN for stable log-scale plotting."""
+    """Values with non-positive entries replaced by NaN, for log-scale plots."""
     arr = np.asarray(values, dtype=float)
     return np.where(arr > 0, arr, np.nan)
 
 
 def _get_active_range(values) -> int:
-    """
-    Find the first index where a loss value becomes non-zero.
-    Used to avoid plotting zero values as a continuous line on log scale.
-    
-    Returns the first index where value > 0, or None if all values are <= 0.
+    """Index of the first positive value, or ``None`` if there is none (where a gated loss starts).
+
+    Examples:
+        >>> int(_get_active_range([0.0, 0.0, 0.3, 0.2]))
+        2
     """
     arr = np.asarray(values, dtype=float)
     nonzero_indices = np.where(arr > 0)[0]
@@ -77,7 +89,16 @@ def _denormalize_targets_from_stats(
     param: str,
     mhd_normalizer: MhdNormalizer,
 ) -> np.ndarray:
-    """Denormalize normalized targets using stored stats without clipping."""
+    """Undo the target normalization from the stored statistics, without the physical clip.
+
+    Unlike :meth:`MhdNormalizer.denormalize`, a ``"centered"`` quantity (Vz) is only
+    multiplied by its std, which is the exact inverse of the transform; Bz then goes through
+    ``B0 sinh``. Used for the training-data histograms.
+
+    Raises:
+        ValueError: For an unknown quantity.
+        RuntimeError: If the normalizer is not finalized.
+    """
     if param not in {'T', 'Vz', 'Bz'}:
         raise ValueError(f"Unsupported parameter: {param}")
 
@@ -119,7 +140,31 @@ def generate_training_data_histograms(
     max_samples_per_param: int = 400000,
     force_recompute: bool = False,
 ) -> tuple[Path, Path]:
-    """Generate per-τ histograms and summary stats for training-target value ranges."""
+    """Per-node histograms and statistics of the training targets, and the mean Stokes profiles.
+
+    Reads the training steps with the same balancing as training, keeps at most
+    ``max_samples_per_param`` values per quantity, and writes PNGs and JSON next to the
+    flavors (reused if they already exist).
+
+    Args:
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        train_steps: Training steps.
+        output_dir: Folder for the outputs (the experiment folder).
+        cache: Per-step cache, or ``None``.
+        global_bz_selection_indices: Pixels per step from global Bz balancing.
+        global_bz_balance_metadata: Its metadata.
+        bins: Number of histogram bins.
+        max_samples_per_param: Largest sample per quantity.
+        force_recompute: Rebuild even if the outputs exist.
+
+    Returns:
+        ``(index_json_path, stats_json_path)``.
+
+    Examples:
+        >>> generate_training_data_histograms(cfg, mn, sn, [110, 120], Path("output/exp"))  # doctest: +SKIP
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     hist_index_path = output_dir / "training_data_histograms_train_split_per_tau_index.json"
     stats_path = output_dir / "training_data_histograms_train_split_stats.json"
@@ -457,9 +502,14 @@ def generate_training_data_histograms(
 
 
 class ExperimentTracker:
-    """Tracks metrics across different experimental conditions."""
+    """Collect the results of every flavor of an experiment, save them and plot comparisons."""
     
     def __init__(self, output_dir: Path):
+        """Start a tracker, loading the flavors already stored for this experiment.
+
+        Args:
+            output_dir: The experiment folder (holds ``experiment_results.json``).
+        """
         self.output_dir = output_dir
         self.results = {}
         self._load_existing_results()
@@ -493,10 +543,31 @@ class ExperimentTracker:
             print(f"Loaded {len(stored)} existing variation(s) from {results_path.name}: "
                   f"{', '.join(stored)}")
     def add_experiment(self, name: str, metrics: dict):
-        """Add results from one experimental condition."""
+        """Add or replace one flavor's results.
+
+        Args:
+            name: Flavor name.
+            metrics: The dict returned by :func:`run_single_experiment`.
+
+        Examples:
+            >>> import tempfile, pathlib
+            >>> t = ExperimentTracker(pathlib.Path(tempfile.mkdtemp())); t.add_experiment("no_physics", {"final_val_loss": 0.1})
+            >>> list(t.results)
+            ['no_physics']
+        """
         self.results[name] = metrics
     def save_results(self):
-        """Save all results to JSON."""
+        """Write ``experiment_results.json`` with every flavor and a summary of training pixels used.
+
+        Examples:
+            >>> import tempfile, pathlib, json, io
+            >>> d = pathlib.Path(tempfile.mkdtemp()); t = ExperimentTracker(d)
+            >>> t.add_experiment("no_physics", {"total_training_pixels_used": 10})
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     t.save_results()
+            >>> json.loads((d / "experiment_results.json").read_text())["__metadata__"]["n_experiments"]
+            1
+        """
         results_path = self.output_dir / "experiment_results.json"
         training_pixels_by_experiment = {
             name: int(metrics.get('total_training_pixels_used', 0))
@@ -513,7 +584,11 @@ class ExperimentTracker:
         print(f"Results saved to {results_path}")
     
     def print_summary_table(self):
-        """Print a formatted summary table."""
+        """Print each flavor's final validation loss, training time and test metrics.
+
+        Examples:
+            >>> tracker.print_summary_table()  # doctest: +SKIP
+        """
         if not self.results:
             print("No results to display")
             return
@@ -567,7 +642,11 @@ class ExperimentTracker:
         print("=" * 140 + "\n")
     
     def plot_individual_loss_curves(self):
-        """Generate individual plots for each experiment showing all loss components."""
+        """Plot every loss component against epoch for each flavor (one figure per flavor).
+
+        Examples:
+            >>> tracker.plot_individual_loss_curves()  # doctest: +SKIP
+        """
         for exp_name, results in self.results.items():
             fig, axes = plt.subplots(2, 3, figsize=(18, 10))
             fig.suptitle(f'Loss Components - {exp_name}', fontsize=14, fontweight='bold')
@@ -646,7 +725,14 @@ class ExperimentTracker:
         print(f"Individual loss curve plots saved to {self.output_dir}")
 
     def plot_testset_correlation_and_rrmse(self):
-        """Generate per-experiment test-set correlation/RRMSE evolution plots and persist CSV metrics."""
+        """Plot, per flavor, the epoch history of the per-epoch "test" correlation and RRMSE, and save them as CSV.
+
+        These are the metrics of :func:`compute_tau_averaged_metrics` and
+        :func:`compute_modest_tau_averaged_metrics`; see their notes on what they compare.
+
+        Examples:
+            >>> tracker.plot_testset_correlation_and_rrmse()  # doctest: +SKIP
+        """
         labels = ['B_LOS', 'V_LOS', 'Temp']
 
         for exp_name, results in self.results.items():
@@ -855,7 +941,11 @@ class ExperimentTracker:
         print(f"Per-experiment MURaM/MODEST test-set correlation/RRMSE evolution plots saved to {self.output_dir}")
         
     def generate_comparison_plots(self):
-        """Generate comparison visualizations."""
+        """Plot all flavors together: loss curves and final metrics.
+
+        Examples:
+            >>> tracker.generate_comparison_plots()  # doctest: +SKIP
+        """
         if not self.results:
             print("No results to plot")
             return
@@ -1069,6 +1159,15 @@ class ExperimentTracker:
 
 def _tau_average(values: np.ndarray, logtau_values: np.ndarray) -> np.ndarray:
     # 1D integration in tau; independent from spatial plotting choices.
+    """Average each row over linear tau with the trapezoid rule: ``sum(mean(v) d tau) / (tau_max - tau_min)``.
+
+    The deepest nodes dominate: with nodes up to log tau = 1.4, the last few nodes carry most
+    of the weight.
+
+    Examples:
+        >>> round(float(_tau_average(np.full((1, 3), 7.0), np.array([-1.0, 0.0, 1.0]))[0]), 9)
+        7.0
+    """
     tau_linear = 10 ** logtau_values
     dtau = np.diff(tau_linear)
     denom = (tau_linear[-1] - tau_linear[0]) + 1e-12
@@ -1077,6 +1176,7 @@ def _tau_average(values: np.ndarray, logtau_values: np.ndarray) -> np.ndarray:
 
 
 def _normalize_lambda_values(values) -> list[float]:
+    """A lambda argument as a list of floats (``None`` gives ``[]``)."""
     if values is None:
         return []
     if isinstance(values, (list, tuple)):
@@ -1085,10 +1185,22 @@ def _normalize_lambda_values(values) -> list[float]:
 
 
 def _lambda_token(value: float) -> str:
+    """A lambda as a folder-name token: ``0.5`` gives ``"0_5"`` and ``1e-3`` gives ``"0_001"``.
+
+    Examples:
+        >>> _lambda_token(0.5), _lambda_token(-2)
+        ('0_5', 'm2')
+    """
     return f"{float(value):g}".replace("-", "m").replace(".", "_")
 
 
 def _variant_names(base_key: str, folder_prefix: str, lambda_value: float, is_multi: bool) -> tuple[str, str]:
+    """Result key and folder name of a flavor; with several lambdas, the lambda is appended.
+
+    Examples:
+        >>> _variant_names("wfa_only", "wfa", 10.0, True)
+        ('wfa_only-lambda-10', 'wfa-lambda-10')
+    """
     if not is_multi:
         return base_key, base_key
     token = _lambda_token(lambda_value)
@@ -1103,7 +1215,34 @@ def compute_tau_averaged_metrics(
     logtau_values: np.ndarray,
     cache: MuramDataCache | None = None,
 ) -> dict[str, float]:
-    """Evaluate model on test steps using tau-averaged physics metrics."""
+    """Per-epoch "test" metrics on the MURaM test steps: RRMSE and correlation of tau-averaged predictions.
+
+    Note:
+        The reference is each pixel's physics approximation (the WFA B_LOS, Doppler v_LOS and
+        black-body T maps), not MURaM's atmosphere, and the prediction is averaged over linear
+        tau (dominated by the deepest nodes) while each approximation describes one height.
+        These numbers measure agreement with the approximations, not accuracy. They are logged
+        (``test_set_epoch_log.csv``, MLflow ``test_*``) but not used in the paper.
+
+    Args:
+        model: The model.
+        test_steps: MURaM test steps (missing ones are skipped).
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        logtau_values: The model's nodes.
+        cache: Per-step cache, or ``None``.
+
+    Returns:
+        ``{blos,vlos,temp}_rrmse_tau_avg``, ``..._correlation`` and ``..._rmse`` (G, km/s,
+        K); NaN when no step is usable.
+
+    Raises:
+        KeyError: If a step has no approximation maps.
+
+    Examples:
+        >>> m = compute_tau_averaged_metrics(model, [198], cfg, mn, sn, cfg.get_logtau_values(), cache)  # doctest: +SKIP
+    """
     from scipy.stats import pearsonr
 
     model.eval()
@@ -1251,7 +1390,26 @@ def compute_modest_tau_averaged_metrics(
     mhd_normalizer: MhdNormalizer,
     modest_snapshot: dict[str, object],
 ) -> dict[str, float]:
-    """Evaluate model on MODEST snapshot using tau-averaged metrics over common optical-depth nodes."""
+    """Per-epoch metrics on the MODEST snapshot against SPINOR, averaged over the shared nodes.
+
+    The prediction and SPINOR's atmosphere are both averaged (plain mean) over the nodes
+    they share (log tau = -2.0, -0.8 and 0.0), then compared pixel by pixel. With the
+    default V multiplier of -1, the B_LOS correlation comes out negative (see
+    ``ModestData``).
+
+    Args:
+        model: The model.
+        config: The training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        modest_snapshot: Output of ``prepare_modest_epoch_snapshot``.
+
+    Returns:
+        ``{blos,vlos,temp}_rrmse_tau_avg``, ``..._correlation`` and ``..._rmse``; NaN if no
+        node is shared.
+
+    Examples:
+        >>> m = compute_modest_tau_averaged_metrics(model, cfg, mn, snapshot)  # doctest: +SKIP
+    """
     pred_logtau = config.get_logtau_values()
     modest_logtau = np.asarray(modest_snapshot["modest_logtau"], dtype=np.float32)
 
@@ -1301,6 +1459,7 @@ def compute_modest_tau_averaged_metrics(
     }
 
     def _metric_pair(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float, float]:
+        """RMSE, RRMSE and correlation over the finite pairs (NaN if none)."""
         m = np.isfinite(y_true) & np.isfinite(y_pred)
         yt = y_true[m]
         yp = y_pred[m]
@@ -1331,6 +1490,16 @@ def compute_modest_tau_averaged_metrics(
 
 @contextlib.contextmanager
 def timer():
+    """Context manager that prints the elapsed time in minutes.
+
+    Examples:
+        >>> import io
+        >>> with contextlib.redirect_stdout(io.StringIO()) as out:
+        ...     with timer():
+        ...         pass
+        >>> out.getvalue().startswith("Elapsed time: 0.00 minutes")
+        True
+    """
     start = time.time()
     
     try:
@@ -1354,7 +1523,37 @@ def run_single_experiment(
     training_hist_bins: int = 120,
     training_hist_max_samples: int = 400000,
 ) -> dict:
-    """Run a single training experiment."""
+    """Train and evaluate one flavor, and save its model, logs and MLflow run.
+
+    Reseeds with ``config.seed``, builds the model (the architecture is fixed here: scales
+    1, 2, 3; 2 input channels; 16 filters; kernel 5; pool 2; 4 dense layers), splits the
+    steps (see the module docstring), optionally prepares global Bz balancing, the balanced
+    cache and the training-data histograms, then trains for ``n_epochs`` with the physics
+    gate. After every epoch it computes the validation loss (on at most 5 validation
+    steps), the MURaM and MODEST per-epoch metrics, and the diagnostic plots.
+
+    Args:
+        experiment_name: Flavor name (also the MLflow run name).
+        config: The flavor's training configuration.
+        mhd_normalizer: Fitted MHD normalizer.
+        stokes_normalizer: Fitted Stokes normalizer.
+        test_steps: MURaM test steps, excluded from training and validation.
+        n_steps_per_epoch: Steps used per epoch (-1 for all).
+        min_step: First step.
+        max_step: Last step (inclusive).
+        step_size: Spacing between steps.
+        cache: Per-step cache, or ``None``.
+        plot_training_data_histograms: Also write the training-data histograms.
+        training_hist_bins: Number of histogram bins.
+        training_hist_max_samples: Largest histogram sample per quantity.
+
+    Returns:
+        Dict with the loss histories, final validation loss, timing, gate state, final and
+        per-epoch test metrics (MURaM and MODEST) and the configuration.
+
+    Examples:
+        >>> res = run_single_experiment("wfa_only", cfg, mn, sn, [198], -1, 110, 130, 10, cache)  # doctest: +SKIP
+    """
     print("\n" + "=" * 100)
     print(f"EXPERIMENT: {experiment_name}".center(100))
     print("=" * 100)
@@ -1999,6 +2198,13 @@ def run_single_experiment(
     }
 
 def main():
+    """Command-line entry point: build each requested flavor's configuration and run them in turn.
+
+    Examples:
+        A two-epoch smoke run of the baseline::
+
+            python scripts/experiments/ablation_study.py --experiments no_physics --n_epochs 2
+    """
     import argparse
     
     parser = argparse.ArgumentParser(description="Physics regularization ablation study")
@@ -2435,6 +2641,7 @@ def main():
     )
 
     def _build_cfg(folder_name: str, lambda_wfa: float, lambda_doppler: float, lambda_temp: float) -> TrainingConfig:
+        """Configuration of one flavor: the shared command-line settings plus its folder and lambdas."""
         return TrainingConfig(
             data_path=str(data_path),
             n_epochs=args.n_epochs,
