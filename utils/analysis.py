@@ -1,3 +1,25 @@
+"""Post-training analysis: load trained flavors, predict on MURaM or MODEST, compute metrics and plot.
+
+* Metric helpers (:func:`compute_regression_metrics`,
+  :func:`compute_distribution_similarity_metrics`, :func:`compute_metrics_by_field_strength`,
+  :func:`compute_metric_vs_tau`). RRMSE is always ``RMSE / mean(|truth|)``, dimensionless.
+* :class:`AnalysisModelPipeline`: finds the flavors of an experiment, loads their
+  checkpoints and predicts in physical units.
+* :class:`MuramDiagnosticPlots` and :class:`ModestDiagnosticPlots`: per-model maps,
+  scatter plots and ``metrics_summary.csv`` (the source of the paper's MODEST tables).
+* Multi-model figures (:func:`plot_combined_images_grid`,
+  :func:`plot_combined_jointplot_grid`, :func:`plot_metric_vs_tau`).
+* Labels: display names, LaTeX symbols and units for every quantity.
+
+Examples:
+    The scripts ``scripts/analysis/muram_analysis.py`` and ``modest_analysis.py`` drive
+    this module; in short::
+
+        pipe = AnalysisModelPipeline(device, output_dir, experiment_root=root)
+        configs, models, n_tau = pipe.prepare_models(["no_physics", "wfa_only"])
+        pred = pipe.predict_and_denormalize(models["wfa_only"], stokes_input, mhd_norm, nx, ny)
+"""
+
 from pathlib import Path
 import json
 import csv
@@ -45,7 +67,20 @@ MODEL_CANONICAL_ORDER = ("no_physics", "wfa_only", "doppler_only", "black_body_o
 
 
 def display_name(model_type: str) -> str:
-    """Human-readable label for a model's raw experiment key, for plot titles/legends only."""
+    """Plot label of a flavor's key ("wfa_only" gives "WFA"); unknown keys are returned unchanged.
+
+    Only for titles and legends: folder names, file names and CSV columns keep the raw key.
+
+    Args:
+        model_type: Flavor key.
+
+    Returns:
+        The display name.
+
+    Examples:
+        >>> display_name("no_physics"), display_name("wfa-lambda-10")
+        ('Baseline', 'wfa-lambda-10')
+    """
     return MODEL_DISPLAY_NAMES.get(model_type, model_type)
 
 
@@ -58,6 +93,22 @@ PARAM_LATEX_LOS = {"T": r"$T$", "Vz": r"$v_{\mathrm{LOS}}$", "Bz": r"$B_{\mathrm
 
 
 def param_latex(param: str, los: bool = False) -> str:
+    r"""LaTeX symbol of a quantity: ``$V_z$``, or ``$v_{\mathrm{LOS}}$`` with ``los=True``.
+
+    MURaM figures use the vertical components (at disk centre they are the line-of-sight
+    ones); MODEST figures compare with SPINOR's line-of-sight quantities and use ``los=True``.
+
+    Args:
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        los: Use the line-of-sight symbols.
+
+    Returns:
+        The LaTeX string.
+
+    Examples:
+        >>> param_latex("Bz"), param_latex("Bz", los=True)
+        ('$B_z$', '$B_{\\mathrm{LOS}}$')
+    """
     table = PARAM_LATEX_LOS if los else PARAM_LATEX
     return table.get(param, f"${param}$")
 
@@ -69,11 +120,33 @@ PARAM_UNITS = {"T": "K", "Vz": r"$\mathrm{km\,s^{-1}}$", "Bz": "G"}
 
 
 def param_unit(param: str) -> str:
+    """Unit label of a quantity: ``"K"``, km/s in LaTeX, or ``"G"`` (empty for unknown keys).
+
+    Args:
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+
+    Examples:
+        >>> param_unit("T"), param_unit("Bz")
+        ('K', 'G')
+    """
     return PARAM_UNITS.get(param, "")
 
 
 def param_axis_label(param: str, prefix: str = "", los: bool = False) -> str:
-    """Axis/colorbar label with unit: '$B_z$ [G]', or 'Ground truth [G]' when `prefix` is given."""
+    """Axis or colourbar label with its unit, e.g. ``"$B_z$ [G]"`` or ``"Ground truth [G]"``.
+
+    Args:
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        prefix: Text replacing the symbol (e.g. ``"Pred - GT"``).
+        los: Use the line-of-sight symbols.
+
+    Returns:
+        The label.
+
+    Examples:
+        >>> param_axis_label("Bz"), param_axis_label("T", "Ground truth")
+        ('$B_z$ [G]', 'Ground truth [K]')
+    """
     head = prefix if prefix else param_latex(param, los=los)
     unit = param_unit(param)
     return f"{head} [{unit}]" if unit else head
@@ -94,21 +167,37 @@ def modest_crop_extent(
     crop_bounds: tuple[int, int, int, int],
     scene_shape: tuple[int, int],
 ) -> tuple[tuple[float, float, float, float], tuple[str, str]]:
-    """Helioprojective extent of a MODEST crop given in native pixels (y0, y1, x0, x1).
+    """Helioprojective extent (arcsec) of a MODEST crop given in native pixels ``(y0, y1, x0, x1)``.
 
-    Returned for the UNtransposed orientation (horizontal axis = Solar-X, vertical = Solar-Y),
-    the same one the full-scene and regions-overview figures use, so a map must be drawn with
-    transpose=False to match it. Computed from the NATIVE bounds so it is independent of
-    whether the predictions live on the upsampled 0.16" grid or the native 0.32" one."""
+    The extent is for the untransposed orientation (horizontal axis Solar-X, vertical
+    Solar-Y), the one the full-scene and regions-overview figures use, so maps must be drawn
+    with ``transpose=False``. It is computed from the native 0.32 arcsec bounds, so it does
+    not depend on whether the predictions are on the upsampled or the native grid; pixel
+    edges (not centres) are mapped, hence the half-pixel offset.
+
+    Args:
+        crop_bounds: ``(y0, y1, x0, x1)`` on the native grid.
+        scene_shape: ``(ny, nx)`` of the whole scene.
+
+    Returns:
+        ``((x_left, x_right, y_bottom, y_top), ("Solar-X [arcsec]", "Solar-Y [arcsec]"))``.
+
+    Examples:
+        >>> ext, labels = modest_crop_extent((0, 390, 0, 858), (390, 858))
+        >>> round(ext[1] - ext[0], 2), round(ext[3] - ext[2], 2), labels[0]
+        (274.56, 124.8, 'Solar-X [arcsec]')
+    """
     y0, y1, x0, x1 = (float(v) for v in crop_bounds)
     ny, nx = (float(v) for v in scene_shape)
     x_center, y_center = MODEST_FOV_CENTER_ARCSEC
     scale = MODEST_PIXEL_SCALE_ARCSEC
 
     def to_x(px: float) -> float:
+        """Solar-X (arcsec) of a native column coordinate."""
         return x_center + (px - nx / 2.0) * scale
 
     def to_y(py: float) -> float:
+        """Solar-Y (arcsec) of a native row coordinate."""
         return y_center + (py - ny / 2.0) * scale
 
     # imshow's extent maps array EDGES, not pixel centres -- hence the half-pixel offset.
@@ -117,21 +206,49 @@ def modest_crop_extent(
 
 
 def combined_plot_title(param: str, context: str, tau_val: float, los: bool = False) -> str:
-    """Shared title format for the combined multi-model comparison figures, e.g.
-    '$B_z$ - Simulation step 198 | $\\log \\tau = -1.00$'."""
+    r"""Title of the multi-model figures: ``"<symbol> - <context> | $\log \tau = <tau>$"``.
+
+    Args:
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        context: e.g. ``"Simulation step 198"``.
+        tau_val: The node.
+        los: Use the line-of-sight symbols.
+
+    Examples:
+        >>> combined_plot_title("T", "Simulation step 198", -1.0)
+        '$T$ - Simulation step 198 | $\\log \\tau = -1.00$'
+    """
     return f"{param_latex(param, los=los)} - {context} | " + r"$\log \tau = " + f"{tau_val:.2f}" + r"$"
 
 
 def combined_plot_title_no_tau(param: str, context: str, los: bool = False) -> str:
-    """Same title format as combined_plot_title but without a fixed tau value, for figures
-    where log(tau) is the plot's own X axis (e.g. metric-vs-tau curves), e.g.
-    '$B_z$ - Simulation step 198'."""
+    r"""Same title without a node, for figures whose x axis is log tau.
+
+    Args:
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        context: e.g. ``"Simulation step 198"``.
+        los: Use the line-of-sight symbols.
+
+    Examples:
+        >>> combined_plot_title_no_tau("Vz", "MODEST - Sunspot", los=True)
+        '$v_{\\mathrm{LOS}}$ - MODEST - Sunspot'
+    """
     return f"{param_latex(param, los=los)} - {context}"
 
 
 def ordered_models(models: dict) -> list[str]:
-    """Model keys present in `models`, in MODEL_CANONICAL_ORDER, with any unrecognized keys
-    (e.g. lambda-suffixed variants) appended at the end in their original order."""
+    """Keys of ``models`` in the canonical order, unknown keys (e.g. lambda variants) appended in their order.
+
+    Args:
+        models: Dict keyed by flavor.
+
+    Returns:
+        The ordered keys.
+
+    Examples:
+        >>> ordered_models({"wfa-lambda-1": 0, "wfa_only": 0, "no_physics": 0})
+        ['no_physics', 'wfa_only', 'wfa-lambda-1']
+    """
     ordered = [m for m in MODEL_CANONICAL_ORDER if m in models]
     ordered += [m for m in models if m not in MODEL_CANONICAL_ORDER]
     return ordered
@@ -143,12 +260,28 @@ def compute_metrics_by_field_strength(
     field_strength: np.ndarray,
     edges: tuple = FIELD_STRENGTH_BIN_EDGES_G,
 ) -> list[dict]:
-    """Regression metrics computed separately within bins of true |B_LOS|.
+    """Regression metrics within bins of the reference |B_LOS| (G) of each pixel.
 
-    Aggregate metrics hide where a model is reliable: a field of view is dominated by weak
-    pixels, so a good overall correlation can coexist with the strong-field regime being
-    badly wrong. `field_strength` is the reference |B_LOS| per pixel (same shape as y_true),
-    and binning on it -- not on the prediction -- keeps the split independent of the model.
+    A field of view is dominated by weak pixels, so a good overall correlation can hide a
+    badly wrong strong-field regime. Binning on the reference field (SPINOR's or MURaM's),
+    not on the prediction, keeps the split independent of the model. The default edges are
+    0, 100, 250, 500, 750, 1000, 1500 G and above.
+
+    Args:
+        y_true: Reference values.
+        y_pred: Predictions, same shape.
+        field_strength: Reference B_LOS per pixel in G (its absolute value is used).
+        edges: Bin edges in G.
+
+    Returns:
+        One dict per bin with ``field_bin``, ``bin_lo_G``, ``bin_hi_G``, ``n_points`` and,
+        for non-empty bins, the metrics of :func:`compute_regression_metrics`.
+
+    Examples:
+        >>> rows = compute_metrics_by_field_strength(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 0.0]),
+        ...                                          np.array([50.0, 60.0, 2000.0]))
+        >>> [(r["field_bin"], r["n_points"]) for r in rows if r["n_points"]]
+        [('0-100G', 2), ('>1500G', 1)]
     """
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
@@ -169,7 +302,25 @@ def compute_metrics_by_field_strength(
 
 
 def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Compute scalar quality metrics for prediction vs ground truth arrays."""
+    """Paired metrics of predictions against a reference, over the finite pairs.
+
+    ``rmse``, ``mae`` and ``bias`` (mean of pred - truth) are in the data's units;
+    ``rrmse`` = rmse / mean(|truth|) and ``nmae`` = mae / mean(|truth|) are dimensionless;
+    ``corr`` is Pearson's r (NaN if either side is constant); ``r2`` = 1 - SS_res / SS_tot.
+
+    Args:
+        y_true: Reference values (any shape).
+        y_pred: Predictions, same number of elements.
+
+    Returns:
+        Dict with ``n_points``, ``rmse``, ``rrmse``, ``mae``, ``nmae``, ``bias``, ``corr``,
+        ``r2`` (NaN when no pair is finite).
+
+    Examples:
+        >>> m = compute_regression_metrics(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 4.0]))
+        >>> round(m["rmse"], 4), round(m["rrmse"], 4), round(m["bias"], 4)
+        (0.5774, 0.2887, 0.3333)
+    """
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
     m = np.isfinite(y_true) & np.isfinite(y_pred)
@@ -216,13 +367,45 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[s
 
 
 def format_metric(value: float, decimals: int = 3) -> str:
+    """A metric as text with ``decimals`` decimals, or ``"nan"``.
+
+    Args:
+        value: The metric.
+        decimals: Number of decimals.
+
+    Examples:
+        >>> format_metric(0.12345), format_metric(float("nan"))
+        ('0.123', 'nan')
+    """
     if not np.isfinite(value):
         return "nan"
     return f"{value:.{decimals}f}"
 
 
 def compute_distribution_similarity_metrics(x: np.ndarray, y: np.ndarray, bins: int = 128) -> dict[str, float]:
-    """Compute unpaired distribution-similarity metrics between two arrays."""
+    """Unpaired comparison of two value distributions (used when the grids differ).
+
+    * ``ks``: two-sample Kolmogorov-Smirnov statistic, 0 to 1.
+    * ``w1_quantile``: 1-Wasserstein distance from up to 20 000 matched quantiles, in the
+      data's units.
+    * ``jsd``: Jensen-Shannon divergence of ``bins``-bin histograms on a shared range
+      (natural log, 0 to ln 2).
+    * ``overlap``: sum of the bin-wise minimum of the two normalized histograms, 0 to 1.
+
+    Args:
+        x: First sample (the reference).
+        y: Second sample.
+        bins: Number of histogram bins.
+
+    Returns:
+        Dict with ``n_true``, ``n_pred`` and the four metrics (NaN if a sample is empty).
+
+    Examples:
+        >>> rng = np.random.default_rng(0); a = rng.standard_normal(5000)
+        >>> same = compute_distribution_similarity_metrics(a, a)
+        >>> same["ks"], round(same["overlap"], 6)
+        (0.0, 1.0)
+    """
     x = np.asarray(x).ravel()
     y = np.asarray(y).ravel()
     x = x[np.isfinite(x)]
@@ -285,7 +468,13 @@ def compute_distribution_similarity_metrics(x: np.ndarray, y: np.ndarray, bins: 
 
 
 class AnalysisModelPipeline:
-    """Reusable pipeline for config selection, runtime cfg building, and model loading."""
+    """Find an experiment's flavors, load their checkpoints and predict in physical units.
+
+    Note:
+        :meth:`load_model` and the model summary assume 2 input channels and the default
+        architecture; a 4-channel checkpoint will not load (strict xfail in
+        ``tests/test_analysis.py``; reframe Phase 1c).
+    """
 
     def __init__(
         self,
@@ -294,6 +483,14 @@ class AnalysisModelPipeline:
         experiments_base_dir: Path | str | None = None,
         experiment_root: str = "experiment_80_to_113",
     ):
+        """Set the device and folders.
+
+        Args:
+            device: Torch device for inference.
+            output_dir: Folder for the analysis outputs (also the runtime config's ``log_dir``).
+            experiments_base_dir: Folder holding the experiments (``output/experiments`` by default).
+            experiment_root: Experiment folder name.
+        """
         self.device = device
         self.output_dir = output_dir
         self.experiments_base_dir = Path(experiments_base_dir) if experiments_base_dir is not None else Path(
@@ -302,6 +499,20 @@ class AnalysisModelPipeline:
         self.experiment_root = str(experiment_root)
 
     def get_model_configs(self) -> dict:
+        """One entry per flavor folder of the experiment that has a ``final_model.pth``.
+
+        Each entry holds the checkpoint, configuration and results paths, the experiment key,
+        the lambdas (from ``experiment_config.json``), a label and a colour.
+
+        Returns:
+            Dict keyed by experiment key.
+
+        Raises:
+            FileNotFoundError: If the experiment folder or every checkpoint is missing.
+
+        Examples:
+            >>> AnalysisModelPipeline("cpu", Path("out"), experiment_root=root).get_model_configs()  # doctest: +SKIP
+        """
         experiment_dir = self.experiments_base_dir / self.experiment_root
         results_path = experiment_dir / "experiment_results.json"
         if not experiment_dir.exists():
@@ -367,10 +578,32 @@ class AnalysisModelPipeline:
 
     @staticmethod
     def select_model_configs(model_configs: dict, selected_types: list[str]) -> dict:
+        """Keep the flavors named in ``selected_types`` (``"all"`` or empty keeps all).
+
+        Short names are accepted: ``wfa``, ``doppler``, ``black-body``/``black_body``,
+        ``all_physics`` and the folder forms ``wfa-lambda-<x>``. A name also selects its lambda
+        variants (``wfa_only`` selects ``wfa_only-lambda-10``).
+
+        Args:
+            model_configs: Output of :meth:`get_model_configs`.
+            selected_types: Requested flavors.
+
+        Returns:
+            The filtered dict.
+
+        Raises:
+            ValueError: If nothing matches.
+
+        Examples:
+            >>> cfgs = {"wfa_only": {"experiment_key": "wfa_only"}, "no_physics": {"experiment_key": "no_physics"}}
+            >>> list(AnalysisModelPipeline.select_model_configs(cfgs, ["wfa"]))
+            ['wfa_only']
+        """
         if not selected_types or "all" in selected_types:
             return model_configs
 
         def _normalize_selected_type(value: str) -> str:
+            """Map a short or folder-style flavor name to its experiment key."""
             if value.startswith("wfa-lambda-"):
                 return value.replace("wfa-lambda-", "wfa_only-lambda-", 1)
             if value.startswith("doppler-lambda-"):
@@ -409,6 +642,20 @@ class AnalysisModelPipeline:
         return filtered
 
     def build_runtime_training_config(self, model_cfg: dict) -> TrainingConfig:
+        """A :class:`TrainingConfig` with the flavor's physics settings, for re-running its data pipeline.
+
+        Missing entries fall back to the old defaults (``tau_averaged`` B_LOS, v_LOS at -1.0,
+        T at 0.0).
+
+        Args:
+            model_cfg: One entry of :meth:`get_model_configs`.
+
+        Returns:
+            The configuration, with ``log_dir`` set to the pipeline's output folder.
+
+        Examples:
+            >>> cfg = pipe.build_runtime_training_config(configs["wfa_only"])  # doctest: +SKIP
+        """
         cfg_kwargs = {
             "device": str(self.device),
             "batch_size": 512,
@@ -448,6 +695,23 @@ class AnalysisModelPipeline:
         return cfg
 
     def load_model(self, config: dict) -> tuple[PhysicsInformedMSCNN, int]:
+        """Load one flavor's checkpoint (evaluation mode).
+
+        The number of nodes is read from the output layer; the rest of the architecture is fixed
+        (scales 1, 2, 3; 2 input channels; 16 filters; kernel 5; pool 2; 4 dense layers).
+
+        Args:
+            config: One entry of :meth:`get_model_configs`.
+
+        Returns:
+            ``(model, n_tau)``.
+
+        Raises:
+            ValueError: If the output size is not a multiple of 3.
+
+        Examples:
+            >>> model, n_tau = pipe.load_model(configs["wfa_only"])  # doctest: +SKIP
+        """
         checkpoint = torch.load(config["path"], map_location=self.device)
         output_features = self._infer_output_features_from_checkpoint(checkpoint)
         if output_features % 3 != 0:
@@ -475,6 +739,7 @@ class AnalysisModelPipeline:
 
     @staticmethod
     def _infer_output_features_from_checkpoint(checkpoint: dict) -> int:
+        """Output size of a checkpoint, from the output layer's bias."""
         state = checkpoint["model_state_dict"]
         key = "linear_block.output_layer.bias"
         if key not in state:
@@ -482,6 +747,20 @@ class AnalysisModelPipeline:
         return int(state[key].shape[0])
 
     def load_all_models(self, model_configs: dict) -> tuple[dict, int]:
+        """Load every flavor and check that they share one number of nodes.
+
+        Args:
+            model_configs: Entries of :meth:`get_model_configs`.
+
+        Returns:
+            ``(models, n_tau)``.
+
+        Raises:
+            ValueError: If two checkpoints have different numbers of nodes.
+
+        Examples:
+            >>> models, n_tau = pipe.load_all_models(configs)  # doctest: +SKIP
+        """
         models = {}
         n_tau_ref = None
         for name, config in model_configs.items():
@@ -498,6 +777,17 @@ class AnalysisModelPipeline:
         return models, int(n_tau_ref)
 
     def prepare_models(self, selected_types: list[str]) -> tuple[dict, dict, int]:
+        """Find, select and load the requested flavors.
+
+        Args:
+            selected_types: Requested flavors (see :meth:`select_model_configs`).
+
+        Returns:
+            ``(model_configs, models, n_tau)``.
+
+        Examples:
+            >>> configs, models, n_tau = pipe.prepare_models(["no_physics", "wfa_only"])  # doctest: +SKIP
+        """
         model_configs = self.get_model_configs()
         model_configs = self.select_model_configs(model_configs, selected_types)
         models, n_tau = self.load_all_models(model_configs)
@@ -505,6 +795,7 @@ class AnalysisModelPipeline:
 
     @staticmethod
     def _print_model_summary(model: PhysicsInformedMSCNN, model_label: str, device) -> None:
+        """Print a torchinfo summary for a (1, 2, 112) input, or the module and parameter counts."""
         print(f"\n--- Torch summary: {model_label} ---")
         if torch_summary is not None:
             try:
@@ -527,7 +818,18 @@ class AnalysisModelPipeline:
         print(f"Trainable params: {n_trainable:,}")
 
     def get_model_logtau_values(self, model_cfg: dict) -> list[float] | None:
-        """Read model log(tau) nodes from experiment_results.json, fallback to experiment_config.json."""
+        """The flavor's log tau nodes, from ``experiment_results.json`` or else ``experiment_config.json``.
+
+        Args:
+            model_cfg: One entry of :meth:`get_model_configs`.
+
+        Returns:
+            The nodes, or ``None`` if neither file has them.
+
+        Examples:
+            >>> pipe.get_model_logtau_values(configs["wfa_only"])[:2]  # doctest: +SKIP
+            [-3.0, -2.9]
+        """
         exp_key = model_cfg.get("experiment_key")
         results_path = model_cfg.get("results_path")
 
@@ -563,7 +865,28 @@ class AnalysisModelPipeline:
         pred_ny: int,
         batch_size: int = 4096,
     ) -> dict[str, np.ndarray]:
-        """Predict and denormalize model outputs on the native prediction grid (no resizing)."""
+        """Predict on a flat input and return ``(nx, ny, n_tau)`` cubes in K, km/s and G.
+
+        Denormalization uses :meth:`MhdNormalizer.denormalize` (including its physical clip of
+        Bz and its Vz mean offset, see the normalizer's strict xfail). No resizing is done.
+
+        Args:
+            model: The model.
+            stokes_input: ``(nx * ny, n_channels, n_wl)`` normalized input.
+            mhd_normalizer: Fitted MHD normalizer.
+            pred_nx: Size of the first map axis.
+            pred_ny: Size of the second map axis.
+            batch_size: Inference batch size.
+
+        Returns:
+            ``{"T", "Vz", "Bz"}`` cubes.
+
+        Raises:
+            ValueError: If the output is not ``(N, 3 n_tau)``.
+
+        Examples:
+            >>> pred = pipe.predict_and_denormalize(model, x, mhd_norm, 390, 858)  # doctest: +SKIP
+        """
         model.eval()
         all_pred = []
 
@@ -589,7 +912,20 @@ class AnalysisModelPipeline:
         pred_tau: list[float],
         atol: float = 1e-6,
     ) -> list[tuple[float, int, int]]:
-        """Return (tau_value, idx_modest, idx_pred) for optical depths present in both grids."""
+        """Nodes present in both grids, as ``(tau, index_in_modest, index_in_prediction)`` (match to ``atol``).
+
+        Args:
+            modest_tau: Reference nodes (e.g. SPINOR's -2.0, -0.8, 0.0).
+            pred_tau: The model's nodes.
+            atol: Matching tolerance.
+
+        Returns:
+            The matches, in the reference order.
+
+        Examples:
+            >>> AnalysisModelPipeline.common_tau_matches([-2.0, -0.8, 0.0], [-2.0, -1.0, -0.8, 0.0])
+            [(-2.0, 0, 0), (-0.8, 1, 2), (0.0, 2, 3)]
+        """
         matches: list[tuple[float, int, int]] = []
         for i_m, mt in enumerate(modest_tau):
             for i_p, pt in enumerate(pred_tau):
@@ -599,7 +935,12 @@ class AnalysisModelPipeline:
         return matches
 
 class MuramDiagnosticPlots:
-    """Data-agnostic diagnostic plot generator."""
+    """Per-model maps, scatter plots and metrics of predictions against MURaM at chosen nodes.
+
+    Outputs go to ``<output_dir>/final/<step>/<model_name>/``: for each node of
+    ``config.epoch_plot_ods`` (default -1.0, -0.8, 0.0) and quantity, an image panel and a
+    joint plot, then ``metrics_summary.csv`` and the mean Stokes profiles.
+    """
 
     def __init__(
         self,
@@ -610,6 +951,17 @@ class MuramDiagnosticPlots:
         output_dir: str | Path | None = Path('./images'),
         stokes_normalizer=None,
     ):
+        """Set up the output folder and plotting options.
+
+        Args:
+            config: Training configuration (nodes, quantities, scatter sample size).
+            model_name: Flavor key.
+            label: Snapshot label for titles (default ``step_<step>``).
+            step: MURaM step (output subfolder).
+            output_dir: Base output folder.
+            stokes_normalizer: Fitted Stokes normalizer, to undo the input normalization in the
+                profile plot.
+        """
         self.config = config
         self.model_name = model_name
         self.label = label if label is not None else (f"step_{step}" if step is not None else "snapshot")
@@ -634,9 +986,19 @@ class MuramDiagnosticPlots:
         stokes_input: np.ndarray,
         wavelengths: np.ndarray | None = None,
     ) -> None:
-        """Plot denormalized mean ± std Stokes I/V profiles from final model inputs.
-        
-        wavelengths must not be None. Always use metadata-derived wavelength arrays.
+        """Plot the mean and standard deviation of the model's I and V input, in continuum units.
+
+        Silently does nothing unless the input has exactly 2 channels (I, V).
+
+        Args:
+            stokes_input: ``(n, 2, n_wl)`` normalized input.
+            wavelengths: The wavelength axis in A (required, from the data's metadata).
+
+        Raises:
+            ValueError: If ``wavelengths`` is missing or has the wrong length.
+
+        Examples:
+            >>> plots.plot_stokes_mean_std(x, wavelengths=wl)  # doctest: +SKIP
         """
         arr = np.asarray(stokes_input, dtype=np.float32)
         if arr.ndim != 3 or arr.shape[1] != 2:
@@ -699,6 +1061,7 @@ class MuramDiagnosticPlots:
         plt.close(fig)
 
     def _write_metrics_csv(self) -> None:
+        """Write the accumulated rows to ``metrics_summary.csv``."""
         if not self.metrics_rows:
             return
         metrics_path = self.out_dir / "metrics_summary.csv"
@@ -713,6 +1076,17 @@ class MuramDiagnosticPlots:
         print(f"[{self.model_name}] Metrics saved to: {metrics_path}")
 
     def plot_image_panel(self, true_map: np.ndarray, pred_map: np.ndarray, p: str, od_eff: float) -> None:
+        """Plot truth, prediction and their difference at one node (shared, quantile-clipped colour scale).
+
+        Args:
+            true_map: Reference map.
+            pred_map: Prediction map, same shape.
+            p: Quantity key.
+            od_eff: The node.
+
+        Examples:
+            >>> plots.plot_image_panel(gt, pred, "Bz", -0.8)  # doctest: +SKIP
+        """
         err_map = pred_map - true_map
         both = np.concatenate([true_map.ravel(), pred_map.ravel()])
 
@@ -750,6 +1124,23 @@ class MuramDiagnosticPlots:
         plt.close(fig)
 
     def plot_jointplot(self, true_map: np.ndarray, pred_map: np.ndarray, p: str, od_eff: float, tau_idx: int) -> dict[str, float] | None:
+        """Scatter plot of prediction against truth at one node, with metrics on all paired pixels.
+
+        The plot shows at most ``epoch_plot_scatter_samples`` points; the metrics use all.
+
+        Args:
+            true_map: Reference map.
+            pred_map: Prediction map, same shape.
+            p: Quantity key.
+            od_eff: The node.
+            tau_idx: Node index (seeds the plotting subsample).
+
+        Returns:
+            The metrics of :func:`compute_regression_metrics`, or ``None`` if no pair is finite.
+
+        Examples:
+            >>> m = plots.plot_jointplot(gt, pred, "T", 0.0, 30)  # doctest: +SKIP
+        """
         x = true_map.ravel()
         y = pred_map.ravel()
         m = np.isfinite(x) & np.isfinite(y)
@@ -797,6 +1188,17 @@ class MuramDiagnosticPlots:
         stokes_input: np.ndarray | None = None,
         wavelengths: np.ndarray | None = None,
     ) -> None:
+        """Make every panel and joint plot, the profile plot and the metrics CSV.
+
+        Args:
+            pred_den: Predicted ``{"T", "Vz", "Bz"}`` cubes in K, km/s and G.
+            gt_den: MURaM cubes on the same nodes (resized to the prediction grid if needed).
+            stokes_input: Model input for the profile plot, or ``None``.
+            wavelengths: Its wavelength axis in A.
+
+        Examples:
+            >>> MuramDiagnosticPlots(cfg, "wfa_only", step=198).generate(pred, gt, x, wl)  # doctest: +SKIP
+        """
         for od in self.ods:
             tau_idx = int(np.argmin(np.abs(self.logtau - od)))
             od_eff = float(self.logtau[tau_idx])
@@ -835,6 +1237,7 @@ class MuramDiagnosticPlots:
 
     @staticmethod
     def _resize_map_to_shape(arr2d: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+        """Bilinear resize of a 2-D map to ``target_shape``."""
         if arr2d.shape == target_shape:
             return arr2d
         t = torch.from_numpy(arr2d).float().unsqueeze(0).unsqueeze(0)
@@ -852,9 +1255,7 @@ class MuramDiagnosticPlots:
 # ------------------------------------------------------------------------------------------
 
 def _resize_map_to_shape(arr2d: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
-    """Bilinear-resize a 2D map to target_shape. Same implementation as the per-class
-    _resize_map_to_shape methods (MuramDiagnosticPlots, ModestDiagnosticPlots), duplicated
-    here at module level since these combined-plot functions aren't methods of either class."""
+    """Bilinear resize of a 2-D map to ``target_shape`` (unchanged if it already matches)."""
     if arr2d.shape == target_shape:
         return arr2d
     t = torch.from_numpy(arr2d).float().unsqueeze(0).unsqueeze(0)
@@ -873,9 +1274,29 @@ def plot_combined_jointplot_grid(
     los: bool = False,
     max_points: int = 20000,
 ) -> None:
-    """2x2 grid of ground-truth-vs-prediction scatter panels, one per model, sharing axis
-    limits so the four panels are directly comparable. Built with plain matplotlib rather
-    than sns.jointplot, which always owns its own figure and cannot be embedded in a grid."""
+    """2 x 2 grid of prediction-against-truth scatter panels, one per model, sharing axis limits.
+
+    With matching grids the panels pair pixels and show correlation, R^2 and RRMSE on all
+    pairs; otherwise they compare matched quantiles and show the distribution metrics.
+
+    Note:
+        The grid has four panels, so with five models the fifth is dropped (strict xfail in
+        ``tests/test_analysis.py``).
+
+    Args:
+        true_map: Reference map.
+        pred_by_model: Prediction map per flavor.
+        param: Quantity key.
+        title_suffix: Context for the title.
+        tau_val: The node.
+        save_path: PNG path.
+        model_order: Order of the panels.
+        los: Use the line-of-sight symbols.
+        max_points: Largest number of plotted points per panel.
+
+    Examples:
+        >>> plot_combined_jointplot_grid(gt, preds, "Bz", "MODEST - Sunspot", -0.8, Path("b.png"), los=True)  # doctest: +SKIP
+    """
     plt.rcParams["font.family"] = "serif"
     models_present = [m for m in model_order if m in pred_by_model]
     if len(models_present) < 2:
@@ -986,20 +1407,29 @@ def plot_combined_images_grid(
     extent: tuple[float, float, float, float] | None = None,
     extent_labels: tuple[str, str] | None = None,
 ) -> None:
-    """2-row x (1 + N-model)-column comparison figure: column 1 is Ground Truth (row 0 only;
-    row 1 under it is left blank); each subsequent column is one model, with its prediction on
-    top and its (signed) error below. Ground truth/predictions share one color scale; all
-    models' error panels share one symmetric scale, so colors are comparable across models, not
-    just within one. Colorbars live in their own dedicated narrow columns (not appended to an
-    image axis via make_axes_locatable) so every image panel -- GT and all N models' predictions/
-    errors -- gets the exact same GridSpec cell; set_box_aspect(panel_aspect) then locks each to
-    an identical box matching the region's true height/width ratio (not forced square -- MODEST
-    crops like plage/negative_region/whole are naturally elongated rectangles, not squares).
+    """Truth, then one column per model with its prediction above and its error below.
 
-    `extent` (already in the orientation the panels are drawn in, i.e. after `transpose`) puts every panel on a physical
-    coordinate grid -- arcsec for MODEST crops, Mm for MURaM -- with ticks drawn on the ground
-    truth panel and the first error panel only, so the figure carries a spatial scale without
-    cluttering every cell. Without it the panels keep their old tick-less look."""
+    Truth and predictions share a colour scale set by the truth's own 2-98 % range (so
+    over- or under-shoot shows as saturation); all error panels share one symmetric scale.
+    Every image gets the same grid cell and the region's true aspect ratio. With ``extent``
+    the truth panel and the first error panel carry spatial ticks (arcsec or Mm).
+
+    Args:
+        true_map: Reference map (resized to the prediction grid if needed).
+        pred_by_model: Prediction map per flavor.
+        param: Quantity key.
+        title_suffix: Context for the title.
+        tau_val: The node.
+        save_path: PNG path.
+        model_order: Order of the columns.
+        los: Use the line-of-sight symbols.
+        transpose: Draw the maps transposed (MURaM); MODEST maps use ``False``.
+        extent: ``(left, right, bottom, top)`` in the drawn orientation, or ``None``.
+        extent_labels: Axis names for the extent.
+
+    Examples:
+        >>> plot_combined_images_grid(gt, preds, "T", "Simulation step 198", 0.0, Path("t.png"))  # doctest: +SKIP
+    """
     plt.rcParams["font.family"] = "serif"
     models_present = [m for m in model_order if m in pred_by_model]
     if len(models_present) < 2:
@@ -1067,7 +1497,7 @@ def plot_combined_images_grid(
         imshow_kw["aspect"] = "auto"
 
     def _spatial_ticks(ax) -> None:
-        """Ticks + axis names where the figure shows its spatial scale; bare panel otherwise."""
+        """Draw spatial ticks and axis names when an extent is given, else hide the ticks."""
         if extent is None:
             ax.set_xticks([])
             ax.set_yticks([])
@@ -1133,11 +1563,22 @@ def plot_combined_images_grid(
 def compute_metric_vs_tau(
     tau_and_maps: list[tuple[float, np.ndarray, np.ndarray]],
 ) -> dict[str, np.ndarray]:
-    """Per-tau RRMSE and Corr between a true map and a predicted map, one point per optical
-    depth. tau_and_maps: (tau_val, true_map, pred_map) triples, any order -- sorted by tau_val
-    here. compute_regression_metrics requires true_map/pred_map to share shape (it does
-    elementwise np.isfinite masking), so a shape mismatch at a given tau (e.g. a MODEST region
-    run without --downsample-prediction-input) yields NaN there rather than raising."""
+    """RRMSE and correlation of truth against prediction at each node, sorted by node.
+
+    A node whose maps have different shapes gives NaN instead of raising.
+
+    Args:
+        tau_and_maps: ``(tau, true_map, pred_map)`` triples in any order.
+
+    Returns:
+        ``{"tau", "rrmse", "corr"}`` arrays.
+
+    Examples:
+        >>> a = np.array([[1.0, 2.0], [3.0, 4.0]])
+        >>> out = compute_metric_vs_tau([(0.0, a, a), (-1.0, a, a + 1.0), (0.5, a, a[:1])])
+        >>> out["tau"].tolist(), round(float(out["rrmse"][0]), 3), bool(np.isnan(out["rrmse"][2]))
+        ([-1.0, 0.0, 0.5], 0.4, True)
+    """
     ordered = sorted(tau_and_maps, key=lambda t: t[0])
     taus = np.array([t[0] for t in ordered], dtype=float)
     rrmse = np.full(len(ordered), np.nan)
@@ -1165,11 +1606,20 @@ def plot_metric_vs_tau(
     model_order: tuple[str, ...] = MODEL_CANONICAL_ORDER,
     los: bool = False,
 ) -> None:
-    """Single-panel, single-paper-column figure (~3.4in wide): one metric_key ("rrmse" or
-    "corr") vs log(tau), one line+marker per model. Kept as a single-metric figure per file
-    (rather than a combined multi-metric panel) so RRMSE and Corr can be placed independently
-    in the paper layout. Font sizes are reduced (~8-9pt axes, ~7-8pt legend) for legibility at
-    that print size."""
+    """One-column figure of one metric (``"rrmse"`` or ``"corr"``) against log tau, one line per model.
+
+    Args:
+        param: Quantity key.
+        metric_key: ``"rrmse"`` or ``"corr"``.
+        metrics_by_model: Output of :func:`compute_metric_vs_tau` per flavor.
+        title_suffix: Context for the title.
+        save_path: PNG path (300 dpi).
+        model_order: Order of the lines.
+        los: Use the line-of-sight symbols.
+
+    Examples:
+        >>> plot_metric_vs_tau("Bz", "corr", metrics, "Simulation step 198", Path("c.png"))  # doctest: +SKIP
+    """
     plt.rcParams["font.family"] = "serif"
     models_present = [m for m in model_order if m in metrics_by_model]
     if not models_present:
@@ -1195,6 +1645,19 @@ def plot_metric_vs_tau(
 
 
 class ModestDiagnosticPlots:
+    """Per-model and combined comparisons of predictions with SPINOR on a MODEST scene or crop.
+
+    :meth:`prepare_snapshot` loads and normalizes the input once; :meth:`run` predicts with
+    every model, applies the optional sign inversions and temperature calibration, and
+    writes maps, joint plots, ``metrics_summary.csv`` (the source of the paper's MODEST
+    tables), ``metrics_by_field_strength.csv`` and the combined figures.
+
+    Note:
+        Paired metrics need the prediction on SPINOR's grid (``--downsample-prediction-input``);
+        otherwise only distribution metrics are computed. The sign-inversion options exist
+        only to undo the V x -1 applied on loading and are removed in reframe Phase 1d. The
+        optional temperature calibration fits and evaluates a per-node bias on the same data.
+    """
     def __init__(
         self,
         pipeline: AnalysisModelPipeline,
@@ -1205,6 +1668,17 @@ class ModestDiagnosticPlots:
         modest_cache,
         args,
     ):
+        """Store the pipeline, normalizers, MODEST loader and command-line options.
+
+        Args:
+            pipeline: An :class:`AnalysisModelPipeline`.
+            modest_output_dir: Output folder for this scene or crop.
+            mhd_normalizer: Fitted MHD normalizer.
+            stokes_normalizer: Fitted Stokes normalizer.
+            modest: A :class:`utils.modest_data.ModestData`.
+            modest_cache: A :class:`utils.cache_manage.ModestDataCache`.
+            args: Parsed options of ``modest_analysis.py``.
+        """
         self.pipeline = pipeline
         self.modest_output_dir = modest_output_dir
         self.mhd_normalizer = mhd_normalizer
@@ -1228,6 +1702,7 @@ class ModestDiagnosticPlots:
 
     @staticmethod
     def _resize_map_to_shape(arr2d: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+        """Bilinear resize of a 2-D map to ``target_shape``."""
         if arr2d.shape == target_shape:
             return arr2d
         t = torch.from_numpy(arr2d).float().unsqueeze(0).unsqueeze(0)
@@ -1235,12 +1710,14 @@ class ModestDiagnosticPlots:
         return out.squeeze(0).squeeze(0).cpu().numpy()
 
     def _temperature_calibration_mode(self) -> str:
+        """``"apply_fit"`` or ``"off"`` from the options."""
         mode = str(getattr(self.args, "temp_calibration_mode", "off")).lower()
         if mode not in {"off", "apply_fit"}:
             return "off"
         return mode
 
     def _temperature_calibration_clip_quantiles(self) -> tuple[float, float] | None:
+        """Valid ``(q_low, q_high)`` from the options, else ``None``."""
         q = getattr(self.args, "temp_calibration_clip_quantiles", None)
         if q is None:
             return None
@@ -1253,9 +1730,11 @@ class ModestDiagnosticPlots:
         return (qlo, qhi)
 
     def _temperature_calibration_min_samples(self) -> int:
+        """Minimum pairs per node for a calibration fit (at least 10)."""
         return int(max(10, int(getattr(self.args, "temp_calibration_min_samples", 500))))
 
     def _temperature_calibration_path(self, model_type: str, out_root: Path) -> Path:
+        """Calibration file of a flavor."""
         base_dir_raw = getattr(self.args, "temp_calibration_dir", None)
         if base_dir_raw:
             return Path(base_dir_raw) / model_type / "temperature_calibration.json"
@@ -1268,6 +1747,10 @@ class ModestDiagnosticPlots:
         true_cube: np.ndarray,
         pred_cube: np.ndarray,
     ) -> dict[str, Any]:
+        """Per-node bias ``b = mean(T_true - T_pred)`` (K) on MODEST, with metrics before and after.
+
+        The slope is fixed to 1. Diagnostics only: fitting and evaluating on the same pixels.
+        """
         min_samples = self._temperature_calibration_min_samples()
         clip_q = self._temperature_calibration_clip_quantiles()
         coefficients: dict[str, dict[str, float | int]] = {}
@@ -1327,12 +1810,14 @@ class ModestDiagnosticPlots:
 
     @staticmethod
     def _save_temperature_calibration(path: Path, payload: dict[str, Any]) -> None:
+        """Write a calibration JSON."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
     @staticmethod
     def _load_temperature_calibration(path: Path) -> dict[str, Any] | None:
+        """Read a calibration JSON, or ``None``."""
         if not path.exists():
             return None
         with open(path, "r", encoding="utf-8") as f:
@@ -1340,6 +1825,7 @@ class ModestDiagnosticPlots:
 
     @staticmethod
     def _find_tau_coeff(coefficients: dict[str, dict[str, Any]], tau_val: float) -> dict[str, Any] | None:
+        """Coefficients of the node ``tau_val`` (matched to 1e-6), or ``None``."""
         for key, coeff in coefficients.items():
             try:
                 if np.isclose(float(key), float(tau_val), atol=1e-6, rtol=0.0):
@@ -1354,6 +1840,7 @@ class ModestDiagnosticPlots:
         matches: list[tuple[float, int, int]],
         payload: dict[str, Any],
     ) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
+        """Add each node's bias to the predicted T cube and report what was applied."""
         coefficients = payload.get("coefficients", {}) if isinstance(payload, dict) else {}
         calibrated = np.array(pred_cube, copy=True)
         applied_by_pred_idx: dict[int, dict[str, float]] = {}
@@ -1375,11 +1862,11 @@ class ModestDiagnosticPlots:
         return calibrated, applied_by_pred_idx
 
     def _write_field_strength_metrics_csv(self, model_type: str, out_root: Path) -> None:
-        """Companion to metrics_summary.csv, split by the true |B_LOS| of each pixel.
+        """Write ``metrics_by_field_strength.csv``: the same comparisons split by SPINOR's |B_LOS| per pixel.
 
-        Lets the range of applicability be read off directly: MURaM steps 110-130 have
-        plenty of pixels below ~500 G, few above ~950 G, and none above 1500 G, while the
-        sunspot crops reach 3.7 kG -- so the high-field rows show extrapolation, not skill.
+        The strong-field rows show extrapolation, not skill: the training steps 110 to 130 have
+        many pixels below about 500 G, few above 950 G and none above 1500 G, while the sunspot
+        reaches 3.7 kG.
         """
         rows = [r for r in self.field_metrics_rows if r.get("model") == model_type]
         if not rows:
@@ -1396,6 +1883,7 @@ class ModestDiagnosticPlots:
         print(f"[{model_type}] Range-of-applicability metrics saved to: {field_path}")
 
     def _write_metrics_csv(self, model_type: str, out_root: Path) -> None:
+        """Write a flavor's ``metrics_summary.csv`` and its field-strength companion."""
         self._write_field_strength_metrics_csv(model_type, out_root)
         rows = [r for r in self.metrics_rows if r.get("model") == model_type]
         if not rows:
@@ -1415,6 +1903,7 @@ class ModestDiagnosticPlots:
         print(f"[{model_type}] Metrics saved to: {metrics_path}")
 
     def _resolve_tau_indices(self, indices: list[int] | None, n_tau: int) -> list[int]:
+        """Valid node indices from the options (negative counts from the end); default first, middle, last."""
         if not indices:
             return sorted(set([0, n_tau // 2, n_tau - 1]))
         out = []
@@ -1425,6 +1914,18 @@ class ModestDiagnosticPlots:
         return sorted(set(out))
 
     def prepare_snapshot(self, n_tau: int):
+        """Load the MODEST scene or crop, SPINOR's atmosphere and the normalized model input.
+
+        The input is ``prediction_stokes`` from ``ModestData.load_all`` (downsampled to the
+        observed grid with ``--downsample-prediction-input``), after the optional spectral
+        transforms of ``transform_modest_stokes_profiles``, normalized and stacked as I, V.
+
+        Args:
+            n_tau: Number of the model's nodes (caps the SPINOR nodes used).
+
+        Examples:
+            >>> diag.prepare_snapshot(n_tau=45)  # doctest: +SKIP
+        """
         prediction_input_mode = "downsampled" if getattr(self.args, "downsample_prediction_input", False) else "upsampled"
         self.modest_data = self.modest.load_all(
             region_bounds=tuple(self.args.crop_bounds) if self.args.cropped_region else None,
@@ -1476,6 +1977,7 @@ class ModestDiagnosticPlots:
         print(f"MODEST prediction input grid: {self.pred_nx}x{self.pred_ny} (GT: {gt_nx}x{gt_ny})")
 
     def _filter_matches(self, matches):
+        """Keep the node matches whose SPINOR index is among the selected ones."""
         if not self.tau_indices:
             return matches
         allowed = set(self.tau_indices)
@@ -1491,6 +1993,7 @@ class ModestDiagnosticPlots:
         transpose: bool = True,
         transpose_pred: bool | None = None,
     ):
+        """Plot truth, prediction and their difference at one node (difference only if the grids match)."""
         gt = true_2d.T if transpose else true_2d
         pred_do_transpose = transpose if transpose_pred is None else transpose_pred
         pr = pred_2d.T if pred_do_transpose else pred_2d
@@ -1550,6 +2053,13 @@ class ModestDiagnosticPlots:
         param: str = "",
         max_points: int = 50000,
     ) -> tuple[dict[str, float], str] | None:
+        """Scatter plot of prediction against SPINOR at one node, and its metrics.
+
+        With matching grids, pixels are paired; otherwise matched quantiles are plotted and only
+        the distribution metrics are computed.
+
+        Returns ``(metrics, "paired_pixel" or "distribution_quantile")``, or ``None``.
+        """
         if true_2d.shape == pred_2d.shape:
             x = true_2d.ravel()
             y = pred_2d.ravel()
@@ -1628,10 +2138,7 @@ class ModestDiagnosticPlots:
         return out_metrics, comparison
 
     def _plot_stokes_mean_std(self, model_type: str, out_root: Path) -> None:
-        """Plot denormalized mean ± std Stokes I/V profiles from MODEST model-input stokes.
-        
-        Wavelength data is always extracted from MODEST metadata. No hardcoded defaults are used.
-        """
+        """Plot the mean and spread of the MODEST I and V input (only for a 2-channel input)."""
         if self.modest_stokes_input is None:
             return
 
@@ -1698,6 +2205,15 @@ class ModestDiagnosticPlots:
         plt.close(fig)
 
     def run(self, model_configs, models):
+        """Predict with every model and write all per-model and combined MODEST outputs.
+
+        Args:
+            model_configs: Entries of :meth:`AnalysisModelPipeline.get_model_configs`.
+            models: Loaded models keyed like ``model_configs``.
+
+        Examples:
+            >>> diag.run(configs, models)  # doctest: +SKIP
+        """
         calibration_mode = self._temperature_calibration_mode()
         print(f"Temperature calibration mode: {calibration_mode}")
         # Accumulated across the per-model loop below so the combined multi-model figures

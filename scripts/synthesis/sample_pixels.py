@@ -34,6 +34,13 @@ from utils.synthesis import SynthesisConfig
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/sample_pixels.py --source modest --experiment-root <root> --model-type wfa_only
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", choices=["modest", "muram"], default="modest",
                     help="Pixel-sampling source")

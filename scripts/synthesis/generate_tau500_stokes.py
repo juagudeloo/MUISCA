@@ -52,6 +52,20 @@ N_WL = 300
 
 
 def main():
+    """Synthesize one row chunk of a MURaM step with NICOLE on the tau_500 grid and save it.
+
+    Note:
+        MURaM's Vz (positive upward) is passed to NICOLE as v_LOS (positive = redshift)
+        unchanged, so granules come out redshifted, and Bx and By are not passed, so Q and U
+        are zero. Both are fixed in reframe Phase 1a (strict xfails
+        ``test_training_granules_are_blueshifted`` and
+        ``test_training_profiles_carry_linear_polarization``).
+
+    Examples:
+        One chunk of rows 0 to 40 of step 140::
+
+            python scripts/synthesis/generate_tau500_stokes.py --step 140 --row-start 0 --row-end 40 --output-dir chunks/
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--step", type=int, required=True, help="MURaM simulation step")
     p.add_argument("--row-start", type=int, required=True, help="First ix row (inclusive)")

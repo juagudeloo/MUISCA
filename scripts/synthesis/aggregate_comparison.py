@@ -37,6 +37,13 @@ from utils.synthesis import SynthesisComparator, SynthesisConfig
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/aggregate_comparison.py --source modest --experiment-root <root> --region-label sunspot
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", choices=["modest", "muram"], default="modest")
     p.add_argument("--experiment-root", required=True)

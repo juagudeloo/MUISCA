@@ -32,6 +32,16 @@ MURAM_PIXEL_SIZE_MM = 0.025
 # -----------------------------------------------------------------------------
 def main(args):
     # Pick GPU when available; otherwise fall back to CPU.
+    """Predict a MURaM step with each flavor and write the per-model and combined diagnostics.
+
+    Args:
+        args: Parsed command-line options (see the module's argument parser).
+
+    Examples:
+        ::
+
+            python scripts/analysis/muram_analysis.py --experiment-root <root> --model-types no_physics wfa_only --step-to-plot 198
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build the reusable analysis pipeline that finds models and manages inference.

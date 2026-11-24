@@ -16,6 +16,13 @@ from utils.synthesis import SynthesisComparator, SynthesisConfig
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/compare_synthesis.py --predictions-h5 predictions.h5 --syntheses-h5 syntheses.h5 --output-dir out/
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--predictions-h5", type=Path, required=True)
     p.add_argument("--syntheses-h5", type=Path, required=True)

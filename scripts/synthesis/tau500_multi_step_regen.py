@@ -51,9 +51,23 @@ OUTPUT_ROOT = Path("/scratchsan/observatorio/juagudeloo/MUISCA/output/synthesis/
 
 
 def compute_logtau500(mhd: MhdData, dz_km: float) -> np.ndarray:
-    """log10(tau_500), integrated the same way MhdData.compute_optical_depth
-    integrates Rosseland tau, but using tau500_opacity.kappa_500(T, P, rho)
-    in place of the Rosseland kappa.0.dat interpolator."""
+    """log10 tau_500 of every cell, integrated from the top of the box down with the H- opacity.
+
+    This is the scale of the training atmospheres (``generate_tau500_stokes.py`` imports it).
+    Same integration as :meth:`MhdData.compute_optical_depth` with ``kappa_500(T, P, rho)`` in
+    place of the Rosseland table; integrating ``kappa_500`` over the HSRA reproduces the
+    HSRA's own log tau within 0.04 dex between -3 and 0.5 (``tests/test_tau500_opacity.py``).
+
+    Args:
+        mhd: A loaded :class:`MhdData` step.
+        dz_km: Layer thickness in km.
+
+    Returns:
+        ``(nx, ny, nz)`` log tau_500.
+
+    Examples:
+        >>> logtau = compute_logtau500(mhd, dz_km=10.0)  # doctest: +SKIP
+    """
     T = mhd.data["T"].value
     P = mhd.data["P"].value
     rho = mhd.data["rho"].to(u.g / u.cm**3).value
@@ -69,6 +83,7 @@ def compute_logtau500(mhd: MhdData, dz_km: float) -> np.ndarray:
 
 
 def _metrics(I_true, I_synth, sigma_I=1e-3):
+    """Continuum ratio, both line depths and chi^2 of synthesized against true I (each normalized to its own wing continuum)."""
     wing_true = np.mean([I_true[:5].mean(), I_true[-5:].mean()])
     wing_synth = np.mean([I_synth[:5].mean(), I_synth[-5:].mean()])
     I_true_n = I_true / wing_true
@@ -78,6 +93,19 @@ def _metrics(I_true, I_synth, sigma_I=1e-3):
 
 
 def run_one_step(step: int, train_cfg: TrainingConfig, data_path: Path) -> dict:
+    """Re-synthesize the sampled pixels of one step on the tau_500 grid and compare with the step's original profiles.
+
+    Args:
+        step: MURaM step.
+        train_cfg: Training configuration (grid sizes, data path, layer thickness).
+        data_path: The data folder.
+
+    Returns:
+        Summary of the comparison (continuum ratio, line depths, chi^2 per pixel).
+
+    Examples:
+        >>> summary = run_one_step(198, TrainingConfig(), Path("data"))  # doctest: +SKIP
+    """
     print(f"\n{'='*70}\nStep {step}\n{'='*70}")
 
     print(f"Loading MURaM step {step} ground truth...")
@@ -218,6 +246,13 @@ def run_one_step(step: int, train_cfg: TrainingConfig, data_path: Path) -> dict:
 
 
 def main():
+    """Run :func:`run_one_step` for every step in ``STEPS`` and save the summaries.
+
+    Examples:
+        ::
+
+            python scripts/synthesis/tau500_multi_step_regen.py
+    """
     train_cfg = TrainingConfig()
     data_path = Path(train_cfg.data_path)
 

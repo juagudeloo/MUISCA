@@ -18,6 +18,21 @@ from utils.synthesis import PredictionExporter, SynthesisConfig
 
 
 def parse_pixel(value: str) -> tuple[int, int]:
+    """Parse ``"ix,iy"`` into a pixel tuple (argparse type).
+
+    Args:
+        value: Text ``"ix,iy"``.
+
+    Returns:
+        ``(ix, iy)``.
+
+    Raises:
+        argparse.ArgumentTypeError: If the text is not two comma-separated integers.
+
+    Examples:
+        >>> parse_pixel("65,301")
+        (65, 301)
+    """
     parts = value.split(",")
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(
@@ -27,6 +42,13 @@ def parse_pixel(value: str) -> tuple[int, int]:
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/export_predictions.py --source modest --experiment-root <root> --model-type wfa_only --pixel 65,301
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", choices=["modest", "muram"], default="modest",
                    help="Prediction source")

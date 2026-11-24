@@ -59,6 +59,16 @@ def _build_regions_to_run(args) -> list[tuple[str, tuple[int, int, int, int] | N
 # -----------------------------------------------------------------------------
 def main(args):
     # Pick GPU when available; otherwise fall back to CPU.
+    """Predict a MODEST scene or crop with each flavor and write the comparisons with SPINOR.
+
+    Args:
+        args: Parsed command-line options (see the module's argument parser).
+
+    Examples:
+        ::
+
+            python scripts/analysis/modest_analysis.py --experiment-root <root> --model-types all --downsample-prediction-input
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     modest_base_dir = Path("/scratchsan/observatorio/juagudeloo/MUISCA/images/analysis/modest")
 

@@ -31,20 +31,23 @@ _MAX_PARAM_CHARS = 480
 
 
 def default_tracking_uri() -> str:
-    """SQLite tracking URI for the shared run database.
+    """SQLite tracking URI of the shared run database (``MLFLOW_TRACKING_URI`` wins if set).
 
-    MLflow 3.x puts the filesystem store in maintenance mode and refuses it outright unless
-    MLFLOW_ALLOW_FILE_STORE=true, so SQLite is the supported backend. It also enables the
-    Model Registry (named models, versions, stages), which a file store cannot provide.
+    MLflow 3.x puts the filesystem store in maintenance mode and refuses it unless
+    ``MLFLOW_ALLOW_FILE_STORE=true``, so SQLite is the supported backend; it also enables the
+    Model Registry. SQLite over NFS does not tolerate concurrent writers: the ablation
+    flavors run one after another in one SLURM job, so there is one writer. If the flavors
+    become a job array, run a tracking server (``mlflow server --backend-store-uri
+    sqlite:///...``) and point ``MLFLOW_TRACKING_URI`` at it instead.
 
-    IMPORTANT if the ablation is ever parallelized: SQLite over NFS does not tolerate
-    concurrent writers. Today the variations run sequentially inside a single SLURM job, so
-    there is exactly one writer and this is safe. Turning the variations into a job array
-    would put N jobs on the same database file -- at that point run a tracking server
-    (`mlflow server --backend-store-uri sqlite:///...`) and point MLFLOW_TRACKING_URI at it,
-    rather than letting the jobs share the file.
+    Returns:
+        The URI, e.g. ``sqlite:///.../mlruns.db``.
 
-    Honours MLFLOW_TRACKING_URI when set, so this can be redirected without editing code.
+    Examples:
+        >>> import os
+        >>> os.environ["MLFLOW_TRACKING_URI"] = "sqlite:///tmp/x.db"; default_tracking_uri()
+        'sqlite:///tmp/x.db'
+        >>> del os.environ["MLFLOW_TRACKING_URI"]
     """
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
@@ -54,13 +57,15 @@ def default_tracking_uri() -> str:
 
 
 def _summarize_sequence(value) -> str:
-    """Compact description of a sequence too long to log verbatim.
+    """Short description of a sequence too long to log, keeping the step if the spacing is uniform.
 
-    Reports the spacing as well as the endpoints, so an evenly-spaced grid stays fully
-    reconstructible from the parameter: the 45-level logtau grid becomes
-    "[45 values: -3.0 ... 1.4, step 0.1]" rather than losing how it was sampled. Falls back
-    to endpoints alone when the spacing is not uniform (or the entries are not numeric),
-    since quoting a single step would then be misleading.
+    The 45-node grid becomes ``"[45 values: -3 ... 1.4, step 0.1]"``. Uniform means steps
+    equal to 1e-4 relative (the float32 grid's steps differ by about 2.4e-6 relative from
+    rounding); otherwise, or for non-numeric entries, only the endpoints are given.
+
+    Examples:
+        >>> _summarize_sequence([0.0, 0.5, 1.0, 1.5])
+        '[4 values: 0 ... 1.5, step 0.5]'
     """
     if not value:
         return "[]"
@@ -84,12 +89,22 @@ def _summarize_sequence(value) -> str:
 
 
 def flatten_params(config: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    """Flatten a nested config dict into MLflow's flat parameter namespace.
+    """Flatten a nested configuration dict into MLflow's flat parameter names.
 
-    `experiment_config.json` is grouped ({'data_config': {'min_step': 110}, ...}) but
-    `mlflow.log_params` only takes flat key/value pairs, so nesting becomes dotted keys
-    ('data_config.min_step'). Long sequences are summarized to stay under MLflow's length
-    limit while still recording what was used.
+    Nesting becomes dotted keys (``"data_config.min_step"``); lists and tuples become
+    comma-separated text, summarized by :func:`_summarize_sequence` beyond 480 characters
+    (MLflow's limit, which the 45-node grid exceeds).
+
+    Args:
+        config: Nested dict (e.g. ``experiment_config.json``).
+        prefix: Prefix for the keys (used in recursion).
+
+    Returns:
+        Flat dict.
+
+    Examples:
+        >>> flatten_params({"data_config": {"min_step": 110, "steps": [110, 120]}})
+        {'data_config.min_step': 110, 'data_config.steps': '110, 120'}
     """
     flat: Dict[str, Any] = {}
     for key, value in config.items():
@@ -107,12 +122,20 @@ def flatten_params(config: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
 
 
 def finite_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
-    """Keep only finite numeric metrics.
+    """Only the finite numeric metrics (booleans, text and NaN are dropped).
 
-    Physics losses report NaN while the WFA gate is still closed (compute_physics_loss
-    returns early without populating the components). MLflow will happily store those, but a
-    NaN in a metric series makes the UI's charts unreadable, so they are dropped and the
-    series simply starts when the gate opens.
+    Physics losses are NaN while the gate is closed; a NaN in an MLflow series makes its
+    charts unreadable, so the series simply starts when the gate opens.
+
+    Args:
+        metrics: Name to value.
+
+    Returns:
+        Name to float, finite values only.
+
+    Examples:
+        >>> finite_metrics({"mse": 0.1, "wfa": float("nan"), "flag": True, "mode": "x"})
+        {'mse': 0.1}
     """
     out: Dict[str, float] = {}
     for key, value in metrics.items():

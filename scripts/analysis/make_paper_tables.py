@@ -96,16 +96,46 @@ CHI2_CAPTION = (
 
 
 def fmt(value: float, best: bool) -> str:
+    r"""A value as LaTeX with three decimals, starred when it is the best of its row.
+
+    Args:
+        value: The value.
+        best: Add the star.
+
+    Examples:
+        >>> fmt(0.12345, True)
+        '$0.123^\\star$'
+    """
     star = "^\\star" if best else ""
     return f"${value:.3f}{star}$"
 
 
 def fmt_logtau(logtau: float) -> str:
+    r"""A node as LaTeX, padded so negative and positive nodes align.
+
+    Args:
+        logtau: The node.
+
+    Examples:
+        >>> fmt_logtau(-0.8), fmt_logtau(0.0)
+        ('$-0.8$', '$\\phantom{-}0.0$')
+    """
     return f"$\\phantom{{-}}{logtau:.1f}$" if logtau >= 0 else f"${logtau:.1f}$"
 
 
 def load_modest_metrics() -> dict:
-    """{(region, model, param, logtau): (corr, rrmse)} from the paired-pixel rows."""
+    """``{(region, model, param, logtau): (corr, rrmse)}`` from the paired-pixel rows of the MODEST CSVs.
+
+    Returns:
+        The metrics.
+
+    Raises:
+        ValueError: If a combination has no paired-pixel row (the MODEST analysis was not run
+            with ``--downsample-prediction-input 1``).
+
+    Examples:
+        >>> m = load_modest_metrics()  # doctest: +SKIP
+    """
     metrics = {}
     for region in REGIONS:
         for model in MODELS:
@@ -127,6 +157,23 @@ def load_modest_metrics() -> dict:
 
 
 def modest_table(metrics: dict, param: str, label: str, caption: str) -> str:
+    """The LaTeX table of correlation and RRMSE for one quantity: regions by rows, models by columns.
+
+    The best value of each row is starred (highest correlation, lowest RRMSE), using the
+    unrounded values.
+
+    Args:
+        metrics: Output of :func:`load_modest_metrics`.
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        label: LaTeX label.
+        caption: Table caption.
+
+    Returns:
+        The LaTeX source.
+
+    Examples:
+        >>> print(modest_table(load_modest_metrics(), "T", "tab:modest_T", "..."))  # doctest: +SKIP
+    """
     lines = [
         "\\begin{table*}[!htbp]", "\\centering", "\\footnotesize", "\\setlength{\\tabcolsep}{5pt}",
         f"\\caption{{{caption}}}", f"\\label{{{label}}}", "\\begin{tabular}{llcccccccc}", "\\hline",
@@ -147,7 +194,14 @@ def modest_table(metrics: dict, param: str, label: str, caption: str) -> str:
 
 
 def load_chi2() -> tuple[dict, dict]:
-    """chi2 of every pixel shared by all models, as (n_pixels, n_models) arrays per (region, key)."""
+    """chi^2 of every pixel shared by all models, as ``(n_pixels, n_models)`` arrays per ``(region, key)``.
+
+    Returns:
+        ``(samples, n_pixels_per_region)``.
+
+    Examples:
+        >>> samples, n = load_chi2()  # doctest: +SKIP
+    """
     samples, n_pixels = {}, {}
     for region in REGIONS:
         path = SYNTHESIS_DIR / region / "pixel_comparison" / "cross_model_chi2.json"
@@ -161,7 +215,26 @@ def load_chi2() -> tuple[dict, dict]:
 
 
 def chi2_stats(chi2: np.ndarray, rng: np.random.Generator) -> dict:
-    """Median, bootstrap interval and paired robustness of the best model for one region."""
+    """Median chi^2 per model, its bootstrap interval, and how often the best stays best.
+
+    Pixels are resampled with replacement (the same resamples for every model, so the
+    comparison is paired); ``p_rank`` is the fraction of resamples where the model with the
+    lowest median stays below the runner-up.
+
+    Args:
+        chi2: ``(n_pixels, n_models)`` values.
+        rng: Random generator (seeded for reproducible tables).
+
+    Returns:
+        Dict with ``median``, ``lo``, ``hi`` (per model), ``best``, ``runner_up`` and ``p_rank``.
+
+    Examples:
+        >>> rng = np.random.default_rng(0)
+        >>> chi2 = np.column_stack([np.full(50, 1.0), np.full(50, 2.0)])
+        >>> s = chi2_stats(chi2, rng)
+        >>> s["median"].tolist(), s["best"], s["p_rank"]
+        ([1.0, 2.0], 0, 1.0)
+    """
     n = chi2.shape[0]
     resampled = np.median(chi2[rng.integers(0, n, size=(N_BOOTSTRAP, n))], axis=1)  # (N_BOOTSTRAP, n_models)
     tail = 100 * (1 - CI_LEVEL) / 2
@@ -179,12 +252,33 @@ def chi2_stats(chi2: np.ndarray, rng: np.random.Generator) -> dict:
 
 
 def fmt_interval(median: float, lo: float, hi: float) -> str:
+    """A median with its interval as LaTeX super- and subscripts.
+
+    Args:
+        median: The median.
+        lo: Lower end of the interval.
+        hi: Upper end of the interval.
+
+    Examples:
+        >>> fmt_interval(1.5, 1.25, 2.0)
+        '$1.50^{+0.50}_{-0.25}$'
+    """
     return f"${median:.2f}^{{+{hi - median:.2f}}}_{{-{median - lo:.2f}}}$"
 
 
 def chi2_table(samples: dict, caption: str) -> tuple[str, dict]:
-    """One full-width LaTeX table with the chi2_I and chi2_V blocks side by side (no stars), and per
-    key a Markdown note with the paired robustness of each region's lowest median."""
+    """The full-width chi^2 table (I and V side by side) and, per key, a Markdown note on rank robustness.
+
+    Args:
+        samples: Output of :func:`load_chi2`.
+        caption: Table caption.
+
+    Returns:
+        ``(latex_table, notes_by_key)``.
+
+    Examples:
+        >>> table, notes = chi2_table(samples, CHI2_CAPTION.format(n_pixels=40))  # doctest: +SKIP
+    """
     stats = {}
     for key in CHI2_SCALE:
         rng = np.random.default_rng(BOOTSTRAP_SEED)   # same draws per key, independent of table layout
@@ -220,7 +314,23 @@ def chi2_table(samples: dict, caption: str) -> tuple[str, dict]:
 
 
 def load_muram_metric(step: int, model: str, param: str, logtau: float) -> tuple[float, float]:
-    """(corr, rrmse) of a model at one node of a MURaM step, from the vs-tau curves' CSV."""
+    """``(corr, rrmse)`` of a model at one node of a MURaM step, from its ``metrics_vs_tau.csv``.
+
+    Args:
+        step: MURaM step.
+        model: Flavor key.
+        param: ``"T"``, ``"Vz"`` or ``"Bz"``.
+        logtau: The node.
+
+    Returns:
+        The two metrics.
+
+    Raises:
+        KeyError: If the CSV has no row for that model, quantity and node.
+
+    Examples:
+        >>> load_muram_metric(130, "wfa_only", "Bz", -0.8)  # doctest: +SKIP
+    """
     path = MURAM_METRICS_DIR / str(step) / "combined" / "metrics_vs_tau.csv"
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -231,6 +341,23 @@ def load_muram_metric(step: int, model: str, param: str, logtau: float) -> tuple
 
 
 def approx_accuracy_table(step: int) -> str:
+    """Table of each approximation, the baseline and its flavor against MURaM at the term's node.
+
+    Note:
+        The approximations and the truth are read from ``.muram_cache/step_<step>.h5``
+        without checking its configuration hash, and ``APPROX_STEP`` is the old validation
+        step 130. Both are to be updated in reframe Phase 3 (hash check, step 150, five
+        models).
+
+    Args:
+        step: MURaM step to evaluate on.
+
+    Returns:
+        The LaTeX source.
+
+    Examples:
+        >>> print(approx_accuracy_table(130))  # doctest: +SKIP
+    """
     cache_path = MURAM_CACHE_DIR / f"step_{step:06d}.h5"
     rows = []
     with h5py.File(cache_path, "r") as h5:
@@ -269,6 +396,13 @@ def approx_accuracy_table(step: int) -> str:
 
 
 def main() -> None:
+    """Write every paper table to one Markdown file of LaTeX blocks.
+
+    Examples:
+        ::
+
+            python scripts/analysis/make_paper_tables.py --output output/paper_tables/paper_tables.md
+    """
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--output", type=Path,
                         default=ROOT / "output" / "paper_tables" / "paper_tables.md")

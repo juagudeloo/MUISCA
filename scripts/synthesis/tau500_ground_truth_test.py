@@ -58,9 +58,21 @@ OLD_SYNTHESES_H5 = Path(
 
 
 def compute_logtau500(mhd: MhdData, dz_km: float) -> np.ndarray:
-    """log10(tau_500), integrated the same way MhdData.compute_optical_depth
-    integrates Rosseland tau, but using tau500_opacity.kappa_500(T, P, rho)
-    in place of the Rosseland kappa.0.dat interpolator."""
+    """log10 tau_500 of every cell, integrated from the top of the box down with the H- opacity.
+
+    Same integration as :meth:`MhdData.compute_optical_depth` (trapezoid along z, tau = 0 at
+    the top, clipped at 1e-30) with ``kappa_500(T, P, rho)`` in place of the Rosseland table.
+
+    Args:
+        mhd: A loaded :class:`MhdData` step.
+        dz_km: Layer thickness in km.
+
+    Returns:
+        ``(nx, ny, nz)`` log tau_500.
+
+    Examples:
+        >>> logtau = compute_logtau500(mhd, dz_km=10.0)  # doctest: +SKIP
+    """
     T = mhd.data["T"].value
     P = mhd.data["P"].value
     rho = mhd.data["rho"].to(u.g / u.cm**3).value
@@ -77,8 +89,21 @@ def compute_logtau500(mhd: MhdData, dz_km: float) -> np.ndarray:
 
 def remap_to_logtau500(logtau500: np.ndarray, quantity: np.ndarray, new_grid: np.ndarray,
                         nx: int, ny: int) -> np.ndarray:
-    """Per-pixel interpolation from the computed logtau500(z) onto new_grid,
-    mirroring MhdData.remap_to_optical_depth's own per-pixel interp1d loop."""
+    """Linear per-column interpolation of a quantity from log tau_500(z) to ``new_grid`` (extrapolating).
+
+    Args:
+        logtau500: ``(nx, ny, nz)`` from :func:`compute_logtau500`.
+        quantity: ``(nx, ny, nz)`` on geometric height.
+        new_grid: Target log tau nodes.
+        nx: Size along x.
+        ny: Size along y.
+
+    Returns:
+        ``(nx, ny, len(new_grid))``.
+
+    Examples:
+        >>> T_tau = remap_to_logtau500(logtau, mhd.data["T"].value, np.arange(-3, 1.41, 0.1), 480, 480)  # doctest: +SKIP
+    """
     out = np.zeros((nx, ny, len(new_grid)))
     for ix in range(nx):
         for iy in range(ny):
@@ -91,6 +116,13 @@ def remap_to_logtau500(logtau500: np.ndarray, quantity: np.ndarray, new_grid: np
 
 
 def main():
+    """Re-synthesize MURaM's own atmosphere on the tau_500 grid for the selected pixels and compare with its profiles.
+
+    Examples:
+        ::
+
+            python scripts/synthesis/tau500_ground_truth_test.py
+    """
     train_cfg = TrainingConfig()
     data_path = Path(train_cfg.data_path)
 
@@ -179,6 +211,7 @@ def main():
     sigma_I = 1e-3
 
     def _metrics(I_true, I_synth):
+        """Continuum ratio, both line depths and chi^2 of synthesized against true I (each normalized to its own wing continuum)."""
         wing_true = np.mean([I_true[:5].mean(), I_true[-5:].mean()])
         wing_synth = np.mean([I_synth[:5].mean(), I_synth[-5:].mean()])
         I_true_n = I_true / wing_true

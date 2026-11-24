@@ -49,6 +49,12 @@ DEFAULT_COLORS = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
 
 
 def _format_bin_range(lo: float, hi: float) -> str:
+    """Folder-name label of a field bin, 4 significant figures.
+
+    Examples:
+        >>> _format_bin_range(12.345, 1234.5)
+        '12.35-1234'
+    """
     return f"{lo:.4g}-{hi:.4g}"
 
 
@@ -87,6 +93,27 @@ def plot_combined_overlay(
     bin_range: tuple[float, float] | None,
     abs_b_los: float | None,
 ) -> Path:
+    """Plot the observed I and V of one pixel with every model's NICOLE re-synthesis.
+
+    The observed profiles come from the first model's ``predictions.h5`` (a warning is printed
+    if another model's differ).
+
+    Args:
+        ix: Pixel index along the first axis.
+        iy: Pixel index along the second axis.
+        model_types: Flavors to overlay.
+        raw_by_model: Arrays read by ``_read_raw_arrays`` per flavor.
+        model_colors: Line colour per flavor.
+        out_dir: Base folder (a ``<lo>-<hi>`` subfolder is used for a field bin).
+        bin_range: Field bin in G, or ``None``.
+        abs_b_los: |B_LOS| of the pixel in G, for the title.
+
+    Returns:
+        Path of the PNG.
+
+    Examples:
+        >>> plot_combined_overlay(65, 301, ["no_physics", "wfa_only"], raw, colors, Path("o"), None, 1670.0)  # doctest: +SKIP
+    """
     target_dir = out_dir / _format_bin_range(*bin_range) if bin_range is not None else out_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -135,6 +162,13 @@ def plot_combined_overlay(
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/compare_models.py --source modest --experiment-root <root> --region-label sunspot
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", choices=["modest", "muram"], default="modest")
     p.add_argument("--experiment-root", required=True)

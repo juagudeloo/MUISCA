@@ -59,11 +59,25 @@ def strip_docstrings(source: str) -> str:
 
 
 def _git_show(ref: str, path: str) -> str:
+    """Text of ``path`` at the git revision ``ref``."""
     return subprocess.run(["git", "show", f"{ref}:{path}"], check=True, capture_output=True, text=True).stdout
 
 
 def same_code(paths: list[str], ref: str) -> int:
-    """Compare each file in ``paths`` against ``ref`` ignoring docstrings; return a status code."""
+    """Compare each file with its version at ``ref``, ignoring docstrings; print the result per file.
+
+    Args:
+        paths: Files to check (paths as git knows them).
+        ref: Git revision to compare with.
+
+    Returns:
+        0 if every file's code is unchanged, else 1.
+
+    Examples:
+        >>> same_code(["tools/check_docstrings.py"], "HEAD")  # doctest: +SKIP
+        tools/check_docstrings.py: code unchanged (docstrings only)
+        0
+    """
     bad = 0
     for path in paths:
         old = strip_docstrings(_git_show(ref, path))
@@ -77,6 +91,7 @@ def same_code(paths: list[str], ref: str) -> int:
 
 
 def _is_trivial(node: ast.AST) -> bool:
+    """True if the function body, docstring excluded, is at most one statement (no ``Examples:`` required)."""
     body = [n for n in node.body if not (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant))]
     return len(body) <= 1
 
@@ -122,6 +137,17 @@ def coverage(paths: list[str]) -> int:
 
 
 def main() -> int:
+    """Command-line entry point: ``same-code <files> [--ref REF]`` or ``coverage <files>``.
+
+    Returns:
+        The process exit status.
+
+    Examples:
+        Check the docs-only rule and the coverage of a module::
+
+            python tools/check_docstrings.py same-code utils/analysis.py
+            python tools/check_docstrings.py coverage utils/analysis.py
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_same = sub.add_parser("same-code", help="code unchanged except docstrings")

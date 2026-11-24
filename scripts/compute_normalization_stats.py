@@ -21,6 +21,17 @@ def _compute_fixed_global_ic(
     end_step: int,
     cont_indices: list[int],
 ) -> tuple[float, dict[int, float]]:
+    """Mean continuum intensity over early legacy steps, for the legacy ``fixed_global`` normalization.
+
+    Only used with ``data_source="muram_legacy"``; the NICOLE profiles are already normalized
+    to the HSRA continuum.
+
+    Returns:
+        ``(fixed_ic, ic_per_step)`` in the legacy cube's intensity units.
+
+    Raises:
+        ValueError: For an empty step range or index list, or a non-positive I_c.
+    """
     if end_step < start_step:
         raise ValueError(f"ic_end_step ({end_step}) must be >= ic_start_step ({start_step})")
 
@@ -79,38 +90,45 @@ def compute_normalization_stats(
     kappa_path: str | Path | None = None,
     lsf_path: str | Path | None = None,
 ):
-    """
-    Compute normalization statistics for both MHD and Stokes data.
+    """Accumulate the MHD and Stokes normalization statistics over the training steps and save them.
+
+    Each step is read through the same pipeline as training (cache, LSF, resampling), its
+    statistics are streamed into :class:`MhdNormalizer` and :class:`StokesNormalizer`, and the
+    JSON files are written to ``normalization_stats/<data_source>/`` (or ``output_dir``).
+    Intermediate states are saved every ``save_interval`` steps for resuming.
+
+    Note:
+        In the reframe plan the statistics are computed on the training steps only (110,
+        120, 130, 140), with 4 channels and the PSF.
 
     Args:
-        min_step: first simulation step to process
-        max_step: last simulation step to process (inclusive)
-        steps: explicit list of steps to process (overrides min_step/max_step scanning
-            -- use this for a small, non-contiguous set of available steps, e.g. a
-            nicole_tau500 pilot with only 2 generated steps)
-        save_interval: save intermediate state every N steps
-        resume_from: path to resume from saved state (optional)
-        logtau_values: explicit log(tau) nodes (overrides min/max/step)
-        logtau_min: minimum log(tau) for range mode
-        logtau_max: maximum log(tau) for range mode
-        logtau_step: step in log(tau) for range mode
-        use_cache: enable/disable cache usage
-        cache_dir: cache directory
-        stokes_ic_mode: 'per_step' or 'fixed_global' (ignored when data_source != 'muram_legacy';
-            the nicole_tau500 source is already continuum-normalized)
-        ic_start_step: first step for fixed-I_c extraction (inclusive)
-        ic_end_step: last step for fixed-I_c extraction (inclusive)
-        ic_cont_indices: continuum indices used for I_c extraction
-        clean_start: if True, remove previous normalization outputs before run
-        purge_cache: if True and clean_start=True, remove cache directory before run
-        data_source: 'muram_legacy' or 'nicole_tau500' (see TrainingConfig.data_source)
-        data_path: root data directory (contains muram-simulation/, csv/, normalization_stats/)
-        output_dir: where to write mhd_normalization.json / stokes_normalization.json.
-            Defaults to data_path/normalization_stats for muram_legacy, or
-            data_path/normalization_stats/<data_source> otherwise -- never clobbers the
-            legacy files when computing stats for a different source.
-        kappa_path: Rosseland opacity table (only used for data_source='muram_legacy')
-        lsf_path: Hinode LSF kernel (used by both sources)
+        min_step: First step when scanning a range.
+        max_step: Last step (inclusive) when scanning a range.
+        steps: Explicit steps; overrides the range.
+        save_interval: Save an intermediate state every this many steps.
+        resume_from: Intermediate state to resume from.
+        logtau_values: Explicit log tau nodes; override the range below.
+        logtau_min: First node.
+        logtau_max: Last node.
+        logtau_step: Node spacing.
+        use_cache: Read and write the per-step cache.
+        cache_dir: Per-step cache folder.
+        stokes_ic_mode: ``"per_step"`` or ``"fixed_global"`` (legacy source only).
+        ic_start_step: First early step for the legacy fixed I_c.
+        ic_end_step: Last early step for the legacy fixed I_c.
+        ic_cont_indices: Continuum indices for the legacy fixed I_c.
+        clean_start: Ignore any saved intermediate state.
+        purge_cache: Delete the per-step cache first.
+        data_source: ``"nicole_tau500"`` or ``"muram_legacy"``.
+        data_path: The data folder.
+        output_dir: Where to write the JSON files (default: the data source's folder).
+        kappa_path: Rosseland opacity table (legacy source).
+        lsf_path: Hinode LSF file.
+
+    Examples:
+        Statistics of the four training steps::
+
+            python scripts/compute_normalization_stats.py --steps 110 120 130 140
     """
     # Configuration - using same paths as other scripts
     data_path = Path(data_path)

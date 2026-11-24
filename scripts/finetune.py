@@ -58,9 +58,21 @@ from scripts.experiments.ablation_study import compute_tau_averaged_metrics
 
 
 def discover_checkpoint_path(experiment_name: str, variation: str, base_exp_dir: Path) -> Path:
-    """
-    Discover checkpoint file for a trained model variation.
-    Checks: final_model.pth (preferred), then best_model.pth in checkpoints/.
+    """Checkpoint of a trained flavor: ``final_model.pth``, else ``checkpoints/best_model.pth``.
+
+    Args:
+        experiment_name: Experiment folder name.
+        variation: Flavor folder name.
+        base_exp_dir: Folder holding the experiments.
+
+    Returns:
+        Path of the checkpoint.
+
+    Raises:
+        FileNotFoundError: If neither file exists.
+
+    Examples:
+        >>> discover_checkpoint_path("exp", "wfa_only", Path("output/experiments"))  # doctest: +SKIP
     """
     candidates = [
         base_exp_dir / experiment_name / variation / "final_model.pth",
@@ -96,11 +108,21 @@ _EXPERIMENT_CONFIG_SECTIONS = ("data_config", "training_config", "model_config",
 
 
 def source_step_exists(step: int, config: TrainingConfig) -> bool:
-    """Whether a MURaM step has source data on disk for the config's data source.
+    """Whether a MURaM step has source files for the configured data source.
 
-    Mirrors the filenames load_source_arrays() resolves (base_training.py): nicole_tau500
-    needs both stokes_<step>_nicole_tau500.npy and atmos_<step>_tau500.npz; muram_legacy
-    needs stokes_<step>.npy.
+    ``nicole_tau500`` needs ``stokes_<step>_nicole_tau500.npy`` and ``atmos_<step>_tau500.npz``;
+    ``muram_legacy`` needs ``stokes_<step>.npy`` (the names ``load_source_arrays`` reads).
+
+    Args:
+        step: Simulation step.
+        config: The training configuration.
+
+    Returns:
+        True if the files exist.
+
+    Examples:
+        >>> source_step_exists(110, TrainingConfig())  # doctest: +SKIP
+        True
     """
     sim_dir = Path(config.data_path) / "muram-simulation"
     if config.data_source == "nicole_tau500":
@@ -111,7 +133,18 @@ def source_step_exists(step: int, config: TrainingConfig) -> bool:
 
 
 def available_source_steps(config: TrainingConfig) -> list:
-    """Steps that do have source data on disk, for error messages."""
+    """Steps that have source files on disk for the configured data source (for error messages).
+
+    Args:
+        config: The training configuration.
+
+    Returns:
+        Sorted step numbers.
+
+    Examples:
+        >>> available_source_steps(TrainingConfig())[:3]  # doctest: +SKIP
+        [110, 120, 130]
+    """
     sim_dir = Path(config.data_path) / "muram-simulation"
     if config.data_source == "nicole_tau500":
         pattern, strip = "stokes_*_nicole_tau500.npy", "_nicole_tau500"
@@ -126,15 +159,22 @@ def available_source_steps(config: TrainingConfig) -> list:
 
 
 def load_experiment_config_json(checkpoint_path: Path) -> dict:
-    """Load the experiment_config.json written alongside a trained checkpoint.
+    """The ``experiment_config.json`` of the base run, next to the checkpoint or one level up.
 
-    Base training saves the run's real settings here, NOT inside the .pth (final_model.pth
-    holds only model_state_dict plus metric history). Without this, fine-tuning silently
-    falls back to TrainingConfig() defaults -- which means min_step=60/max_step=200/
-    step_size=1, i.e. iterating 141 steps when only a handful were ever synthesized.
+    The base run's settings live there, not in the checkpoint; without them fine-tuning would
+    fall back to the ``TrainingConfig`` defaults (steps 60 to 200), so a missing file raises.
 
-    Looks next to the checkpoint first, then one level up (for checkpoints/best_model.pth).
-    Raises rather than returning empty: a silent fallback here produces a wrong run.
+    Args:
+        checkpoint_path: The base checkpoint.
+
+    Returns:
+        The parsed JSON.
+
+    Raises:
+        FileNotFoundError: If no ``experiment_config.json`` is found.
+
+    Examples:
+        >>> cfg = load_experiment_config_json(Path("output/experiments/exp/wfa_only/final_model.pth"))  # doctest: +SKIP
     """
     candidates = [
         checkpoint_path.parent / "experiment_config.json",
@@ -154,7 +194,23 @@ def load_experiment_config_json(checkpoint_path: Path) -> dict:
 
 
 def apply_experiment_config(config: TrainingConfig, experiment_config: dict) -> dict:
-    """Replay a base run's experiment_config.json onto a TrainingConfig. Returns applied keys."""
+    """Copy a base run's settings onto a configuration and return the applied ones.
+
+    Settings are set as attributes after construction, so ``__post_init__`` does not run
+    again for them (e.g. a different ``data_source`` would not redirect the paths).
+
+    Args:
+        config: Configuration to update in place.
+        experiment_config: Parsed ``experiment_config.json``.
+
+    Returns:
+        The applied ``{attribute: value}``.
+
+    Examples:
+        >>> applied = apply_experiment_config(TrainingConfig(), {"physics_config": {"lambda_wfa": 10.0}})  # doctest: +SKIP
+        >>> applied  # doctest: +SKIP
+        {'lambda_wfa': 10.0}
+    """
     applied = {}
     for section in _EXPERIMENT_CONFIG_SECTIONS:
         for key, value in (experiment_config.get(section) or {}).items():
@@ -177,11 +233,27 @@ def load_and_adapt_config(
     step_overrides: dict = None,
     balance_overrides: dict = None,
 ) -> tuple:
-    """
-    Load checkpoint and setup config for fine-tuning with mandatory Bz balancing.
+    """Configuration for fine-tuning a checkpoint, with global Bz balancing enforced.
+
+    Restores the base run's settings, then forces global balancing on |Bz| at
+    ``bz_balance_tau_idx`` with 12 bins and seed 42 (overridable). The number of epochs
+    defaults to 10 % of the base run's (at least 5).
+
+    Args:
+        checkpoint_path: The base checkpoint.
+        finetune_epochs_override: Number of fine-tuning epochs, if given.
+        step_overrides: Settings for a different step range (normalizers are not recomputed).
+        balance_overrides: ``bz_balance_bins``, ``bz_balance_cap`` or ``bz_balance_oversample``.
 
     Returns:
-        (config, checkpoint_dict) tuple
+        ``(config, checkpoint)``.
+
+    Raises:
+        ValueError: If the base run has no ``bz_balance_tau_idx`` (balancing would silently
+            use the middle node).
+
+    Examples:
+        >>> cfg, ck = load_and_adapt_config(Path(".../final_model.pth"), finetune_epochs_override=20)  # doctest: +SKIP
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
@@ -258,17 +330,23 @@ def run_fine_tune_single_variation(
     step_overrides: dict = None,
     balance_overrides: dict = None,
 ):
-    """
-    Run fine-tuning for a single model variation.
+    """Fine-tune one flavor on Bz-balanced data and save it under ``output/fine-tune``.
 
-    Workflow:
-    1. Discover and load trained checkpoint
-    2. Load normalizers
-    3. Setup model with mandatory Bz balancing
-    4. Compute global Bz balancing indices (global deepest-tau strategy)
-    5. Run training epochs with balanced cache
-    6. Generate diagnostic plots
-    7. Save fine-tuned checkpoint
+    Loads the checkpoint and its configuration, the normalizers, computes the global Bz
+    balancing, trains with the balanced cache, validates, plots and saves the fine-tuned
+    model to ``<output_base_dir>/<experiment>-finetuned/<variation>/``.
+
+    Args:
+        experiment_name: Base experiment.
+        variation: Flavor to fine-tune.
+        output_base_dir: Base output folder.
+        base_exp_dir: Folder holding the base experiments.
+        finetune_epochs_override: Number of fine-tuning epochs, if given.
+        step_overrides: Settings for a different step range.
+        balance_overrides: Balancing settings to override.
+
+    Examples:
+        >>> run_fine_tune_single_variation("exp", "wfa_only", Path("output/fine-tune"), Path("output/experiments"))  # doctest: +SKIP
     """
     
     print(f"\n{'='*100}")
@@ -642,10 +720,12 @@ def run_fine_tune_single_variation(
 
 
 def main():
-    """
-    Main entry point for fine-tuning script.
-    
-    Parses arguments, discovers checkpoints, and runs fine-tuning for selected variations.
+    """Command-line entry point: fine-tune each requested flavor in turn.
+
+    Examples:
+        Fine-tune two flavors for 20 epochs::
+
+            python scripts/finetune.py --experiment-name exp --variations wfa_only,no_physics --finetune-epochs 20
     """
     parser = argparse.ArgumentParser(
         description="Fine-tune MUISCA checkpoint models on Bz-balanced training data"

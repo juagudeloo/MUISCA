@@ -24,6 +24,13 @@ CHUNK_RE = re.compile(r"chunk_(\d+)_(\d+)_(\d+)_stokes\.npy$")
 
 
 def main():
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/synthesis/merge_tau500_stokes.py --step 140 --chunk-dir chunks/ --output-dir data/muram-simulation/
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--step", type=int, required=True)
     p.add_argument("--chunk-dir", type=Path, required=True,

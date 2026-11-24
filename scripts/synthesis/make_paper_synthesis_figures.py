@@ -45,6 +45,19 @@ OUT_DIR = SYNTH_BASE / "synthesis_for_paper"
 
 
 def load_case(region_label: str, ix: int, iy: int):
+    """Observed I and V, every model's re-synthesized I and V, |B_LOS| and chi^2 of one paper pixel.
+
+    Args:
+        region_label: MODEST region folder.
+        ix: Pixel index along the first axis.
+        iy: Pixel index along the second axis.
+
+    Returns:
+        ``(wl, i_obs, v_obs, synth_by_model, abs_b_los, chi2_by_model)``.
+
+    Examples:
+        >>> case = load_case("sunspot", 106, 277)  # doctest: +SKIP
+    """
     pred_path = SYNTH_BASE / MODEL_TYPES[0] / region_label / "predictions.h5"
     with h5py.File(pred_path, "r") as h5:
         pred_pixels = h5["pixels"][...]
@@ -83,6 +96,12 @@ def load_case(region_label: str, ix: int, iy: int):
 
 
 def _format_sci(value: float) -> str:
+    r"""A chi^2 value as LaTeX ``m x 10^e`` (``"n/a"`` for missing, zero or non-finite).
+
+    Examples:
+        >>> _format_sci(12345.0)
+        '$1.23\\times10^{4}$'
+    """
     if value is None or not np.isfinite(value) or value == 0:
         return "n/a"
     exp = int(np.floor(np.log10(abs(value))))
@@ -92,6 +111,23 @@ def _format_sci(value: float) -> str:
 
 def make_panel(wl, obs, synth_by_model, stokes_idx, ylabel, region_name, b_label,
                chi2_by_model, chi2_key, out_path):
+    """One paper panel: observed profile, each model's re-synthesis and a chi^2 box.
+
+    Args:
+        wl: Wavelength axis in A.
+        obs: Observed profile.
+        synth_by_model: ``{flavor: (I, V)}`` re-synthesized profiles.
+        stokes_idx: 0 for I, 1 for V.
+        ylabel: Axis label.
+        region_name: Region for the title.
+        b_label: |B_LOS| text for the title.
+        chi2_by_model: ``{flavor: {"chi2_I", "chi2_V"}}``.
+        chi2_key: ``"chi2_I"`` or ``"chi2_V"``.
+        out_path: PNG path.
+
+    Examples:
+        >>> make_panel(*case_args, out_path=Path("p.png"))  # doctest: +SKIP
+    """
     fig, ax = plt.subplots(figsize=(5.0, 4.2))
     ax.plot(wl, obs, color="k", lw=1.8, label="Observed")
     for mt in MODEL_TYPES:
@@ -127,6 +163,13 @@ def make_panel(wl, obs, synth_by_model, stokes_idx, ylabel, region_name, b_label
 
 
 def main() -> None:
+    """Write the paper's re-synthesis panels (I and V) for every case in ``CASES``.
+
+    Examples:
+        ::
+
+            python scripts/synthesis/make_paper_synthesis_figures.py
+    """
     plt.rcParams["font.family"] = "serif"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for region_label, ix, iy, region_name, basename in CASES:

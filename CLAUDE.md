@@ -68,6 +68,8 @@ sbatch tools/fine_tune.sh --experiment-name <name> --variations wfa_only,all_phy
 **Tests and docstrings:**
 ```bash
 pytest tests/ --doctest-modules utils/ models/    # synthetic tests + docstring examples
+pytest --doctest-modules scripts/                 # script examples (separate run: utils/synthesis.py and
+                                                  # scripts/synthesis/ share a module name for pytest)
 pytest -m "not data" tests/                       # skip tests that need real MURaM/MODEST/HSRA files
 python tools/check_docstrings.py coverage <files> # Google-style docstring with Args/Examples
 python tools/check_docstrings.py same-code <files> # a docs-only edit left the code unchanged

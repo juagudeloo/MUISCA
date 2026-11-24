@@ -51,6 +51,12 @@ N_WL, N_CHANNELS = 112, 2   # Hinode/SOT-SP grid, Stokes I and V
 
 
 def cpu_model() -> str:
+    """CPU model name from ``/proc/cpuinfo``, without the core-count suffix.
+
+    Examples:
+        >>> isinstance(cpu_model(), str)
+        True
+    """
     for line in Path("/proc/cpuinfo").read_text().splitlines():
         if line.startswith("model name"):
             # "AMD EPYC 9354P 32-Core Processor" -> "AMD EPYC 9354P"
@@ -59,7 +65,17 @@ def cpu_model() -> str:
 
 
 def time_nicole(n_pixels: int) -> list[float]:
-    """Seconds per pixel for n_pixels sequential NICOLE syntheses of real MUISCA predictions."""
+    """Seconds per pixel of sequential single-pixel NICOLE syntheses of real MUISCA predictions.
+
+    Args:
+        n_pixels: Number of pixels from ``PREDICTIONS_H5``.
+
+    Returns:
+        One time per pixel, including writing the model and reading the profile.
+
+    Examples:
+        >>> times = time_nicole(10)  # doctest: +SKIP
+    """
     with h5py.File(PREDICTIONS_H5, "r") as h5:
         pixels = [tuple(int(v) for v in p) for p in h5["pixels"][:n_pixels]]
         logtau = h5["logtau"][...]
@@ -85,6 +101,17 @@ def time_nicole(n_pixels: int) -> list[float]:
 
 
 def load_model(device: torch.device) -> torch.nn.Module:
+    """Load the benchmarked flavor (``MODEL_TYPE``) on ``device`` in evaluation mode.
+
+    Args:
+        device: CPU or GPU.
+
+    Returns:
+        The model.
+
+    Examples:
+        >>> model = load_model(torch.device("cpu"))  # doctest: +SKIP
+    """
     pipeline = AnalysisModelPipeline(device=device, output_dir=Path(tempfile.gettempdir()) / "bench_out",
                                      experiment_root=EXPERIMENT_ROOT, experiments_base_dir=None)
     _, models, _ = pipeline.prepare_models([MODEL_TYPE])
@@ -92,7 +119,19 @@ def load_model(device: torch.device) -> torch.nn.Module:
 
 
 def time_muisca(device: torch.device, n_threads: int | None, repeats: int) -> list[float]:
-    """Seconds per full map, input on the CPU and output back on the CPU."""
+    """Seconds per full 480 x 480 map in one batch (input from and output to the CPU).
+
+    Args:
+        device: CPU or GPU.
+        n_threads: CPU threads (``None`` leaves torch's setting).
+        repeats: Number of timed passes after one warm-up.
+
+    Returns:
+        One time per pass.
+
+    Examples:
+        >>> times = time_muisca(torch.device("cpu"), 1, 3)  # doctest: +SKIP
+    """
     if n_threads is not None:
         torch.set_num_threads(n_threads)
     model = load_model(device)
@@ -112,6 +151,15 @@ def time_muisca(device: torch.device, n_threads: int | None, repeats: int) -> li
 
 
 def fmt_time(seconds: float) -> str:
+    r"""A duration as LaTeX in ms, s or h.
+
+    Args:
+        seconds: The duration in s.
+
+    Examples:
+        >>> fmt_time(0.0123), fmt_time(4.2), fmt_time(7200.0)
+        ('$12.3$~ms', '$4.2$~s', '$\\sim\\!2.0$~h')
+    """
     if seconds >= 3600:
         return f"$\\sim\\!{seconds / 3600:.1f}$~h"
     if seconds >= 1:
@@ -120,6 +168,15 @@ def fmt_time(seconds: float) -> str:
 
 
 def fmt_speedup(factor: float) -> str:
+    r"""A speed-up factor as LaTeX, in scientific notation above 10.
+
+    Args:
+        factor: The speed-up.
+
+    Examples:
+        >>> fmt_speedup(3.0), fmt_speedup(25000.0)
+        ('$3\\times$', '$\\sim\\!2.5\\times10^{4}$')
+    """
     if factor < 10:
         return f"${factor:.0f}\\times$"
     exponent = int(np.floor(np.log10(factor)))
@@ -127,6 +184,13 @@ def fmt_speedup(factor: float) -> str:
 
 
 def main() -> None:
+    """Command-line entry point (see the module docstring for the options and outputs).
+
+    Examples:
+        ::
+
+            python scripts/analysis/benchmark_inference_speed.py --nicole-pixels 60 --threads 32
+    """
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--nicole-pixels", type=int, default=60)
     parser.add_argument("--threads", type=int, default=32, help="multi-threaded CPU column")
