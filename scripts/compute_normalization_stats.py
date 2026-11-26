@@ -12,7 +12,8 @@ from tqdm import tqdm
 from utils.muram_data import StokesData
 from utils.normalizer import MhdNormalizer, StokesNormalizer
 from utils.cache_manage import MuramDataCache
-from scripts.base_training import TrainingConfig, build_cache_config_signature, load_source_arrays
+from scripts.base_training import (TrainingConfig, build_cache_config_signature, load_source_arrays,
+                                   require_one_velocity_convention)
 
 
 def _compute_fixed_global_ic(
@@ -315,6 +316,8 @@ def compute_normalization_stats(
         checkpoint_dir=str(output_dir / "_tmp_checkpoints"),
         log_dir=str(output_dir / "_tmp_logs"),
     )
+    # Statistics over steps with opposite velocity signs would have a meaningless Vz mean.
+    require_one_velocity_convention(available_steps, shared_cfg)
 
     # Initialize cache (optional)
     cache = None

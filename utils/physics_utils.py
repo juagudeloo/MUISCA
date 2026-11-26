@@ -285,12 +285,16 @@ class ApproxInversions:
 
             v_LOS = c (x0 - lambda0) / lambda0.
 
-        Sign convention: positive v_LOS means a redshifted line core, the same as MURaM's
-        Vz, which the network is trained against. The two must agree for the Doppler
-        physics term to reinforce the MSE instead of fighting it. The opposite convention
-        was in place until it was caught empirically: the approximation correlated -0.965
-        with MURaM's Vz at log(tau) = -1.0, and the doppler_only arm drove the predicted
-        velocity to correlation -0.951 at exactly that height.
+        Sign convention: positive v_LOS means a redshifted line core (motion away from the
+        observer), the same as the training target v_LOS = -Vz (MURaM's Vz is positive
+        upward; NICOLE synthesizes the profiles with v_LOS = -Vz since Phase 1a). The two
+        must agree for the Doppler physics term to reinforce the MSE instead of fighting it.
+
+        History: an opposite sign of this approximation was caught empirically (it
+        correlated -0.965 with the target at log(tau) = -1.0, and the doppler_only arm drove
+        the predicted velocity to correlation -0.951 at that height). Profiles from before
+        Phase 1a were synthesized with v_LOS = +Vz, so on them the target is +Vz and the
+        same redshift-positive approximation still agrees with it.
 
         Args:
             wl_range: Only ``wl_range[1]`` is used. The fit runs over indices

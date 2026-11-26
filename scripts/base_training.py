@@ -625,6 +625,53 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def require_one_velocity_convention(steps, config: TrainingConfig) -> str | None:
+    """Refuse a set of steps whose velocity targets follow different sign conventions.
+
+    Steps regenerated since Phase 1a store ``v_los`` = -Vz (positive = redshift); older
+    ``nicole_tau500`` files only store Vz (positive upward), and ``load_source_arrays``
+    then uses +Vz as the target. Mixing the two in one experiment (e.g. regenerated
+    training steps with an old test step) silently flips the sign of the velocity in
+    part of the data, so this raises instead. Steps without files are ignored (they are
+    skipped or reported elsewhere); only the key list of each npz is read.
+
+    Args:
+        steps: The steps of one experiment (training, validation and test together).
+        config: The training configuration (data source and data path).
+
+    Returns:
+        ``"v_los"`` or ``"Vz"`` (the target each step uses), or ``None`` for
+        ``muram_legacy`` and when no step has files.
+
+    Raises:
+        ValueError: If some steps carry ``v_los`` and others do not.
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> require_one_velocity_convention([999], TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)) is None
+        True
+    """
+    if config.data_source != "nicole_tau500":
+        return None
+    sim_dir = Path(config.data_path) / "muram-simulation"
+    found = {}
+    for step in steps:
+        path = sim_dir / f"atmos_{step}_tau500.npz"
+        if path.exists():
+            with np.load(path) as atmos:
+                found[int(step)] = "v_los" if "v_los" in atmos.files else "Vz"
+    kinds = set(found.values())
+    if len(kinds) > 1:
+        old = sorted(s for s, k in found.items() if k == "Vz")
+        raise ValueError(
+            f"Steps {old} come from the old generator (velocity target +Vz) while the others "
+            "carry v_los = -Vz; regenerate them (tools/generate_tau500_stokes.sh) before "
+            "using them together."
+        )
+    return kinds.pop() if kinds else None
+
+
 def source_data_fingerprint(step: int, config: TrainingConfig) -> dict:
     """Size (bytes) and modification time (ns) of the source files of one step.
 

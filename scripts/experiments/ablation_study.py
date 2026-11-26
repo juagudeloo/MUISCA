@@ -57,7 +57,7 @@ from scripts.base_training import (
     TrainingConfig, set_global_seed,
     load_and_prepare_step, validate, train_epoch, MetricsLogger,
     initialize_wfa_gate_state, update_wfa_gate_state,
-    compute_global_bz_balancing_indices,
+    compute_global_bz_balancing_indices, require_one_velocity_convention,
     build_or_refresh_balanced_cache, choose_balanced_cache_runtime_mode,
     preload_balanced_steps_from_cache,
     generate_epoch_diagnostic_plots, generate_epoch_diagnostic_videos,
@@ -1702,6 +1702,7 @@ def run_single_experiment(
     n_val = max(1, len(train_steps) // 10)
     val_steps = random.sample(train_steps, n_val)
     train_steps = [s for s in train_steps if s not in val_steps]
+    require_one_velocity_convention(train_steps + val_steps + list(test_steps), config)
 
     global_bz_selection_indices = None
     global_bz_balance_metadata = None

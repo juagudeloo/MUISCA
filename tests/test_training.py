@@ -307,3 +307,37 @@ def test_muram_test_metrics_compare_with_the_ground_truth(tmp_path, monkeypatch)
         for node in (-2.0, -0.8, 0.0):
             assert metrics[q][node]["correlation"] == pytest.approx(1.0, abs=1e-6)
             assert metrics[q][node]["rrmse"] == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 2, sixth run): an I/V-only baseline "
+                   "trained next to the IQUV one, selected with a Stokes-channel option.")
+def test_ablation_can_train_with_a_chosen_set_of_stokes_channels():
+    """The ablation CLI accepts ``--stokes_channels`` (e.g. ``I V``) for the I/V-only baseline.
+
+    The sixth run compares a baseline that sees only I and V with the IQUV baseline, to show
+    whether Q and U help T and B_LOS in strong, inclined fields.
+    """
+    out = subprocess.run([sys.executable, str(ROOT / "scripts" / "experiments" / "ablation_study.py"), "--help"],
+                         capture_output=True, text=True, timeout=120)
+    assert "--stokes_channels" in out.stdout or "--stokes-channels" in out.stdout
+
+
+def test_an_experiment_refuses_steps_with_different_velocity_conventions(tmp_path):
+    """Steps with ``v_los`` (= -Vz, regenerated) and steps with only Vz (old generator) cannot be mixed.
+
+    An old step's velocity target is +Vz and a regenerated step's is -Vz, so one forgotten
+    step in Phase 2 (e.g. test step 198) would flip the sign of the velocity in part of an
+    experiment with nothing but a warning. Only the npz key list is read; steps without
+    files are ignored.
+    """
+    from scripts.base_training import TrainingConfig, require_one_velocity_convention
+    sim = tmp_path / "muram-simulation"
+    sim.mkdir()
+    z = np.zeros((1, 1, 2))
+    np.savez(sim / "atmos_150_tau500.npz", T=z, Vz=z, v_los=z, Bz=z)
+    np.savez(sim / "atmos_198_tau500.npz", T=z, Vz=z, Bz=z)
+    cfg = TrainingConfig(data_path=str(tmp_path), checkpoint_dir=str(tmp_path / "c"), log_dir=str(tmp_path / "l"))
+    assert require_one_velocity_convention([150, 160], cfg) == "v_los"
+    assert require_one_velocity_convention([198], cfg) == "Vz"
+    with pytest.raises(ValueError, match=r"\[198\]"):
+        require_one_velocity_convention([150, 198], cfg)

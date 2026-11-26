@@ -227,3 +227,31 @@ def test_run_cube_synthesizes_q_and_u_like_the_single_pixel_path(tmp_path):
     np.testing.assert_allclose(cube[0, 1, 1], single[1], atol=3e-3)
     assert np.corrcoef(cube[0, 1, 1], single[1])[0, 1] > 0.9999
     assert np.abs(cube[0, 1, 2]).max() < 1e-6 and np.abs(cube[0, 1, 1]).max() > 0.01
+
+
+@needs_nicole
+@pytest.mark.data
+def test_transverse_field_floor_grows_with_the_horizontal_field(tmp_path):
+    """Leaving out Bx and By costs no chi^2 without a horizontal field and more for a stronger one.
+
+    The same HSRA atmosphere (B_LOS = 300 G) with a horizontal field of 0, 200 and 800 G is
+    synthesized with and without that field; chi^2_I and chi^2_V between the two (sigma 1e-3)
+    must be 0 for 0 G and grow with the field. This is the floor that the re-synthesis of
+    MUISCA's predictions, which have no transverse field, inherits.
+
+    The three columns are 0, 5 and 10 K warmer than the HSRA (the same in both runs): NICOLE
+    is off by about 3e-3 for a pixel identical to its predecessor, which would give chi^2 of
+    about 1e3 in the run without the field and make the test pass for the wrong reason.
+    """
+    from scripts.synthesis.transverse_field_floor import chi2_between
+    runner = NicoleRunner(_config(tmp_path))
+    T = np.broadcast_to(_hsra_temperature(), (1, 3, LOGTAU.size)).copy()
+    T += np.array([0.0, 5.0, 10.0])[None, :, None]
+    b = np.full_like(T, 300.0)
+    bx = np.zeros_like(T); bx[0, 1] = 200.0; bx[0, 2] = 800.0
+    with_t = runner.run_cube(tmp_path / "w", LOGTAU, T, np.zeros_like(T), b, 112, b_x_G=bx, b_y_G=np.zeros_like(T))[0]
+    without = runner.run_cube(tmp_path / "wo", LOGTAU, T, np.zeros_like(T), b, 112)[0]
+    chi_i = chi2_between(with_t[:, 0], without[:, 0])
+    chi_v = chi2_between(with_t[:, 3], without[:, 3])
+    assert chi_i[0] < 1e-6 and chi_v[0] < 1e-6
+    assert chi_i[2] > chi_i[1] > 0 and chi_v[2] > chi_v[1] > 0

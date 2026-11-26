@@ -870,6 +870,8 @@ class NicoleRunner:
         transverse = {}
         for key, arr in (("b_x_G", b_x_G), ("b_y_G", b_y_G)):
             if arr is not None:
+                if np.shape(arr) != T.shape:
+                    raise ValueError(f"{key} has shape {np.shape(arr)}; it must match T, {T.shape}")
                 af = np.asarray(arr, dtype=np.float64).reshape(npix, nz)
                 transverse[key] = np.concatenate([af[:1], af], axis=0).reshape(1, npix + 1, nz)
 
