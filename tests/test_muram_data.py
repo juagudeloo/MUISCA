@@ -290,11 +290,15 @@ def test_dataset_targets_and_pixels_match_the_normalizer(tmp_path):
 
 # --- Physical consistency of the training data -------------------------------------------
 
+# The generator was fixed in reframe Phase 1a (v_LOS = -Vz, Bx and By passed to NICOLE; a test
+# chunk gives corr = -0.59 and Q, U up to 6e-3). The stored step-110 files still come from the
+# old generator, so these checks wait for the Phase 2 regeneration; remove the markers then.
+REGEN_PENDING = ("Waiting for the Phase 2 regeneration: stokes_110_nicole_tau500.npy still comes from the old "
+                 "generator (granules redshifted, corr +0.52; Q = U = 0). The generator itself is fixed (1a).")
+
 @pytest.mark.skipif(not (MURAM_DIR / "stokes_110_nicole_tau500.npy").exists(), reason="step 110 files absent")
 @pytest.mark.data
-@pytest.mark.xfail(strict=True, reason="Known bug, fixed in reframe Phase 1a: generate_tau500_stokes.py passes "
-                   "MURaM Vz (positive upward) to NICOLE as v_LOS (positive = redshift), so granules come out "
-                   "redshifted. Hinode quiet Sun gives corr = -0.52; step 110 gives +0.52.")
+@pytest.mark.xfail(strict=True, reason=REGEN_PENDING)
 def test_training_granules_are_blueshifted():
     """In the synthesized training profiles, bright granules must be blueshifted, as on the real Sun.
 
@@ -350,7 +354,7 @@ def test_dataset_serves_four_stokes_channels_in_iquv_order(tmp_path):
 
 @pytest.mark.skipif(not (MURAM_DIR / "stokes_110_nicole_tau500.npy").exists(), reason="step 110 files absent")
 @pytest.mark.data
-@pytest.mark.xfail(strict=True, reason=IQUV_TARGET)
+@pytest.mark.xfail(strict=True, reason=REGEN_PENDING)
 def test_training_profiles_carry_linear_polarization():
     """The synthesized training profiles have non-zero Q and U where the field is transverse.
 
@@ -363,10 +367,12 @@ def test_training_profiles_carry_linear_polarization():
     assert qu.max() > 1e-3
 
 
-@pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 1a): load_step also reads the horizontal "
-                   "field, Bx = result_7 and By = result_5 (verified with div B), for Q and U in the synthesis.")
 def test_load_step_reads_the_horizontal_field(tmp_path):
-    """``load_step`` returns Bx (result_7) and By (result_5) in G, with the same layout and sqrt(4 pi) factor as Bz."""
+    """With ``read_horizontal_field``, ``load_step`` returns Bx (result_7) and By (result_5) in G, laid out and scaled like Bz.
+
+    Without the flag they are not read (they cost two extra cubes for callers that do not use
+    them).
+    """
     nx, ny, nz = 2, 3, 4
     x, y, z = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
     code = (100 * x + 10 * y + z + 1).astype(np.float32)
@@ -380,7 +386,8 @@ def test_load_step_reads_the_horizontal_field(tmp_path):
     for name, arr in (("result_0", ones), ("result_2", ones), ("result_6", ones),
                       ("result_7", 2 * code), ("result_5", 3 * code)):
         to_file(arr).tofile(tmp_path / f"{name}.110000")
-    data = _quiet(MhdData(str(tmp_path), nx=nx, ny=ny, nz=nz).load_step, 110)
+    data = _quiet(MhdData(str(tmp_path), nx=nx, ny=ny, nz=nz).load_step, 110, read_horizontal_field=True)
+    assert "Bx" not in _quiet(MhdData(str(tmp_path), nx=nx, ny=ny, nz=nz).load_step, 110)
     np.testing.assert_allclose(data["Bx"].to_value(u.G), 2 * code * np.sqrt(4 * np.pi), rtol=1e-6)
     np.testing.assert_allclose(data["By"].to_value(u.G), 3 * code * np.sqrt(4 * np.pi), rtol=1e-6)
 

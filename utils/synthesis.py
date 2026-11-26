@@ -799,6 +799,8 @@ class NicoleRunner:
         wl_first: Optional[float] = None,
         wl_step_mA: Optional[float] = None,
         v_mic_cms: Optional[float] = None,
+        b_x_G: Optional[np.ndarray] = None,
+        b_y_G: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Synthesize a whole ``(nx, ny)`` atmosphere cube in one NICOLE run.
 
@@ -825,6 +827,9 @@ class NicoleRunner:
             wl_first: First wavelength in A (default: the configuration's).
             wl_step_mA: Step in mA (default: the configuration's).
             v_mic_cms: Microturbulence in cm/s (default: the configuration's).
+            b_x_G: ``(nx, ny, nz)`` transverse field along x in G, or ``None`` (zero).
+            b_y_G: ``(nx, ny, nz)`` transverse field along y in G, or ``None`` (zero).
+                Q and U are zero without a transverse field.
 
         Returns:
             ``(nx, ny, 4, n_wl)`` I, Q, U, V in continuum units.
@@ -862,6 +867,11 @@ class NicoleRunner:
         if gt_pressure is not None:
             Pf = gt_pressure.reshape(npix, nz)
             Pw = np.concatenate([Pf[:1], Pf], axis=0).reshape(1, npix + 1, nz)
+        transverse = {}
+        for key, arr in (("b_x_G", b_x_G), ("b_y_G", b_y_G)):
+            if arr is not None:
+                af = np.asarray(arr, dtype=np.float64).reshape(npix, nz)
+                transverse[key] = np.concatenate([af[:1], af], axis=0).reshape(1, npix + 1, nz)
 
         model_path = workdir / "model.model"
         if gt_pressure is not None:
@@ -869,7 +879,7 @@ class NicoleRunner:
                 model_path,
                 logtau=logtau, T=Tw, v_los_kms=Vw, b_long_G=Bw,
                 v_mic_cms=v_mic_cms, v_mac_cms=self.cfg.v_mac_cms,
-                stray_light=self.cfg.stray_light, gas_p=Pw,
+                stray_light=self.cfg.stray_light, gas_p=Pw, **transverse,
             )
             hydrostatic_eq, input_density = "N", "PGas"
         else:
@@ -877,7 +887,7 @@ class NicoleRunner:
                 model_path,
                 logtau=logtau, T=Tw, v_los_kms=Vw, b_long_G=Bw,
                 v_mic_cms=v_mic_cms, v_mac_cms=self.cfg.v_mac_cms,
-                stray_light=self.cfg.stray_light, el_p_seed=self.cfg.el_p_seed,
+                stray_light=self.cfg.stray_light, el_p_seed=self.cfg.el_p_seed, **transverse,
             )
             hydrostatic_eq, input_density = "Y", "Pel"
 

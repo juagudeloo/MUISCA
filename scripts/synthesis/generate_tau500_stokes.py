@@ -55,11 +55,10 @@ def main():
     """Synthesize one row chunk of a MURaM step with NICOLE on the tau_500 grid and save it.
 
     Note:
-        MURaM's Vz (positive upward) is passed to NICOLE as v_LOS (positive = redshift)
-        unchanged, so granules come out redshifted, and Bx and By are not passed, so Q and U
-        are zero. Both are fixed in reframe Phase 1a (strict xfails
-        ``test_training_granules_are_blueshifted`` and
-        ``test_training_profiles_carry_linear_polarization``).
+        NICOLE receives v_LOS = -Vz (MURaM's Vz is positive upward, NICOLE's v_LOS positive
+        for a redshift) and the horizontal field Bx, By, so the profiles have blueshifted
+        granules and non-zero Q and U. The atmosphere file keeps ``Vz`` (positive upward)
+        and adds ``v_los`` (= -Vz, the training target), ``Bx`` and ``By``, all in km/s or G.
 
     Examples:
         One chunk of rows 0 to 40 of step 140::
@@ -90,7 +89,7 @@ def main():
 
     print(f"[step {args.step}] rows [{r0},{r1}) of {nx}")
     mhd = MhdData(data_path=data_path / "muram-simulation", nx=nx, ny=ny, nz=train_cfg.nz)
-    mhd.load_step(step=args.step, z_max=train_cfg.z_max)
+    mhd.load_step(step=args.step, z_max=train_cfg.z_max, read_horizontal_field=True)
 
     print("Computing log(tau_500)...")
     logtau500 = compute_logtau500(mhd, dz_km=train_cfg.dz_km)  # (nx, ny, nz_geom)
@@ -100,6 +99,8 @@ def main():
     T_full = mhd.data["T"].value
     Vz_full = mhd.data["Vz"].to(u.km / u.s).value
     Bz_full = mhd.data["Bz"].to(u.G).value
+    Bx_full = mhd.data["Bx"].to(u.G).value
+    By_full = mhd.data["By"].to(u.G).value
     nz_geom = T_full.shape[2]
     z_km_1d = np.arange(nz_geom, dtype=np.float64) * train_cfg.dz_km  # geometric height per z-index
 
@@ -107,6 +108,8 @@ def main():
     T_c = np.empty((nrows, ny, nz), dtype=np.float64)
     Vz_c = np.empty((nrows, ny, nz), dtype=np.float64)
     Bz_c = np.empty((nrows, ny, nz), dtype=np.float64)
+    Bx_c = np.empty((nrows, ny, nz), dtype=np.float64)
+    By_c = np.empty((nrows, ny, nz), dtype=np.float64)
     Z_c = np.empty((nrows, ny, nz), dtype=np.float64)
 
     print(f"Remapping {nrows * ny} pixels onto the tau_500 grid...")
@@ -116,6 +119,8 @@ def main():
             T_c[i, iy] = interp1d(lt, T_full[ix, iy], bounds_error=False, fill_value="extrapolate")(G)
             Vz_c[i, iy] = interp1d(lt, Vz_full[ix, iy], bounds_error=False, fill_value="extrapolate")(G)
             Bz_c[i, iy] = interp1d(lt, Bz_full[ix, iy], bounds_error=False, fill_value="extrapolate")(G)
+            Bx_c[i, iy] = interp1d(lt, Bx_full[ix, iy], bounds_error=False, fill_value="extrapolate")(G)
+            By_c[i, iy] = interp1d(lt, By_full[ix, iy], bounds_error=False, fill_value="extrapolate")(G)
             Z_c[i, iy] = interp1d(lt, z_km_1d, bounds_error=False, fill_value="extrapolate")(G)
 
     cfg = SynthesisConfig(
@@ -128,8 +133,14 @@ def main():
 
     workdir = args.output_dir / f"_cube_wd_{args.step}_{r0:04d}_{r1:04d}"
     print(f"Synthesizing chunk with NICOLE (one cube invocation)...")
-    iquv = runner.run_cube(workdir, G, T_c, Vz_c, Bz_c, N_WL,
-                           wl_first=WL_FIRST, wl_step_mA=WL_STEP_MA)  # (nrows, ny, 4, N_WL)
+    # MURaM's Vz is positive upward; NICOLE's v_LOS is positive for a redshift (away from
+    # the observer), so the line-of-sight velocity at disk centre is -Vz. Passing Vz itself
+    # made granules redshifted in the training profiles (corr(Ic, core velocity) = +0.52
+    # against -0.52 on Hinode). Bz (positive up, toward the observer) is B_LOS as is.
+    v_los_c = -Vz_c
+    iquv = runner.run_cube(workdir, G, T_c, v_los_c, Bz_c, N_WL,
+                           wl_first=WL_FIRST, wl_step_mA=WL_STEP_MA,
+                           b_x_G=Bx_c, b_y_G=By_c)  # (nrows, ny, 4, N_WL)
     if not args.keep_workdir:
         _rmtree_retry(workdir)
 
@@ -143,7 +154,7 @@ def main():
     np.save(stokes_path, stokes_chunk)
     np.savez(
         atmos_path,
-        logtau=G, T=T_c, Vz=Vz_c, Bz=Bz_c, z_km=Z_c,
+        logtau=G, T=T_c, Vz=Vz_c, v_los=v_los_c, Bz=Bz_c, Bx=Bx_c, By=By_c, z_km=Z_c,
         row_start=r0, row_end=r1, step=args.step,
     )
 

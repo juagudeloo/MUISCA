@@ -85,18 +85,23 @@ def display_name(model_type: str) -> str:
 
 
 # LaTeX-formatted symbol for each internal MHD parameter key, for plot titles only. MURaM is
-# synthesised at disc centre, where the vertical components ARE the line-of-sight ones, so its
-# figures keep $V_z$/$B_z$; MODEST figures compare against SPINOR's line-of-sight quantities and
-# must say so, which is what `los=True` selects.
-PARAM_LATEX = {"T": r"$T$", "Vz": r"$V_z$", "Bz": r"$B_z$"}
+# synthesised at disc centre, where the vertical components are the line-of-sight ones. The
+# field keeps $B_z$ (positive up, i.e. toward the observer, the B_LOS sign). The velocity under
+# the "Vz" key is the training target, v_LOS = -Vz (positive = redshift, away from the
+# observer), so it is labelled v_LOS: labelling it V_z would show granules (upflows) as negative
+# under an upward-positive symbol. MODEST figures compare against SPINOR's line-of-sight
+# quantities and say so for both, which is what `los=True` selects.
+PARAM_LATEX = {"T": r"$T$", "Vz": r"$v_{\mathrm{LOS}}$", "Bz": r"$B_z$"}
 PARAM_LATEX_LOS = {"T": r"$T$", "Vz": r"$v_{\mathrm{LOS}}$", "Bz": r"$B_{\mathrm{LOS}}$"}
 
 
 def param_latex(param: str, los: bool = False) -> str:
-    r"""LaTeX symbol of a quantity: ``$V_z$``, or ``$v_{\mathrm{LOS}}$`` with ``los=True``.
+    r"""LaTeX symbol of a quantity: ``$B_z$``, or ``$B_{\mathrm{LOS}}$`` with ``los=True``.
 
-    MURaM figures use the vertical components (at disk centre they are the line-of-sight
-    ones); MODEST figures compare with SPINOR's line-of-sight quantities and use ``los=True``.
+    MURaM figures use ``$B_z$`` for the field (at disk centre it is B_LOS, same sign) and
+    ``$v_{\mathrm{LOS}}$`` for the velocity, which is the target v_LOS = -Vz (positive =
+    redshift). MODEST figures compare with SPINOR's line-of-sight quantities and use
+    ``los=True``.
 
     Args:
         param: ``"T"``, ``"Vz"`` or ``"Bz"``.

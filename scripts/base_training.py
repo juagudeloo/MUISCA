@@ -625,15 +625,52 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_cache_config_signature(config: TrainingConfig) -> dict:
+def source_data_fingerprint(step: int, config: TrainingConfig) -> dict:
+    """Size (bytes) and modification time (ns) of the source files of one step.
+
+    A regenerated step keeps its file names, so the cache signatures include this
+    fingerprint: without it, caches built from the old files would keep being served.
+
+    Args:
+        step: Simulation step.
+        config: The training configuration (data source and data path).
+
+    Returns:
+        ``{file_name: [size, mtime_ns]}`` for the files that exist (missing files are
+        left out, so a step without data has an empty fingerprint).
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> source_data_fingerprint(999, TrainingConfig(checkpoint_dir=tmp, log_dir=tmp))
+        {}
+    """
+    sim_dir = Path(config.data_path) / "muram-simulation"
+    if config.data_source == "nicole_tau500":
+        names = [f"stokes_{step}_nicole_tau500.npy", f"atmos_{step}_tau500.npz"]
+    else:
+        names = [f"stokes_{int(step):03d}000.npy"]
+    out = {}
+    for name in names:
+        path = sim_dir / name
+        if path.exists():
+            st = path.stat()
+            out[name] = [int(st.st_size), int(st.st_mtime_ns)]
+    return out
+
+
+def build_cache_config_signature(config: TrainingConfig, step: int | None = None) -> dict:
     """Settings that determine the per-step cache's content (hashed to validate a cached step).
 
     Args:
         config: The training configuration.
+        step: If given, the fingerprint of that step's source files is included, so a
+            regenerated step invalidates its cache entry.
 
     Returns:
         JSON-serializable dict: data source, grid sizes, wavelength settings, log tau grid,
-        continuum normalization and the black-body settings.
+        continuum normalization, the black-body settings and, with ``step``, the source
+        files' fingerprint.
 
     Note:
         ``lande_factor`` and ``lsf_path`` change the cached content but are missing (strict
@@ -662,6 +699,7 @@ def build_cache_config_signature(config: TrainingConfig) -> dict:
         'stokes_fixed_ic': None if config.stokes_fixed_ic is None else float(config.stokes_fixed_ic),
         'stokes_mult_factor': float(config.stokes_mult_factor),
         **_temperature_approx_signature(config),
+        **({} if step is None else {'source_fingerprint': source_data_fingerprint(step, config)}),
     }
 
 
@@ -725,6 +763,8 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
         "stokes_fixed_ic": None if config.stokes_fixed_ic is None else float(config.stokes_fixed_ic),
         "stokes_mult_factor": float(config.stokes_mult_factor),
         **{k: list(v) if isinstance(v, tuple) else v for k, v in _temperature_approx_signature(config).items()},
+        # Regenerated steps keep their file names; their fingerprints invalidate the cache.
+        "source_fingerprints": {str(s): source_data_fingerprint(s, config) for s in sorted(train_steps)},
     }
 
 
@@ -1113,7 +1153,9 @@ def load_source_arrays(
 
     * ``nicole_tau500``: ``stokes_<step>_nicole_tau500.npy`` (already normalized to the HSRA
       continuum) and ``atmos_<step>_tau500.npz``; the file's log tau grid must equal the
-      configuration's.
+      configuration's. The velocity returned under ``"Vz"`` is the file's ``v_los``
+      (positive = redshift, the sign the profiles were synthesized with) when present, and
+      its ``Vz`` for files written before that key existed.
     * ``muram_legacy``: the raw MURaM cube remapped to Rosseland tau and the old
       ``stokes_<step>.npy`` cube with its continuum normalization.
 
@@ -1202,9 +1244,21 @@ def load_source_arrays(
                 "to use this data source."
             )
 
+        if "v_los" not in atmos.files:
+            warnings.warn(
+                f"Step {step}: {atmos_path.name} comes from the old generator (no v_los, Bx, By): "
+                "its profiles have redshifted granules and Q = U = 0. Do not mix it with "
+                "regenerated steps in one experiment.",
+                stacklevel=2,
+            )
         mhd_data = {
             "T": np.asarray(atmos["T"], dtype=np.float64) * u.K,
-            "Vz": np.asarray(atmos["Vz"], dtype=np.float64) * u.km / u.s,
+            # The velocity target must use the sign NICOLE synthesized the profiles with.
+            # New files carry "v_los" (= -Vz, positive = redshift, as NICOLE and SPINOR);
+            # older files were synthesized with Vz itself, so their "Vz" is the consistent
+            # target for them. The key stays "Vz" for the normalizer, model and analysis.
+            "Vz": np.asarray(atmos["v_los"] if "v_los" in atmos.files else atmos["Vz"],
+                             dtype=np.float64) * u.km / u.s,
             "Bz": np.asarray(atmos["Bz"], dtype=np.float64) * u.G,
         }
 
@@ -1280,7 +1334,7 @@ def load_and_prepare_step(
         >>> ds, approx = load_and_prepare_step(110, cfg, mhd_norm, stokes_norm, cache=cache)  # doctest: +SKIP
     """
     # Compute configuration hash for cache validation
-    config_for_hash = build_cache_config_signature(config)
+    config_for_hash = build_cache_config_signature(config, step=step)
     config_hash = MuramDataCache.make_config_hash(config_for_hash) if cache else None
     new_logtau = config.get_logtau_values()
 

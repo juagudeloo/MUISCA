@@ -210,8 +210,7 @@ def test_training_histograms_use_the_exact_inverse_of_the_normalization(tmp_path
     Unlike ``MhdNormalizer.denormalize`` (strict xfail for Vz), it does not add the mean
     back for the "centered" Vz, which is the exact inverse of the transform.
     """
-    sys.path.insert(0, str(ROOT / "scripts" / "experiments"))
-    from ablation_study import _denormalize_targets_from_stats
+    from scripts.experiments.ablation_study import _denormalize_targets_from_stats
     rng = np.random.default_rng(1)
     atm = {"T": 5000 + 300 * rng.standard_normal((6, 6, 3)), "Vz": 0.5 + rng.standard_normal((6, 6, 3)),
            "Bz": 100 * rng.standard_normal((6, 6, 3))}
@@ -297,8 +296,7 @@ def test_muram_test_metrics_compare_with_the_ground_truth(tmp_path, monkeypatch)
     must be 1 and the RRMSE 0 at every node; a function scoring against the
     approximations would fail.
     """
-    sys.path.insert(0, str(ROOT / "scripts" / "experiments"))
-    import ablation_study
+    import scripts.experiments.ablation_study as ablation_study
     norm, ds, _ = _tiny_step(tmp_path, n=60)
     approx = {"blos": np.zeros((8, 8)), "vlos": np.zeros((8, 8)), "temp": np.full((8, 8), 6000.0)}
     monkeypatch.setattr(ablation_study, "load_and_prepare_step", lambda **kw: (ds, approx))

@@ -14,9 +14,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts" / "analysis"))
-
-import make_paper_tables as tables  # noqa: E402
+import scripts.analysis.make_paper_tables as tables  # noqa: E402
 
 
 # --- Paper tables ------------------------------------------------------------------------
@@ -112,8 +110,7 @@ def test_finetuning_refuses_a_base_run_without_a_balancing_node(tmp_path):
     The base run's settings are replayed from its experiment_config.json, which must sit
     next to the checkpoint.
     """
-    sys.path.insert(0, str(ROOT / "scripts"))
-    import finetune
+    import scripts.finetune as finetune
     from models.pinn_mscnn_model import PhysicsInformedMSCNN
     run = tmp_path / "exp" / "wfa_only"
     run.mkdir(parents=True)
@@ -127,3 +124,36 @@ def test_finetuning_refuses_a_base_run_without_a_balancing_node(tmp_path):
         {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": 44}}))
     cfg, _ = finetune.load_and_adapt_config(run / "final_model.pth", finetune_epochs_override=3)
     assert (cfg.lambda_wfa, cfg.apply_bz_bin_balance, cfg.bz_balance_scope, cfg.n_epochs) == (10.0, True, "global", 3)
+
+
+# --- Generation safeguards ---------------------------------------------------------------
+
+def test_merge_refuses_chunks_with_unphysical_continua(tmp_path, monkeypatch):
+    """The merge step refuses to write a step if any pixel's continuum is outside 0.3 to 2 (HSRA units).
+
+    NICOLE can return garbage without any error (negative continua appeared when the local
+    field slots were filled), and the merge used to reject only NaN. Two chunks tile a
+    4-row frame; one pixel has a continuum of -12, so the merge must exit without writing.
+    """
+    import dataclasses
+    import scripts.synthesis.merge_tau500_stokes as merge
+    from scripts.base_training import TrainingConfig
+    nx, ny, nwl, nz = 4, 3, 5, 2
+    monkeypatch.setattr(merge, "TrainingConfig",
+                        lambda: dataclasses.replace(TrainingConfig(checkpoint_dir=str(tmp_path / "c"),
+                                                                   log_dir=str(tmp_path / "l")), nx=nx, ny=ny))
+    chunks = tmp_path / "chunks"
+    chunks.mkdir()
+    for r0, r1 in ((0, 2), (2, 4)):
+        st = np.ones((r1 - r0, ny, nwl, 4))
+        if r0 == 2:
+            st[0, 1, :, 0] = -12.0
+        np.save(chunks / f"chunk_150_{r0:04d}_{r1:04d}_stokes.npy", st)
+        arr = np.zeros((r1 - r0, ny, nz))
+        np.savez(chunks / f"chunk_150_{r0:04d}_{r1:04d}_atmos.npz", logtau=np.array([-1.0, 0.0]),
+                 T=arr + 5000, Vz=arr, v_los=arr, Bz=arr, Bx=arr, By=arr, z_km=arr)
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["merge", "--step", "150", "--chunk-dir", str(chunks), "--output-dir", str(out)])
+    with pytest.raises(SystemExit, match="continuum outside"):
+        merge.main()
+    assert not (out / "stokes_150_nicole_tau500.npy").exists()

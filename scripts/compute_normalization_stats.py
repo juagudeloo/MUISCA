@@ -321,7 +321,7 @@ def compute_normalization_stats(
     config_hash = None
     if use_cache:
         cache = MuramDataCache(cache_dir=cache_dir, compression='gzip')
-        config_hash = MuramDataCache.make_config_hash(build_cache_config_signature(shared_cfg))
+        config_hash = "per-step"  # computed per step below, with the step's source fingerprint
         # strict logtau compatibility check up-front
         cache.exists(step=min_step, config_hash=None, logtau_values=new_logtau)  # validation side-effect only
 
@@ -332,6 +332,10 @@ def compute_normalization_stats(
     # Process each simulation step
     for step in tqdm(available_steps, desc="Processing steps"):
         try:
+            if cache is not None:
+                # Same per-step hash as training, so the two share cache entries and a
+                # regenerated step invalidates them.
+                config_hash = MuramDataCache.make_config_hash(build_cache_config_signature(shared_cfg, step=step))
             if cache is not None and config_hash is not None and cache.exists(step, config_hash, logtau_values=new_logtau):
                 stokes_data_cached, mhd_data_cached, _ = cache.load_raw(step=step, verbose=False)
                 stokes_data = {'I': stokes_data_cached['I'], 'V': stokes_data_cached['V']}

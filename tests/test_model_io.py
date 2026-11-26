@@ -117,8 +117,6 @@ def test_check_prof_on_binary_profiles(tmp_path):
 
 # --- Target for reframe Phase 1a: transverse field in the training synthesis -------------
 
-@pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 1a): write_binary_model_cube takes "
-                   "b_x_G and b_y_G so NICOLE can synthesize Q and U. Today the transverse slots are zero.")
 def test_binary_model_cube_writes_the_transverse_field(tmp_path):
     """Bx and By (G) written to the binary cube read back in NICOLE's transverse-field slots 9 and 10.
 
@@ -136,3 +134,21 @@ def test_binary_model_cube_writes_the_transverse_field(tmp_path):
     d = read_model(str(path), "nicole2.3", 2, 2, NZ, 1, 0)
     np.testing.assert_allclose(_var(d, 9), bx[1, 0, order])
     np.testing.assert_allclose(_var(d, 10), by[1, 0, order])
+
+
+def test_binary_model_cube_leaves_the_local_field_slots_zero(tmp_path):
+    """The local-frame field slots (11 to 13) stay zero; only the line-of-sight slots carry the field.
+
+    Regression for 2026-11-24: filling them (local b_z = B_long) made NICOLE return garbage,
+    negative continua down to -270, for about half of the MURaM pixels, with no error.
+    """
+    rng = np.random.default_rng(4)
+    shape = (1, 3, NZ)
+    T, v = 5000 + 100 * rng.random(shape), rng.standard_normal(shape)
+    b, bx, by = 300 * rng.standard_normal(shape), 300 * rng.standard_normal(shape), 300 * rng.standard_normal(shape)
+    path = tmp_path / "cube.model"
+    write_binary_model_cube(path, LOGTAU, T, v, b, b_x_G=bx, b_y_G=by)
+    for iy in range(3):
+        d = read_model(str(path), "nicole2.3", 1, 3, NZ, 0, iy)
+        for slot in (11, 12, 13):
+            assert np.all(_var(d, slot) == 0.0), slot

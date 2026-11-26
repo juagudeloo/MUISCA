@@ -1018,6 +1018,8 @@ def write_binary_model_cube(
     el_p=None,
     el_p_seed=1.0,
     gas_p=None,
+    b_x_G=None,
+    b_y_G=None,
 ):
     """Write a whole ``(nx, ny)`` field of atmospheres as one NICOLE binary cube (``nicole2.3bm``).
 
@@ -1040,15 +1042,19 @@ def write_binary_model_cube(
         gas_p: Optional gas pressure in dyn cm^-2, ``(nx, ny, nz)``. Pair it with
             "Input density = Pgas" and "Impose hydrostatic equilibrium = N" so NICOLE uses
             it as given.
+        b_x_G: Transverse field along x in G, ``(nx, ny, nz)``, or None for zero.
+        b_y_G: Transverse field along y in G, ``(nx, ny, nz)``, or None for zero. Without
+            a transverse field NICOLE gives Q = U = 0.
 
     Raises:
         ValueError: If the shapes are inconsistent.
 
     Note:
-        Today only B_long is written; the transverse slots are zero, so NICOLE gives
-        Q = U = 0. The slot naming in the comment below (``b_los_x``, ``b_los_y``, ``b_x``,
-        ``b_y``, ``b_z``) differs from ``read_model``'s (``b_x``, ``b_y``, ``bl_x``,
-        ``bl_y``, ``bl_z``). At disk centre the two frames coincide.
+        The transverse field is written to the line-of-sight slots only (9 and 10,
+        ``b_x``, ``b_y`` in ``read_model``); the local-frame slots (11 to 13) stay zero.
+        Filling them (``bl_z = b_long``) made NICOLE return garbage for about half of the
+        MURaM pixels. NICOLE's convention: the Q line core goes as -cos 2 chi and U as
+        -sin 2 chi, with chi the azimuth from +x (``tests/test_synthesis.py``).
 
     Examples:
         >>> import tempfile, numpy as np
@@ -1073,7 +1079,8 @@ def write_binary_model_cube(
     #     var order: z, tau, T, gas_p, rho, el_p, v_los, v_mic, b_los_z,
     #                b_los_x, b_los_y, b_x, b_y, b_z, v_x, v_y, v_z
     #     scalars:   v_mac, stray_frac, expansion
-    #   Only tau, T, el_p, v_los(cm/s), v_mic(cm/s), b_los_z(=B_long) are set;
+    #   Set: tau, T, el_p, v_los(cm/s), v_mic(cm/s), b_los_z(=B_long) and b_los_x/y
+    #   (transverse field); the local-frame b_x/b_y/b_z stay 0;
     #   everything else is 0 (matching write_ascii_model's single-pixel output,
     #   NICOLE recomputes gas_p/rho/densities under hydrostatic equilibrium).
     #   If gas_p (nx,ny,nz, dyn/cm^2) is supplied, it is written to the gas_p
@@ -1103,6 +1110,12 @@ def write_binary_model_cube(
             f"logtau (got {T.shape}, {v_los_kms.shape}, {b_long_G.shape})"
         )
     nx, ny = T.shape[:2]
+    b_x_arr = np.zeros_like(T) if b_x_G is None else np.asarray(b_x_G, dtype=np.float64)
+    b_y_arr = np.zeros_like(T) if b_y_G is None else np.asarray(b_y_G, dtype=np.float64)
+    if b_x_arr.shape != T.shape or b_y_arr.shape != T.shape:
+        raise ValueError(
+            f"b_x_G and b_y_G must be (nx, ny, {nz}) like T (got {b_x_arr.shape}, {b_y_arr.shape})"
+        )
 
     if el_p is None:
         el_p_arr = np.full((nx, ny, nz), float(el_p_seed), dtype=np.float64)
@@ -1149,8 +1162,12 @@ def write_binary_model_cube(
                     v_los_kms[ix, iy, order] * 1.0e5,     # v_los (km/s -> cm/s)
                     v_mic_arr[ix, iy, order],             # v_mic
                     b_long_G[ix, iy, order],              # b_los_z (= B_long)
-                    zero_col, zero_col,                   # b_los_x, b_los_y
-                    zero_col, zero_col, zero_col,         # b_x, b_y, b_z
+                    b_x_arr[ix, iy, order],               # b_los_x
+                    b_y_arr[ix, iy, order],               # b_los_y
+                    # The local-frame slots must stay zero: filling b_z (local) with B_long
+                    # made NICOLE return garbage (negative continua) for about half of the
+                    # MURaM pixels. NICOLE synthesizes from the line-of-sight slots.
+                    zero_col, zero_col, zero_col,         # b_x, b_y, b_z (local)
                     zero_col, zero_col, zero_col,         # v_x, v_y, v_z
                 ]
                 rec = np.concatenate(cols)

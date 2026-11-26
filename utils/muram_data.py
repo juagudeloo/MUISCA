@@ -112,7 +112,8 @@ class MhdData:
             return quantity.to(target_unit).value
         return quantity
         
-    def load_step(self, step: Union[int, str], z_max: Optional[int] = None) -> Dict[str, np.ndarray]:
+    def load_step(self, step: Union[int, str], z_max: Optional[int] = None,
+                  read_horizontal_field: bool = False) -> Dict[str, np.ndarray]:
         """Read one snapshot (T, P, rho, Vz, Bz) from the raw MURaM binaries.
 
         Reads ``eos`` (T, P), ``result_0`` (rho), ``result_2`` (rho times the vertical
@@ -122,24 +123,27 @@ class MhdData:
         (code units to G). Also sets ``z0`` and ``height_levels``.
 
         Note:
-            Vz is positive upward. NICOLE's v_LOS is positive for a redshift, so the
-            velocity handed to NICOLE must be ``-Vz``. The current synthesis passes Vz
-            unchanged, which makes granules redshifted in the training profiles; this is
-            fixed in the reframe plan, Phase 1a. The horizontal field (``result_7`` for Bx,
-            ``result_5`` for By, verified with div B) is not read yet.
+            Vz and Bz are positive upward (toward the observer at disk centre). NICOLE's
+            v_LOS is positive for a redshift, so the synthesis hands it ``-Vz``. The
+            horizontal field is read from ``result_7`` (Bx) and ``result_5`` (By), verified
+            with div B, when ``read_horizontal_field`` is set.
 
         Args:
             step: Snapshot number. ``110``, ``"110"`` and ``"110000"`` all select the files
                 ending in ``.110000``.
             z_max: Keep only layers ``0 .. z_max - 1`` (drops the top of the box). ``None``
                 keeps all ``nz`` layers.
+            read_horizontal_field: Also read Bx (``result_7``) and By (``result_5``), needed
+                to synthesize Q and U.
 
         Returns:
             ``self.data``, a dict of ``(nx, ny, nz)`` Quantities: ``T`` (K), ``P``
-            (dyn cm^-2), ``rho`` (g cm^-3), ``Vz`` (km/s) and ``Bz`` (G).
+            (dyn cm^-2), ``rho`` (g cm^-3), ``Vz`` (km/s) and ``Bz`` (G), plus ``Bx`` and
+            ``By`` (G) with ``read_horizontal_field``.
 
         Raises:
-            FileNotFoundError: If one of the four required files is missing.
+            FileNotFoundError: If one of the four required files is missing, or, with
+                ``read_horizontal_field``, one of ``result_5`` and ``result_7``.
             ValueError: If ``z_max`` is not in ``1 .. nz``.
 
         Examples:
@@ -189,11 +193,26 @@ class MhdData:
         rho = _read3("result_0")
         rho_Vz = _read3("result_2")
         Bz = _read3("result_6")
+        # Horizontal field: result_7 is along x and result_5 along y (checked with div B,
+        # 0.002 against 0.055 for the swapped pair). Only read when asked for (the Stokes
+        # synthesis needs it for Q and U; other callers would just pay two extra cubes).
+        Bx = By = None
+        if read_horizontal_field:
+            have = [_path(n).exists() for n in ("result_7", "result_5")]
+            if not all(have):
+                raise FileNotFoundError(
+                    f"Step {suffix}: the horizontal field needs both result_7 (Bx) and "
+                    f"result_5 (By); found result_7={have[0]}, result_5={have[1]}"
+                )
+            Bx = _read3("result_7")
+            By = _read3("result_5")
         
         # Derived fields
         Vz = rho_Vz / rho / 1e5  # convert to km/s
         coef = np.sqrt(4.0 * 3.14159265)
         Bz = Bz * coef
+        Bx = None if Bx is None else Bx * coef
+        By = None if By is None else By * coef
         
         # Optionally trim top z layers
         # Keep self.nz unchanged for file I/O. Track trimmed size in self.z_max.
@@ -205,6 +224,8 @@ class MhdData:
             rho = rho[:, :, :z_max]
             Vz = Vz[:, :, :z_max]
             Bz = Bz[:, :, :z_max]
+            Bx = None if Bx is None else Bx[:, :, :z_max]
+            By = None if By is None else By[:, :, :z_max]
             self.z_max = z_max
             print(f"  Trimmed z axis to first {z_max} layers (0..{z_max-1})")
         else:
@@ -217,6 +238,9 @@ class MhdData:
             "Vz": Vz*u.km/u.s,
             "Bz": Bz*u.G,
         }
+        if read_horizontal_field:
+            self.data["Bx"] = Bx * u.G
+            self.data["By"] = By * u.G
         
         # Compute reference layer (z0) and height levels
         self._compute_reference_layer()

@@ -179,7 +179,7 @@ def run_one_step(step: int, train_cfg: TrainingConfig, data_path: Path) -> dict:
         workdir = runner.prepare_workdir(
             ix=ix, iy=iy,
             logtau=NEW_LOGTAU_GRID,
-            T=r["T"], v_los_kms=r["Vz"], b_long_G=r["Bz"],
+            T=r["T"], v_los_kms=-r["Vz"], b_long_G=r["Bz"],  # Vz is positive upward; v_LOS positive = redshift
         )
         iquv = runner.run_pixel(workdir)
         synth_out[(ix, iy)] = iquv

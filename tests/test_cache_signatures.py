@@ -124,3 +124,22 @@ def test_balanced_signature_changes_with_the_training_steps():
     base = build_balanced_cache_signature(TrainingConfig(), STEPS)
     other = build_balanced_cache_signature(TrainingConfig(), STEPS[:-1])
     assert BalancedTrainDataCache.make_signature_hash(base) != BalancedTrainDataCache.make_signature_hash(other)
+
+
+def test_regenerated_source_files_change_both_signatures(tmp_path):
+    """Rewriting a step's source files (same names, new content) changes both cache hashes.
+
+    Regenerated steps keep their file names, so without the source fingerprint the caches
+    would keep serving the old profiles and targets (e.g. the old velocity sign) after a
+    regeneration.
+    """
+    sim = tmp_path / "muram-simulation"
+    sim.mkdir()
+    for name in ("stokes_110_nicole_tau500.npy", "atmos_110_tau500.npz"):
+        (sim / name).write_bytes(b"old")
+    cfg = _variant(data_path=str(tmp_path))
+    raw0 = MuramDataCache.make_config_hash(build_cache_config_signature(cfg, step=110))
+    bal0 = BalancedTrainDataCache.make_signature_hash(build_balanced_cache_signature(cfg, [110]))
+    (sim / "atmos_110_tau500.npz").write_bytes(b"regenerated, longer")
+    assert MuramDataCache.make_config_hash(build_cache_config_signature(cfg, step=110)) != raw0
+    assert BalancedTrainDataCache.make_signature_hash(build_balanced_cache_signature(cfg, [110])) != bal0
