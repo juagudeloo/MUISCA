@@ -104,8 +104,8 @@ class MhdNormalizer:
         # Percentile-based transform scales and tail-loss parameters
         self.B0_transform_per_tau = None  # shape (n_tau,), transform scale per-τ
         self.B0_weight_start = None  # scalar, P90 for tail-weighting start
-        # Which velocity the "Vz" statistics describe: "v_los" (= -Vz, regenerated steps),
-        # "Vz" (old generator) or None (statistics written before this was recorded).
+        # Which velocity the "Vz" statistics describe: "v_los" (= -Vz, nicole_tau500 steps)
+        # or None (muram_legacy, or statistics written before this was recorded).
         self.velocity_target = None
         self.B1_weight_saturation = None  # scalar, P99.5 for tail-weighting saturation
         self.huber_delta = None  # scalar, Huber threshold = 0.25 * B0_weight_start
@@ -576,9 +576,9 @@ class MhdNormalizer:
             filepath: Output JSON path. Parent folders are created.
             logtau_values: Optional log(tau) value of every node, stored rounded to 6
                 decimals so loaders can check that the grid matches.
-            velocity_target: The velocity the ``Vz`` statistics describe (``"v_los"`` or
-                ``"Vz"``, from ``require_one_velocity_convention``), stored so training can
-                refuse statistics of the other convention.
+            velocity_target: The velocity the ``Vz`` statistics describe (``"v_los"`` for
+                ``nicole_tau500``), stored so training can refuse statistics of another
+                convention.
 
         Examples:
             >>> norm.save("data/normalization_stats/nicole_tau500/mhd_normalization.json",

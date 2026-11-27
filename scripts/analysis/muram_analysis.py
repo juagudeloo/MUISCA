@@ -86,8 +86,8 @@ def main(args):
         # Rebuild the training configuration for this model so data loading matches training.
         cfg = pipeline.build_runtime_training_config(model_configs[name])
         # The one set of statistics loaded above must match how this model's inputs are
-        # degraded and the step's velocity convention.
-        check_normalization_matches_run(mhd_normalizer, stokes_normalizer, cfg, [args.step_to_plot])
+        # degraded and describe the v_los target.
+        check_normalization_matches_run(mhd_normalizer, stokes_normalizer, cfg)
         model_type = model_configs[name]["experiment_key"]
         print(f"Generating diagnostics for: {model_configs[name]['label']}")
 

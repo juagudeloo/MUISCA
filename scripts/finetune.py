@@ -393,8 +393,7 @@ def run_fine_tune_single_variation(
     mhd_normalizer.load(filepath=mhd_norm_path)
     stokes_normalizer = StokesNormalizer()
     stokes_normalizer.load(filepath=stokes_norm_path)
-    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
-                                    range(config.min_step, config.max_step + 1, config.step_size))
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config)
     print(f"✓ Normalizers loaded from {mhd_norm_path.parent}")
 
     # The normalizer and the checkpoint must agree on the optical-depth grid, or every

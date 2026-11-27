@@ -45,7 +45,7 @@
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-STEPS=(110 120 130 198) # MURaM steps: 131-133 contiguous for train/val, 198 for the OOD test split
+STEPS=(110 120 130 140 150 198) # train 110-140, val 150, test 198
 N_CHUNKS=40              # row-chunks per step (480 rows / N_CHUNKS rows each)
 NX_ROWS=480             # MURaM frame rows (nx)
 

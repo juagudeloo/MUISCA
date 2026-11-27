@@ -322,25 +322,21 @@ def test_ablation_can_train_with_a_chosen_set_of_stokes_channels():
     assert "--stokes_channels" in out.stdout or "--stokes-channels" in out.stdout
 
 
-def test_an_experiment_refuses_steps_with_different_velocity_conventions(tmp_path):
-    """Steps with ``v_los`` (= -Vz, regenerated) and steps with only Vz (old generator) cannot be mixed.
+def test_loading_refuses_an_old_generator_step(tmp_path):
+    """A ``nicole_tau500`` step without ``v_los`` (old generator, target +Vz) is refused.
 
-    An old step's velocity target is +Vz and a regenerated step's is -Vz, so one forgotten
-    step in Phase 2 (e.g. test step 198) would flip the sign of the velocity in part of an
-    experiment with nothing but a warning. Only the npz key list is read; steps without
-    files are ignored.
+    Its profiles have redshifted granules and Q = U = 0; using its +Vz as the target next to
+    regenerated -Vz steps would flip the velocity sign in part of an experiment.
     """
-    from scripts.base_training import TrainingConfig, require_one_velocity_convention
+    from scripts.base_training import TrainingConfig, load_source_arrays
     sim = tmp_path / "muram-simulation"
     sim.mkdir()
-    z = np.zeros((1, 1, 2))
-    np.savez(sim / "atmos_150_tau500.npz", T=z, Vz=z, v_los=z, Bz=z)
-    np.savez(sim / "atmos_198_tau500.npz", T=z, Vz=z, Bz=z)
     cfg = TrainingConfig(data_path=str(tmp_path), checkpoint_dir=str(tmp_path / "c"), log_dir=str(tmp_path / "l"))
-    assert require_one_velocity_convention([150, 160], cfg) == "v_los"
-    assert require_one_velocity_convention([198], cfg) == "Vz"
-    with pytest.raises(ValueError, match=r"\[198\]"):
-        require_one_velocity_convention([150, 198], cfg)
+    z = np.zeros((1, 1, 45))
+    np.savez(sim / "atmos_198_tau500.npz", T=z, Vz=z, Bz=z, logtau=cfg.get_logtau_values())
+    np.save(sim / "stokes_198_nicole_tau500.npy", np.zeros((1, 1, 300, 4), dtype=np.float32))
+    with pytest.raises(ValueError, match="old generator"):
+        load_source_arrays(198, cfg)
 
 
 def test_training_noise_has_the_measured_sigma_in_physical_units():
@@ -369,21 +365,24 @@ def test_training_noise_has_the_measured_sigma_in_physical_units():
 
 
 def test_training_refuses_statistics_of_the_other_velocity_convention():
-    """Statistics of another velocity convention, or that record none, cannot normalize the steps.
+    """MHD statistics that do not describe ``v_los``, or record nothing, cannot normalize the steps.
 
     A mismatch would shift every normalized velocity target by twice the Vz mean per node;
-    unrecorded statistics predate Phase 1b and describe +Vz.
+    unrecorded statistics predate Phase 1b and describe +Vz. ``muram_legacy`` is not checked.
     """
     from scripts.base_training import check_normalizer_velocity_target
+    cfg = TrainingConfig(checkpoint_dir="/tmp/_ck", log_dir="/tmp/_lg")
     norm = MhdNormalizer(n_tau=45)
-    for stored, data, ok in ((None, "Vz", False), (None, "v_los", False), ("v_los", "v_los", True),
-                             ("Vz", "v_los", False), ("v_los", "Vz", False), ("v_los", None, True)):
+    for stored, ok in ((None, False), ("Vz", False), ("v_los", True)):
         norm.velocity_target = stored
         if ok:
-            check_normalizer_velocity_target(norm, data)
+            check_normalizer_velocity_target(norm, cfg)
         else:
             with pytest.raises(ValueError, match="recompute"):
-                check_normalizer_velocity_target(norm, data)
+                check_normalizer_velocity_target(norm, cfg)
+    norm.velocity_target = None
+    check_normalizer_velocity_target(norm, TrainingConfig(checkpoint_dir="/tmp/_ck", log_dir="/tmp/_lg",
+                                                          data_source="muram_legacy"))
 
 
 def test_training_refuses_stokes_statistics_of_differently_degraded_profiles(tmp_path):

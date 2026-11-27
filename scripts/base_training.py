@@ -650,6 +650,10 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# Velocity target of the nicole_tau500 steps: v_LOS = -Vz (km/s, positive = redshift, as
+# NICOLE and SPINOR). The normalization statistics record it (velocity_target).
+VELOCITY_TARGET = "v_los"
+
 # Settings every saved run must carry, because the dataclass defaults changed with them.
 DEGRADATION_SETTINGS = ("spatial_psf", "hinode_noise")
 
@@ -808,37 +812,41 @@ def file_content_hash(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def check_normalizer_velocity_target(mhd_normalizer: MhdNormalizer, convention: str | None) -> None:
-    """Refuse MHD statistics whose velocity convention differs from the data's.
+def check_normalizer_velocity_target(mhd_normalizer: MhdNormalizer, config: TrainingConfig) -> None:
+    """Refuse MHD statistics that do not describe the ``v_los`` velocity target.
 
-    Regenerated steps carry ``v_los`` = -Vz, so statistics computed on old files (mean of
-    +Vz) would shift every normalized velocity by twice the mean. Statistics that do not
-    record their convention (``velocity_target`` None, older than Phase 1b) are refused.
+    The ``nicole_tau500`` steps carry ``v_los`` = -Vz (positive = redshift). Statistics of
+    the old generator's +Vz, or that record no convention (older than Phase 1b), would
+    shift every normalized velocity by twice the mean. The ``muram_legacy`` source is not
+    checked.
 
     Args:
         mhd_normalizer: The loaded MHD normalizer.
-        convention: What :func:`require_one_velocity_convention` returned for the run's steps.
+        config: The run's configuration (its data source).
 
     Raises:
-        ValueError: If the statistics record no convention or another one than the data's.
+        ValueError: If the statistics record no convention or another one than ``v_los``.
 
     Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)
         >>> norm = MhdNormalizer(); norm.velocity_target = "v_los"
-        >>> check_normalizer_velocity_target(norm, "v_los")
+        >>> check_normalizer_velocity_target(norm, cfg)
         >>> norm.velocity_target = None
-        >>> check_normalizer_velocity_target(norm, "v_los")
+        >>> check_normalizer_velocity_target(norm, cfg)
         Traceback (most recent call last):
         ...
         ValueError: The MHD normalization statistics do not record their velocity convention (older than Phase 1b) but the steps carry v_los; recompute them with scripts/compute_normalization_stats.py.
     """
-    if convention is None:
+    if config.data_source != "nicole_tau500":
         return
     stored = getattr(mhd_normalizer, "velocity_target", None)
-    if stored != convention:
+    if stored != VELOCITY_TARGET:
         label = (f"describe {stored}" if stored is not None
                  else "do not record their velocity convention (older than Phase 1b)")
         raise ValueError(
-            f"The MHD normalization statistics {label} but the steps carry {convention}; "
+            f"The MHD normalization statistics {label} but the steps carry {VELOCITY_TARGET}; "
             "recompute them with scripts/compute_normalization_stats.py."
         )
 
@@ -889,75 +897,26 @@ def check_stokes_normalizer_degradation(stokes_normalizer: StokesNormalizer, con
 
 
 def check_normalization_matches_run(mhd_normalizer: MhdNormalizer, stokes_normalizer: StokesNormalizer,
-                                    config: TrainingConfig, steps) -> None:
+                                    config: TrainingConfig) -> None:
     """Every guard on the loaded statistics, for any entry point that trains or evaluates.
 
-    The steps must share one velocity convention, the MHD statistics must describe it, and
-    the Stokes statistics must come from profiles degraded like this run's.
+    The MHD statistics must describe the ``v_los`` target, and the Stokes statistics must
+    come from profiles degraded like this run's.
 
     Args:
         mhd_normalizer: The loaded MHD normalizer.
         stokes_normalizer: The loaded Stokes normalizer.
         config: The run's configuration.
-        steps: All steps the run reads (training, validation and test).
 
     Raises:
-        ValueError: From :func:`require_one_velocity_convention`,
-            :func:`check_normalizer_velocity_target` or
+        ValueError: From :func:`check_normalizer_velocity_target` or
             :func:`check_stokes_normalizer_degradation`.
 
     Examples:
-        >>> check_normalization_matches_run(mn, sn, cfg, [110, 120, 130, 140, 150, 198])  # doctest: +SKIP
+        >>> check_normalization_matches_run(mn, sn, cfg)  # doctest: +SKIP
     """
-    check_normalizer_velocity_target(mhd_normalizer, require_one_velocity_convention(list(steps), config))
+    check_normalizer_velocity_target(mhd_normalizer, config)
     check_stokes_normalizer_degradation(stokes_normalizer, config)
-
-
-def require_one_velocity_convention(steps, config: TrainingConfig) -> str | None:
-    """Refuse a set of steps whose velocity targets follow different sign conventions.
-
-    Steps regenerated since Phase 1a store ``v_los`` = -Vz (positive = redshift); older
-    ``nicole_tau500`` files only store Vz (positive upward), and ``load_source_arrays``
-    then uses +Vz as the target. Mixing the two in one experiment (e.g. regenerated
-    training steps with an old test step) silently flips the sign of the velocity in
-    part of the data, so this raises instead. Steps without files are ignored (they are
-    skipped or reported elsewhere); only the key list of each npz is read.
-
-    Args:
-        steps: The steps of one experiment (training, validation and test together).
-        config: The training configuration (data source and data path).
-
-    Returns:
-        ``"v_los"`` or ``"Vz"`` (the target each step uses), or ``None`` for
-        ``muram_legacy`` and when no step has files.
-
-    Raises:
-        ValueError: If some steps carry ``v_los`` and others do not.
-
-    Examples:
-        >>> import tempfile
-        >>> tmp = tempfile.mkdtemp()
-        >>> require_one_velocity_convention([999], TrainingConfig(checkpoint_dir=tmp, log_dir=tmp)) is None
-        True
-    """
-    if config.data_source != "nicole_tau500":
-        return None
-    sim_dir = Path(config.data_path) / "muram-simulation"
-    found = {}
-    for step in steps:
-        path = sim_dir / f"atmos_{step}_tau500.npz"
-        if path.exists():
-            with np.load(path) as atmos:
-                found[int(step)] = "v_los" if "v_los" in atmos.files else "Vz"
-    kinds = set(found.values())
-    if len(kinds) > 1:
-        old = sorted(s for s, k in found.items() if k == "Vz")
-        raise ValueError(
-            f"Steps {old} come from the old generator (velocity target +Vz) while the others "
-            "carry v_los = -Vz; regenerate them (tools/generate_tau500_stokes.sh) before "
-            "using them together."
-        )
-    return kinds.pop() if kinds else None
 
 
 def source_data_fingerprint(step: int, config: TrainingConfig) -> dict:
@@ -1609,20 +1568,17 @@ def load_source_arrays(
                 "to use this data source."
             )
 
-        if "v_los" not in atmos.files:
-            warnings.warn(
-                f"Step {step}: {atmos_path.name} comes from the old generator (no v_los, Bx, By): "
-                "its profiles have redshifted granules and Q = U = 0. Do not mix it with "
-                "regenerated steps in one experiment.",
-                stacklevel=2,
+        if VELOCITY_TARGET not in atmos.files:
+            raise ValueError(
+                f"Step {step}: {atmos_path.name} comes from the old generator (no v_los, Bx, By; "
+                "redshifted granules and Q = U = 0); regenerate it with tools/generate_tau500_stokes.sh."
             )
         mhd_data = {
             "T": np.asarray(atmos["T"], dtype=np.float64) * u.K,
-            # The velocity target must use the sign NICOLE synthesized the profiles with.
-            # New files carry "v_los" (= -Vz, positive = redshift, as NICOLE and SPINOR);
-            # older files were synthesized with Vz itself, so their "Vz" is the consistent
-            # target for them. The key stays "Vz" for the normalizer, model and analysis.
-            "Vz": np.asarray(atmos["v_los"] if "v_los" in atmos.files else atmos["Vz"],
+            # The velocity target uses the sign NICOLE synthesized the profiles with:
+            # v_los = -Vz (positive = redshift, as NICOLE and SPINOR). The key stays "Vz"
+            # for the normalizer, model and analysis.
+            "Vz": np.asarray(atmos[VELOCITY_TARGET],
                              dtype=np.float64) * u.km / u.s,
             "Bz": np.asarray(atmos["Bz"], dtype=np.float64) * u.G,
         }
@@ -3710,8 +3666,7 @@ def train_pinn_model(config: TrainingConfig):
     mhd_normalizer.load(filepath=config.data_path / config.mhd_normalizer_path)
     stokes_normalizer = StokesNormalizer()
     stokes_normalizer.load(filepath=config.data_path / config.stokes_normalizer_path)
-    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
-                                    range(config.min_step, config.max_step + 1, config.step_size))
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config)
     print("  ✓ Normalizers loaded")
     
     # Initialize model (including temperature parameters)

@@ -290,15 +290,11 @@ def test_dataset_targets_and_pixels_match_the_normalizer(tmp_path):
 
 # --- Physical consistency of the training data -------------------------------------------
 
-# The generator was fixed in reframe Phase 1a (v_LOS = -Vz, Bx and By passed to NICOLE; a test
-# chunk gives corr = -0.59 and Q, U up to 6e-3). The stored step-110 files still come from the
-# old generator, so these checks wait for the Phase 2 regeneration; remove the markers then.
-REGEN_PENDING = ("Waiting for the Phase 2 regeneration: stokes_110_nicole_tau500.npy still comes from the old "
-                 "generator (granules redshifted, corr +0.52; Q = U = 0). The generator itself is fixed (1a).")
+# The generator was fixed in reframe Phase 1a (v_LOS = -Vz, Bx and By passed to NICOLE) and
+# every step was regenerated with it on 2026-11-27.
 
 @pytest.mark.skipif(not (MURAM_DIR / "stokes_110_nicole_tau500.npy").exists(), reason="step 110 files absent")
 @pytest.mark.data
-@pytest.mark.xfail(strict=True, reason=REGEN_PENDING)
 def test_training_granules_are_blueshifted():
     """In the synthesized training profiles, bright granules must be blueshifted, as on the real Sun.
 
@@ -354,7 +350,6 @@ def test_dataset_serves_four_stokes_channels_in_iquv_order(tmp_path):
 
 @pytest.mark.skipif(not (MURAM_DIR / "stokes_110_nicole_tau500.npy").exists(), reason="step 110 files absent")
 @pytest.mark.data
-@pytest.mark.xfail(strict=True, reason=REGEN_PENDING)
 def test_training_profiles_carry_linear_polarization():
     """The synthesized training profiles have non-zero Q and U where the field is transverse.
 

@@ -1709,8 +1709,7 @@ def run_single_experiment(
     n_val = max(1, len(train_steps) // 10)
     val_steps = random.sample(train_steps, n_val)
     train_steps = [s for s in train_steps if s not in val_steps]
-    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
-                                    train_steps + val_steps + list(test_steps))
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config)
 
     global_bz_selection_indices = None
     global_bz_balance_metadata = None

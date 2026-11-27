@@ -14,7 +14,7 @@ from utils.normalizer import MhdNormalizer, StokesNormalizer
 from utils.cache_manage import MuramDataCache
 from scripts.base_training import (TrainingConfig, _degradation_signature, build_cache_config_signature,
                                    degrade_training_stokes, load_source_arrays,
-                                   require_one_velocity_convention)
+                                   VELOCITY_TARGET)
 
 
 def _compute_fixed_global_ic(
@@ -321,9 +321,9 @@ def compute_normalization_stats(
         checkpoint_dir=str(output_dir / "_tmp_checkpoints"),
         log_dir=str(output_dir / "_tmp_logs"),
     )
-    # Statistics over steps with opposite velocity signs would have a meaningless Vz mean.
-    # The convention is stored in the JSON so training can refuse mismatched statistics.
-    velocity_target = require_one_velocity_convention(available_steps, shared_cfg)
+    # The velocity convention is stored in the JSON so training can refuse mismatched
+    # statistics (load_source_arrays refuses old-generator steps without v_los).
+    velocity_target = VELOCITY_TARGET if data_source == "nicole_tau500" else None
 
     # Initialize cache (optional)
     cache = None
