@@ -120,26 +120,26 @@ def test_common_nodes_are_matched_between_spinor_and_the_model():
 
 
 def test_runtime_config_replays_the_degradation_a_run_was_trained_with(tmp_path):
-    """Analysis rebuilds a run's PSF and noise settings, and treats a run without them as pre-Phase-1b.
+    """Analysis rebuilds a run's PSF and noise settings and refuses a run that does not record them.
 
-    The defaults now blur the profiles with the Hinode PSF. A model trained before that
-    (no ``spatial_psf`` in its experiment_config.json) must be evaluated on unblurred
-    profiles, or every MURaM metric of the old models would change silently.
+    The defaults blur the profiles with the Hinode PSF. A run without these settings (or
+    without an experiment_config.json) predates Phase 1b; analysing it with today's
+    defaults would change its MURaM metrics silently, so it raises and points to the git
+    tag that still analyses it.
     """
     import json
     pipe = AnalysisModelPipeline("cpu", tmp_path)
     base = {"lambda_wfa": 0.0, "lambda_doppler": 0.0, "lambda_temp": 0.0}
+    new = tmp_path / "new.json"
+    new.write_text(json.dumps({"data_config": {"spatial_psf": False, "hinode_noise": 0.0,
+                                               "psf_path": "hinode-MODEST/PSFs/x.fits"}}))
+    cfg_new = pipe.build_runtime_training_config({**base, "config_path": str(new)})
+    assert (cfg_new.spatial_psf, cfg_new.hinode_noise, cfg_new.psf_path) == (False, 0.0, "hinode-MODEST/PSFs/x.fits")
     old = tmp_path / "old.json"
     old.write_text(json.dumps({"data_config": {"seed": 1}}))
-    new = tmp_path / "new.json"
-    new.write_text(json.dumps({"data_config": {"spatial_psf": True, "hinode_noise": 1.2e-3,
-                                               "psf_path": "hinode-MODEST/PSFs/x.fits"}}))
-    cfg_old = pipe.build_runtime_training_config({**base, "config_path": str(old)})
-    cfg_none = pipe.build_runtime_training_config({**base, "config_path": None})
-    cfg_new = pipe.build_runtime_training_config({**base, "config_path": str(new)})
-    assert (cfg_old.spatial_psf, cfg_old.hinode_noise) == (False, 0.0)
-    assert (cfg_none.spatial_psf, cfg_none.hinode_noise) == (False, 0.0)
-    assert (cfg_new.spatial_psf, cfg_new.hinode_noise, cfg_new.psf_path) == (True, 1.2e-3, "hinode-MODEST/PSFs/x.fits")
+    for path in (str(old), None, str(tmp_path / "missing.json")):
+        with pytest.raises(ValueError, match="paper-v1-results"):
+            pipe.build_runtime_training_config({**base, "config_path": path})
 
 
 # --- Targets for the agreed changes ------------------------------------------------------

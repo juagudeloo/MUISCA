@@ -457,7 +457,9 @@ class PredictionExporter:
             source. For models trained on ``nicole_tau500`` the MURaM input therefore differs
             from the training profiles (e.g. continuum 0.91 instead of 0.97 at one pixel of
             step 198). Fixed in the reframe plan, Phase 1d. Until then it refuses models
-            trained with the spatial PSF (``NotImplementedError``).
+            trained with the spatial PSF (``NotImplementedError``), and runs older than Phase
+            1b are refused by ``build_runtime_training_config``, so it only serves runs
+            trained with ``--spatial-psf 0``.
 
         Returns ``(prediction_stokes, wavelength, gt_pressure)``.
         """

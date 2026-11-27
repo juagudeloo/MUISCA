@@ -1628,8 +1628,8 @@ def run_single_experiment(
             'bz_balance_mode': str(config.bz_balance_mode),
             'bz_balance_bins': int(config.bz_balance_bins),
             'bz_balance_tau_idx': None if config.bz_balance_tau_idx is None else int(config.bz_balance_tau_idx),
-            # Observational degradation; analysis and fine-tuning replay these (runs without
-            # them were trained with LEGACY_DEGRADATION).
+            # Observational degradation; analysis and fine-tuning replay these and refuse a
+            # run without them.
             'spatial_psf': bool(config.spatial_psf),
             'psf_path': str(config.psf_path),
             'psf_sampling_arcsec': float(config.psf_sampling_arcsec),

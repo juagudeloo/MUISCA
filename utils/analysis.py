@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.gridspec import GridSpec
 
-from scripts.base_training import LEGACY_DEGRADATION, TrainingConfig
+from scripts.base_training import TrainingConfig, require_degradation_settings
 from models.pinn_mscnn_model import PhysicsInformedMSCNN
 from utils.modest_data import transform_modest_stokes_profiles
 
@@ -649,15 +649,18 @@ class AnalysisModelPipeline:
     def build_runtime_training_config(self, model_cfg: dict) -> TrainingConfig:
         """A :class:`TrainingConfig` with the flavor's physics settings, for re-running its data pipeline.
 
-        Missing entries fall back to the old defaults (``tau_averaged`` B_LOS, v_LOS at -1.0,
-        T at 0.0), and a run without ``spatial_psf`` or ``hinode_noise`` (or without a saved
-        configuration) is replayed without PSF and noise, as it was trained.
+        Missing physics entries fall back to the old defaults (``tau_averaged`` B_LOS, v_LOS
+        at -1.0, T at 0.0). The PSF and noise settings must be saved.
 
         Args:
             model_cfg: One entry of :meth:`get_model_configs`.
 
         Returns:
             The configuration, with ``log_dir`` set to the pipeline's output folder.
+
+        Raises:
+            ValueError: If the run has no ``experiment_config.json`` or it has no
+                ``spatial_psf`` or ``hinode_noise`` (it predates Phase 1b).
 
         Examples:
             >>> cfg = pipe.build_runtime_training_config(configs["wfa_only"])  # doctest: +SKIP
@@ -666,41 +669,44 @@ class AnalysisModelPipeline:
             "device": str(self.device),
             "batch_size": 512,
             "enable_epoch_plots": True,
-            **LEGACY_DEGRADATION,  # without a saved config, assume a pre-Phase-1b run
         }
 
         cfg_path = model_cfg.get("config_path")
-        if cfg_path is not None and Path(cfg_path).exists():
-            with open(cfg_path, "r") as f:
-                raw = json.load(f)
+        if cfg_path is None or not Path(cfg_path).exists():
+            raise ValueError(
+                f"No experiment_config.json for this model ({cfg_path}); its PSF and noise settings "
+                "are unknown. Runs that old are analysed with the code at git tag paper-v1-results."
+            )
+        with open(cfg_path, "r") as f:
+            raw = json.load(f)
 
-            train_cfg = raw.get("training_config", {})
-            phys_cfg = raw.get("physics_config", {})
-            data_cfg = raw.get("data_config", {})
+        train_cfg = raw.get("training_config", {})
+        phys_cfg = raw.get("physics_config", {})
+        data_cfg = raw.get("data_config", {})
+        require_degradation_settings(data_cfg, f"{cfg_path} (data_config)")
 
-            cfg_kwargs.update({
-                "data_path": raw.get("data_path", TrainingConfig().data_path),
-                "learning_rate": train_cfg.get("learning_rate", 1e-3),
-                "batch_size": int(train_cfg.get("batch_size", 512)),
-                "lambda_wfa": float(phys_cfg.get("lambda_wfa", model_cfg["lambda_wfa"])),
-                "lambda_doppler": float(phys_cfg.get("lambda_doppler", model_cfg["lambda_doppler"])),
-                "lambda_temp": float(phys_cfg.get("lambda_temp", model_cfg["lambda_temp"])),
-                "blos_physics_mode": phys_cfg.get("blos_physics_mode", "tau_averaged"),
-                "blos_target_logtau": phys_cfg.get("blos_target_logtau", None),
-                "vlos_physics_mode": phys_cfg.get("vlos_physics_mode", "single_height"),
-                "vlos_target_logtau": phys_cfg.get("vlos_target_logtau", -1.0),
-                "temp_physics_mode": phys_cfg.get("temp_physics_mode", "single_height"),
-                "temp_target_logtau": phys_cfg.get("temp_target_logtau", 0.0),
-                "temp_continuum_indices": phys_cfg.get("temp_continuum_indices", None),
-                "temp_continuum_wavelength": phys_cfg.get("temp_continuum_wavelength", None),
-                "logtau_values": data_cfg.get("logtau_values", None),
-                # Runs saved before Phase 1b were trained without PSF and noise.
-                "spatial_psf": bool(data_cfg.get("spatial_psf", LEGACY_DEGRADATION["spatial_psf"])),
-                "hinode_noise": float(data_cfg.get("hinode_noise", LEGACY_DEGRADATION["hinode_noise"])),
-            })
-            for key in ("psf_path", "psf_sampling_arcsec", "pixel_km"):
-                if key in data_cfg:
-                    cfg_kwargs[key] = data_cfg[key]
+        cfg_kwargs.update({
+            "data_path": raw.get("data_path", TrainingConfig().data_path),
+            "learning_rate": train_cfg.get("learning_rate", 1e-3),
+            "batch_size": int(train_cfg.get("batch_size", 512)),
+            "lambda_wfa": float(phys_cfg.get("lambda_wfa", model_cfg["lambda_wfa"])),
+            "lambda_doppler": float(phys_cfg.get("lambda_doppler", model_cfg["lambda_doppler"])),
+            "lambda_temp": float(phys_cfg.get("lambda_temp", model_cfg["lambda_temp"])),
+            "blos_physics_mode": phys_cfg.get("blos_physics_mode", "tau_averaged"),
+            "blos_target_logtau": phys_cfg.get("blos_target_logtau", None),
+            "vlos_physics_mode": phys_cfg.get("vlos_physics_mode", "single_height"),
+            "vlos_target_logtau": phys_cfg.get("vlos_target_logtau", -1.0),
+            "temp_physics_mode": phys_cfg.get("temp_physics_mode", "single_height"),
+            "temp_target_logtau": phys_cfg.get("temp_target_logtau", 0.0),
+            "temp_continuum_indices": phys_cfg.get("temp_continuum_indices", None),
+            "temp_continuum_wavelength": phys_cfg.get("temp_continuum_wavelength", None),
+            "logtau_values": data_cfg.get("logtau_values", None),
+            "spatial_psf": bool(data_cfg["spatial_psf"]),
+            "hinode_noise": float(data_cfg["hinode_noise"]),
+        })
+        for key in ("psf_path", "psf_sampling_arcsec", "pixel_km"):
+            if key in data_cfg:
+                cfg_kwargs[key] = data_cfg[key]
 
         cfg = TrainingConfig(**cfg_kwargs)
         cfg.log_dir = self.output_dir

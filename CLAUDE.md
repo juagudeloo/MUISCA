@@ -90,7 +90,7 @@ MURaM 3D simulation cubes (T, Vz, Bz at geometric height)
   → MuramStepDataset → DataLoader → fresh Gaussian noise per batch (hinode_noise) → training
 ```
 
-The PSF (`spatial_psf`, the 0.16″ Hinode PSF resampled to the 25 km MURaM grid) is cached with the profiles; the noise (`hinode_noise` = 1.2e-3 of the continuum, measured in MODEST) is never cached, and validation and analysis inputs are noiseless. Runs saved without these settings are replayed with `LEGACY_DEGRADATION` (no PSF, no noise).
+The PSF (`spatial_psf`, the 0.16″ Hinode PSF resampled to the 25 km MURaM grid) is cached with the profiles; the noise (`hinode_noise` = 1.2e-3 of the continuum, measured in MODEST) is never cached, and validation and analysis inputs are noiseless. Runs saved without these settings, and normalization statistics that do not record their velocity convention and degradation, are refused; git tag `paper-v1-results` is the last code that analyses the models of the first paper draft.
 
 ### Model Architecture
 

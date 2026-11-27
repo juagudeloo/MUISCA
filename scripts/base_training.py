@@ -125,8 +125,8 @@ class TrainingConfig:
     # Observational degradation of the training profiles (reframe Phase 1b). The spatial
     # PSF is part of the cached profiles; the noise is drawn anew for every training batch
     # (never cached, so the model does not fit one realization). Validation and analysis
-    # inputs are noiseless. Runs saved before these settings existed are replayed with
-    # LEGACY_DEGRADATION (no PSF, no noise).
+    # inputs are noiseless. A saved run without these settings predates Phase 1b and is
+    # refused (require_degradation_settings); tag paper-v1-results still analyses those runs.
     spatial_psf: bool = True
     psf_sampling_arcsec: float = 0.16   # pixel size of psf_path
     pixel_km: float = 25.0              # MURaM horizontal cell size
@@ -460,8 +460,11 @@ class TrainingConfig:
                 of fields).
 
         Returns:
-            A validated :class:`TrainingConfig`. Missing ``spatial_psf`` and ``hinode_noise``
-            are taken from :data:`LEGACY_DEGRADATION` (the file predates them).
+            A validated :class:`TrainingConfig`.
+
+        Raises:
+            ValueError: If the file has no ``spatial_psf`` or ``hinode_noise`` (it predates
+                Phase 1b; see :func:`require_degradation_settings`).
 
         Examples:
             >>> cfg = TrainingConfig.load(Path("output/experiments/exp/checkpoints/config.json"))  # doctest: +SKIP
@@ -470,10 +473,8 @@ class TrainingConfig:
             config_dict = json.load(f)
         valid_keys = {field.name for field in fields(cls)}
         filtered_config = {key: value for key, value in config_dict.items() if key in valid_keys}
-        # A configuration saved before Phase 1b was trained without PSF and noise; resuming
-        # it must not pick up today's defaults.
-        for key, value in LEGACY_DEGRADATION.items():
-            filtered_config.setdefault(key, value)
+        # Resuming must not pick up today's degradation defaults silently.
+        require_degradation_settings(filtered_config, str(path))
         return cls(**filtered_config)
 
     def get_logtau_values(self) -> np.ndarray:
@@ -649,9 +650,38 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-# Degradation of runs saved before Phase 1b: their experiment_config.json has no
-# spatial_psf or hinode_noise, and they were trained on noiseless, unblurred profiles.
-LEGACY_DEGRADATION = {"spatial_psf": False, "hinode_noise": 0.0}
+# Settings every saved run must carry, because the dataclass defaults changed with them.
+DEGRADATION_SETTINGS = ("spatial_psf", "hinode_noise")
+
+
+def require_degradation_settings(settings, source: str) -> None:
+    """Refuse a saved run configuration that does not say how its profiles were degraded.
+
+    The defaults blur the profiles with the Hinode PSF and add noise, so a configuration
+    without these settings would be replayed with them even if it was trained on clean,
+    unblurred profiles. Such files predate Phase 1b; the code at git tag
+    ``paper-v1-results`` still analyses them.
+
+    Args:
+        settings: The saved settings (a mapping of field names).
+        source: What the settings were read from, for the message.
+
+    Raises:
+        ValueError: If any of :data:`DEGRADATION_SETTINGS` is missing.
+
+    Examples:
+        >>> require_degradation_settings({"spatial_psf": True, "hinode_noise": 1.2e-3}, "run.json")
+        >>> require_degradation_settings({"spatial_psf": False}, "old.json")
+        Traceback (most recent call last):
+        ...
+        ValueError: old.json has no hinode_noise. Add it (a hand-written config); a run saved before Phase 1b is analysed with the code at git tag paper-v1-results.
+    """
+    missing = [key for key in DEGRADATION_SETTINGS if key not in settings]
+    if missing:
+        raise ValueError(
+            f"{source} has no {', '.join(missing)}. Add it (a hand-written config); a run saved "
+            "before Phase 1b is analysed with the code at git tag paper-v1-results."
+        )
 
 # Order of the Stokes channels in the model input (MuramStepDataset stacks I, then V).
 # Phase 1c replaces this with TrainingConfig.stokes_channels.
@@ -782,32 +812,33 @@ def check_normalizer_velocity_target(mhd_normalizer: MhdNormalizer, convention: 
     """Refuse MHD statistics whose velocity convention differs from the data's.
 
     Regenerated steps carry ``v_los`` = -Vz, so statistics computed on old files (mean of
-    +Vz) would shift every normalized velocity by twice the mean. Statistics saved before
-    the convention was recorded (``velocity_target`` None) are accepted only for old data.
+    +Vz) would shift every normalized velocity by twice the mean. Statistics that do not
+    record their convention (``velocity_target`` None, older than Phase 1b) are refused.
 
     Args:
         mhd_normalizer: The loaded MHD normalizer.
         convention: What :func:`require_one_velocity_convention` returned for the run's steps.
 
     Raises:
-        ValueError: If the statistics describe another velocity than the data.
+        ValueError: If the statistics record no convention or another one than the data's.
 
     Examples:
-        >>> norm = MhdNormalizer(); norm.velocity_target = None
-        >>> check_normalizer_velocity_target(norm, "Vz")   # old stats, old data: fine
+        >>> norm = MhdNormalizer(); norm.velocity_target = "v_los"
+        >>> check_normalizer_velocity_target(norm, "v_los")
+        >>> norm.velocity_target = None
         >>> check_normalizer_velocity_target(norm, "v_los")
         Traceback (most recent call last):
         ...
-        ValueError: The MHD normalization statistics describe Vz (unrecorded, older than Phase 1b) but the steps carry v_los; recompute them with scripts/compute_normalization_stats.py.
+        ValueError: The MHD normalization statistics do not record their velocity convention (older than Phase 1b) but the steps carry v_los; recompute them with scripts/compute_normalization_stats.py.
     """
     if convention is None:
         return
     stored = getattr(mhd_normalizer, "velocity_target", None)
-    effective = stored if stored is not None else "Vz"
-    if effective != convention:
-        label = stored if stored is not None else "Vz (unrecorded, older than Phase 1b)"
+    if stored != convention:
+        label = (f"describe {stored}" if stored is not None
+                 else "do not record their velocity convention (older than Phase 1b)")
         raise ValueError(
-            f"The MHD normalization statistics describe {label} but the steps carry {convention}; "
+            f"The MHD normalization statistics {label} but the steps carry {convention}; "
             "recompute them with scripts/compute_normalization_stats.py."
         )
 
@@ -817,28 +848,35 @@ def check_stokes_normalizer_degradation(stokes_normalizer: StokesNormalizer, con
 
     The PSF lowers the spatial spread of every Stokes parameter (the V std most), so
     statistics of unblurred profiles would mis-scale blurred inputs and the noise sigma
-    (:func:`input_noise_scale`), and the other way round. Statistics written before Phase 1b
-    (no record) describe unblurred profiles.
+    (:func:`input_noise_scale`), and the other way round. Statistics without a record
+    (older than Phase 1b) are refused.
 
     Args:
         stokes_normalizer: The loaded Stokes normalizer.
         config: The run's configuration.
 
     Raises:
-        ValueError: If the recorded degradation differs from the configuration's.
+        ValueError: If there is no record or it differs from the configuration's.
 
     Examples:
         >>> import tempfile
         >>> tmp = tempfile.mkdtemp()
-        >>> norm = StokesNormalizer(); norm.degradation = None
-        >>> check_stokes_normalizer_degradation(norm, TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, spatial_psf=False))
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, spatial_psf=False)
+        >>> norm = StokesNormalizer(); norm.degradation = _degradation_signature(cfg)
+        >>> check_stokes_normalizer_degradation(norm, cfg)
         >>> check_stokes_normalizer_degradation(norm, TrainingConfig(checkpoint_dir=tmp, log_dir=tmp))
         Traceback (most recent call last):
         ...
         ValueError: The Stokes normalization statistics were computed without the spatial PSF, but this run uses it; recompute them with scripts/compute_normalization_stats.py (--spatial-psf 1).
     """
-    stored = getattr(stokes_normalizer, "degradation", None) or {"spatial_psf": False}
+    stored = getattr(stokes_normalizer, "degradation", None)
     expected = _degradation_signature(config)
+    if stored is None:
+        raise ValueError(
+            "The Stokes normalization statistics do not record how their profiles were degraded "
+            "(older than Phase 1b); recompute them with scripts/compute_normalization_stats.py "
+            f"(--spatial-psf {int(bool(expected.get('spatial_psf')))})."
+        )
     if stored != expected:
         have = "with" if stored.get("spatial_psf") else "without"
         want = "uses" if expected.get("spatial_psf") else "does not use"

@@ -53,7 +53,7 @@ from mlflow.types import Schema, TensorSpec
 
 from utils.hinode_wavelengths import N_WL_OBSERVED
 from utils.mlflow_utils import default_tracking_uri, finite_metrics, flatten_params
-from scripts.base_training import LEGACY_DEGRADATION, check_normalization_matches_run, set_global_seed
+from scripts.base_training import check_normalization_matches_run, require_degradation_settings, set_global_seed
 from scripts.experiments.ablation_study import compute_tau_averaged_metrics
 
 
@@ -274,12 +274,9 @@ def load_and_adapt_config(
             except Exception:
                 pass
 
-    # A base run saved before Phase 1b has no PSF or noise settings and was trained without
-    # them; keep it that way instead of picking up today's defaults.
+    # Without its PSF and noise settings the base run would be fine-tuned on today's defaults.
     restored = set(applied) | {k for k in saved_config if hasattr(config, k)}
-    for key, value in LEGACY_DEGRADATION.items():
-        if key not in restored:
-            setattr(config, key, value)
+    require_degradation_settings(restored, f"The base run of {checkpoint_path}")
 
     # ENFORCE Bz balancing (mandatory for fine-tuning, per magnetic_field_balancing_and_finetuning.md)
     # Override any base-training settings to ensure fine-tuning uses balanced data.

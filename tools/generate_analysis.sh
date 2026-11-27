@@ -18,6 +18,9 @@ cd "${MUISCA_ROOT}" || exit 1
 # multi-model comparison figures (jointplots 2x2, images 2x(1+N)) under a "combined/"
 # subdirectory, in addition to the usual per-model plots.
 MODEL_TYPES="no_physics wfa_only doppler_only black_body_only"
+# Runs older than Phase 1b (e.g. experiment_110_to_130-step_size_10-normal, the first
+# paper draft) do not record their PSF and noise settings and are refused; analyse them
+# with the code at git tag paper-v1-results. Set this to the Phase 2 experiment.
 EXPERIMENT_ROOT="experiment_110_to_130-step_size_10-normal"
 
 # Runtime control

@@ -116,16 +116,35 @@ def test_finetuning_refuses_a_base_run_without_a_balancing_node(tmp_path):
     run.mkdir(parents=True)
     torch.save({"model_state_dict": PhysicsInformedMSCNN(scales=[1], output_features=135).state_dict()},
                run / "final_model.pth")
+    degradation = {"spatial_psf": False, "hinode_noise": 0.0}
     (run / "experiment_config.json").write_text(json.dumps(
-        {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": None}}))
+        {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": None, **degradation}}))
     with pytest.raises(ValueError, match="bz_balance_tau_idx"):
         finetune.load_and_adapt_config(run / "final_model.pth")
     (run / "experiment_config.json").write_text(json.dumps(
-        {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": 44}}))
+        {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": 44, **degradation}}))
     cfg, _ = finetune.load_and_adapt_config(run / "final_model.pth", finetune_epochs_override=3)
     assert (cfg.lambda_wfa, cfg.apply_bz_bin_balance, cfg.bz_balance_scope, cfg.n_epochs) == (10.0, True, "global", 3)
-    # A run saved before Phase 1b (no spatial_psf, hinode_noise) is fine-tuned as it was trained.
+    # The base run's degradation is kept, not replaced by today's defaults.
     assert (cfg.spatial_psf, cfg.hinode_noise) == (False, 0.0)
+
+
+def test_finetuning_refuses_a_base_run_without_its_degradation_settings(tmp_path):
+    """A base run without ``spatial_psf`` and ``hinode_noise`` predates Phase 1b and is refused.
+
+    Fine-tuning it with today's defaults would switch it to blurred, noisy profiles halfway
+    through its training.
+    """
+    import scripts.finetune as finetune
+    from models.pinn_mscnn_model import PhysicsInformedMSCNN
+    run = tmp_path / "exp" / "wfa_only"
+    run.mkdir(parents=True)
+    torch.save({"model_state_dict": PhysicsInformedMSCNN(scales=[1], output_features=135).state_dict()},
+               run / "final_model.pth")
+    (run / "experiment_config.json").write_text(json.dumps(
+        {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": 44}}))
+    with pytest.raises(ValueError, match="has no spatial_psf, hinode_noise"):
+        finetune.load_and_adapt_config(run / "final_model.pth")
 
 
 # --- Generation safeguards ---------------------------------------------------------------

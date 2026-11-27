@@ -369,13 +369,14 @@ def test_training_noise_has_the_measured_sigma_in_physical_units():
 
 
 def test_training_refuses_statistics_of_the_other_velocity_convention():
-    """Statistics of +Vz (recorded, or unrecorded and so older) cannot normalize regenerated v_los steps.
+    """Statistics of another velocity convention, or that record none, cannot normalize the steps.
 
-    A mismatch would shift every normalized velocity target by twice the Vz mean per node.
+    A mismatch would shift every normalized velocity target by twice the Vz mean per node;
+    unrecorded statistics predate Phase 1b and describe +Vz.
     """
     from scripts.base_training import check_normalizer_velocity_target
     norm = MhdNormalizer(n_tau=45)
-    for stored, data, ok in ((None, "Vz", True), (None, "v_los", False), ("v_los", "v_los", True),
+    for stored, data, ok in ((None, "Vz", False), (None, "v_los", False), ("v_los", "v_los", True),
                              ("Vz", "v_los", False), ("v_los", "Vz", False), ("v_los", None, True)):
         norm.velocity_target = stored
         if ok:
@@ -386,16 +387,20 @@ def test_training_refuses_statistics_of_the_other_velocity_convention():
 
 
 def test_training_refuses_stokes_statistics_of_differently_degraded_profiles(tmp_path):
-    """Statistics of unblurred profiles (recorded, or older than Phase 1b) cannot scale PSF-blurred inputs.
+    """Statistics of differently degraded profiles, or without a record, cannot scale the inputs.
 
     The PSF lowers the spread of every Stokes parameter, so mismatched statistics would
-    mis-scale the inputs and the noise sigma.
+    mis-scale the inputs and the noise sigma. Statistics without a record predate Phase 1b.
     """
     from scripts.base_training import _degradation_signature, check_stokes_normalizer_degradation
     with_psf = _cfg(tmp_path)
     without = _cfg(tmp_path, spatial_psf=False)
     norm = StokesNormalizer()
     norm.degradation = None
+    for cfg in (with_psf, without):
+        with pytest.raises(ValueError, match="do not record"):
+            check_stokes_normalizer_degradation(norm, cfg)
+    norm.degradation = _degradation_signature(without)
     check_stokes_normalizer_degradation(norm, without)
     with pytest.raises(ValueError, match="without the spatial PSF"):
         check_stokes_normalizer_degradation(norm, with_psf)
@@ -405,20 +410,20 @@ def test_training_refuses_stokes_statistics_of_differently_degraded_profiles(tmp
         check_stokes_normalizer_degradation(norm, without)
 
 
-def test_resuming_an_old_configuration_keeps_it_without_psf_and_noise(tmp_path):
-    """``TrainingConfig.load`` of a file without the degradation settings replays LEGACY_DEGRADATION.
+def test_resuming_a_configuration_keeps_its_degradation_and_refuses_one_without_it(tmp_path):
+    """``TrainingConfig.load`` keeps a file's PSF and noise settings and refuses a file without them.
 
-    Resuming a run trained on clean, unblurred profiles must not switch to today's defaults
-    halfway through; a file that has the settings keeps them. A NaN noise sigma is refused.
+    Resuming must not switch to today's defaults halfway through; a file without the
+    settings predates Phase 1b. A NaN noise sigma is refused.
     """
     import json
     old = tmp_path / "old.json"
     old.write_text(json.dumps({"n_epochs": 3, "checkpoint_dir": str(tmp_path / "c"), "log_dir": str(tmp_path / "l")}))
-    cfg = TrainingConfig.load(old)
-    assert (cfg.n_epochs, cfg.spatial_psf, cfg.hinode_noise) == (3, False, 0.0)
+    with pytest.raises(ValueError, match="paper-v1-results"):
+        TrainingConfig.load(old)
     new = tmp_path / "new.json"
-    new.write_text(json.dumps({"spatial_psf": True, "hinode_noise": 1.2e-3,
+    new.write_text(json.dumps({"spatial_psf": False, "hinode_noise": 0.0,
                                "checkpoint_dir": str(tmp_path / "c"), "log_dir": str(tmp_path / "l")}))
-    assert (TrainingConfig.load(new).spatial_psf, TrainingConfig.load(new).hinode_noise) == (True, 1.2e-3)
+    assert (TrainingConfig.load(new).spatial_psf, TrainingConfig.load(new).hinode_noise) == (False, 0.0)
     with pytest.raises(ValueError, match="hinode_noise"):
         _cfg(tmp_path, hinode_noise=float("nan"))
