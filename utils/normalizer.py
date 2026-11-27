@@ -104,6 +104,9 @@ class MhdNormalizer:
         # Percentile-based transform scales and tail-loss parameters
         self.B0_transform_per_tau = None  # shape (n_tau,), transform scale per-τ
         self.B0_weight_start = None  # scalar, P90 for tail-weighting start
+        # Which velocity the "Vz" statistics describe: "v_los" (= -Vz, regenerated steps),
+        # "Vz" (old generator) or None (statistics written before this was recorded).
+        self.velocity_target = None
         self.B1_weight_saturation = None  # scalar, P99.5 for tail-weighting saturation
         self.huber_delta = None  # scalar, Huber threshold = 0.25 * B0_weight_start
         
@@ -561,7 +564,8 @@ class MhdNormalizer:
         
         return denormalized
     
-    def save(self, filepath: str, logtau_values: Optional[List[float]] = None):
+    def save(self, filepath: str, logtau_values: Optional[List[float]] = None,
+             velocity_target: Optional[str] = None):
         """Write the final statistics to JSON (version ``'3.0_asinh_per_tau'``) and clean up.
 
         Finalizes first if needed, writes ``final_stats``, ``B0_transform_per_tau``, the
@@ -572,6 +576,9 @@ class MhdNormalizer:
             filepath: Output JSON path. Parent folders are created.
             logtau_values: Optional log(tau) value of every node, stored rounded to 6
                 decimals so loaders can check that the grid matches.
+            velocity_target: The velocity the ``Vz`` statistics describe (``"v_los"`` or
+                ``"Vz"``, from ``require_one_velocity_convention``), stored so training can
+                refuse statistics of the other convention.
 
         Examples:
             >>> norm.save("data/normalization_stats/nicole_tau500/mhd_normalization.json",
@@ -603,6 +610,9 @@ class MhdNormalizer:
             arr = np.asarray(logtau_values, dtype=np.float32)
             save_dict['logtau_values'] = [float(x) for x in np.round(arr, 6).tolist()]
         save_dict['bz_hist_bins'] = int(self.bz_hist_bins)
+        if velocity_target is not None:
+            save_dict['velocity_target'] = str(velocity_target)
+        self.velocity_target = velocity_target
 
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -680,6 +690,7 @@ class MhdNormalizer:
         self.epsilon = save_dict.get('epsilon', 1e-8)
         self.finalized = save_dict.get('finalized', True)
         self.logtau_values = save_dict.get('logtau_values', None)
+        self.velocity_target = save_dict.get('velocity_target', None)
         self.bz_hist_bins = int(save_dict.get('bz_hist_bins', self.bz_hist_bins))
         
         # Load asinh transform parameters (new + legacy key names)
@@ -845,7 +856,10 @@ class StokesNormalizer:
         }
         self.finalized = False
         self.final_stats = None
-    
+        # Degradation of the profiles the statistics were computed on (the PSF settings of
+        # TrainingConfig), or None for files written before Phase 1b (no PSF).
+        self.degradation = None
+
     def update(self, stokes_dict):
         """Add one simulation step to the running mean/M2 of I and V.
 
@@ -904,11 +918,14 @@ class StokesNormalizer:
         self.finalized = True
         return self.final_stats
     
-    def save(self, filepath):
+    def save(self, filepath, degradation: Optional[dict] = None):
         """Write ``final_stats`` to JSON, finalizing first if needed, and print a summary.
 
         Args:
             filepath: Output JSON path. Parent folders are created.
+            degradation: The PSF settings of the profiles (``_degradation_signature`` of the
+                training configuration), stored under ``"_degradation"`` so training can
+                refuse statistics of differently degraded profiles.
 
         Examples:
             >>> norm.save("data/normalization_stats/nicole_tau500/stokes_normalization.json")  # doctest: +SKIP
@@ -920,9 +937,13 @@ class StokesNormalizer:
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
         
+        payload = dict(self.final_stats)
+        if degradation is not None:
+            payload["_degradation"] = degradation
+        self.degradation = degradation
         with open(filepath, 'w') as f:
-            json.dump(self.final_stats, f, indent=2)
-        
+            json.dump(payload, f, indent=2)
+
         print(f"Stokes normalization statistics saved to {filepath}")
         for key in ['I', 'V']:
             stats = self.final_stats[key]
@@ -950,7 +971,8 @@ class StokesNormalizer:
         
         with open(filepath, 'r') as f:
             self.final_stats = json.load(f)
-        
+        self.degradation = self.final_stats.pop("_degradation", None)
+
         self.finalized = True
         print(f"Stokes normalization statistics loaded from {filepath}")
         return self

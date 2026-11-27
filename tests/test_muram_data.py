@@ -392,14 +392,32 @@ def test_load_step_reads_the_horizontal_field(tmp_path):
     np.testing.assert_allclose(data["By"].to_value(u.G), 3 * code * np.sqrt(4 * np.pi), rtol=1e-6)
 
 
-@pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 1b): the training profiles are degraded "
-                   "with the Hinode PSF resampled to the MURaM grid, by StokesData.apply_spatial_psf.")
+PSF_PATH = ROOT / "data" / "hinode-MODEST" / "PSFs" / "hinode_psf_bin.0.16.fits"
+
+
+@pytest.mark.skipif(not PSF_PATH.exists(), reason="Hinode PSF file absent")
+@pytest.mark.data
+def test_hinode_psf_on_the_muram_grid_is_centred_normalized_and_keeps_its_wings():
+    """The 0.16 arcsec Hinode PSF resampled to 25 km keeps sum 1, its centre and its encircled energy.
+
+    25 km is 0.0345 arcsec at 1 AU, so the 9.8 arcsec file becomes 279 x 279 cells. The
+    encircled energy inside 0.8 arcsec (0.858 in the file) must survive the resampling to
+    0.01: the far wings are what lowers the granulation contrast to Hinode's level.
+    """
+    from utils.muram_data import KM_PER_ARCSEC, load_psf_on_muram_grid
+    k = load_psf_on_muram_grid(PSF_PATH, 0.16, 25.0)
+    assert k.shape == (279, 279) and k.sum() == pytest.approx(1.0, abs=1e-12)
+    assert np.unravel_index(k.argmax(), k.shape) == (139, 139)
+    r = np.hypot(*np.mgrid[:279, :279] - 139) * 25.0 / KM_PER_ARCSEC
+    assert k[r <= 0.8].sum() == pytest.approx(0.858, abs=0.01)
+
+
 def test_spatial_psf_keeps_the_mean_and_lowers_the_contrast():
     """The PSF step blurs every wavelength map: the spatial mean is unchanged and the contrast drops.
 
     The convolution is normalized and periodic (the MURaM box is periodic), so the mean
-    profile must be exactly conserved; on MURaM the continuum contrast drops from 14.4 %
-    to about 8 %. Here a random map blurred by a Gaussian PSF must keep its mean to 1e-6
+    profile must be exactly conserved; on MURaM 198 the continuum contrast drops from 14.5 %
+    to 8.4 % with the Hinode PSF (raw MODEST quiet Sun 6.9 %). Here a random map blurred by a Gaussian PSF must keep its mean to 1e-6
     and lose at least a third of its standard deviation.
     """
     rng = np.random.default_rng(0)

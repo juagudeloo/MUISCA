@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.gridspec import GridSpec
 
-from scripts.base_training import TrainingConfig
+from scripts.base_training import LEGACY_DEGRADATION, TrainingConfig
 from models.pinn_mscnn_model import PhysicsInformedMSCNN
 from utils.modest_data import transform_modest_stokes_profiles
 
@@ -650,7 +650,8 @@ class AnalysisModelPipeline:
         """A :class:`TrainingConfig` with the flavor's physics settings, for re-running its data pipeline.
 
         Missing entries fall back to the old defaults (``tau_averaged`` B_LOS, v_LOS at -1.0,
-        T at 0.0).
+        T at 0.0), and a run without ``spatial_psf`` or ``hinode_noise`` (or without a saved
+        configuration) is replayed without PSF and noise, as it was trained.
 
         Args:
             model_cfg: One entry of :meth:`get_model_configs`.
@@ -665,6 +666,7 @@ class AnalysisModelPipeline:
             "device": str(self.device),
             "batch_size": 512,
             "enable_epoch_plots": True,
+            **LEGACY_DEGRADATION,  # without a saved config, assume a pre-Phase-1b run
         }
 
         cfg_path = model_cfg.get("config_path")
@@ -692,7 +694,13 @@ class AnalysisModelPipeline:
                 "temp_continuum_indices": phys_cfg.get("temp_continuum_indices", None),
                 "temp_continuum_wavelength": phys_cfg.get("temp_continuum_wavelength", None),
                 "logtau_values": data_cfg.get("logtau_values", None),
+                # Runs saved before Phase 1b were trained without PSF and noise.
+                "spatial_psf": bool(data_cfg.get("spatial_psf", LEGACY_DEGRADATION["spatial_psf"])),
+                "hinode_noise": float(data_cfg.get("hinode_noise", LEGACY_DEGRADATION["hinode_noise"])),
             })
+            for key in ("psf_path", "psf_sampling_arcsec", "pixel_km"):
+                if key in data_cfg:
+                    cfg_kwargs[key] = data_cfg[key]
 
         cfg = TrainingConfig(**cfg_kwargs)
         cfg.log_dir = self.output_dir

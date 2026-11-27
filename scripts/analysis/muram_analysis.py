@@ -16,7 +16,7 @@ from utils.analysis import (
     compute_metric_vs_tau,
     plot_metric_vs_tau,
 )
-from scripts.base_training import TrainingConfig, load_and_prepare_step
+from scripts.base_training import TrainingConfig, check_normalization_matches_run, load_and_prepare_step
 
 # Horizontal size of one MURaM surface pixel, in Mm (25 km, see TrainingConfig's 480x480 grid
 # spanning 12x12 Mm). Used to put the comparison maps on a physical scale.
@@ -85,6 +85,9 @@ def main(args):
     for name, model in models.items():
         # Rebuild the training configuration for this model so data loading matches training.
         cfg = pipeline.build_runtime_training_config(model_configs[name])
+        # The one set of statistics loaded above must match how this model's inputs are
+        # degraded (old models: no PSF) and the step's velocity convention.
+        check_normalization_matches_run(mhd_normalizer, stokes_normalizer, cfg, [args.step_to_plot])
         model_type = model_configs[name]["experiment_key"]
         print(f"Generating diagnostics for: {model_configs[name]['label']}")
 

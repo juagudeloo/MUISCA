@@ -152,6 +152,20 @@ def test_save_load_round_trip(fitted, tmp_path):
     np.testing.assert_allclose(loaded.transform(atm)["Bz"], norm.transform(atm)["Bz"])
 
 
+def test_saved_statistics_record_the_velocity_convention(fitted, tmp_path):
+    """The MHD JSON stores which velocity its Vz statistics describe; older files load as None.
+
+    Regenerated steps carry v_los = -Vz. Training compares this record with the data's
+    convention (``check_normalizer_velocity_target``), so statistics of +Vz cannot normalize
+    v_los with a mean of the wrong sign.
+    """
+    norm, _ = fitted
+    norm.save(str(tmp_path / "new.json"), velocity_target="v_los")
+    norm.save(str(tmp_path / "old.json"))
+    assert MhdNormalizer(n_tau=N_TAU).load(str(tmp_path / "new.json")).velocity_target == "v_los"
+    assert MhdNormalizer(n_tau=N_TAU).load(str(tmp_path / "old.json")).velocity_target is None
+
+
 # --- StokesNormalizer -------------------------------------------------------------------
 
 def _stokes(seed: int = 0) -> dict:
@@ -223,3 +237,21 @@ def test_stokes_normalizer_handles_q_and_u():
     back = norm.inverse_transform(flat)
     for key in ("Q", "U"):
         np.testing.assert_allclose(back[key], data[key].reshape(-1, 7), rtol=1e-4, atol=1e-7)
+
+
+def test_stokes_statistics_record_the_degradation_of_their_profiles(tmp_path):
+    """The Stokes JSON stores the PSF settings of its profiles; reloading gives back only I and V stats.
+
+    Training refuses statistics of differently degraded profiles
+    (``check_stokes_normalizer_degradation``), so the record must survive the round trip,
+    and files without it (before Phase 1b) must still load with ``degradation`` None.
+    """
+    norm = StokesNormalizer()
+    norm.update(_stokes())
+    norm.finalize()
+    record = {"spatial_psf": True, "psf_path": "hinode-MODEST/PSFs/hinode_psf_bin.0.16.fits"}
+    norm.save(str(tmp_path / "new.json"), degradation=record)
+    norm.save(str(tmp_path / "old.json"))
+    new = StokesNormalizer().load(str(tmp_path / "new.json"))
+    assert new.degradation == record and set(new.final_stats) == {"I", "V"}
+    assert StokesNormalizer().load(str(tmp_path / "old.json")).degradation is None

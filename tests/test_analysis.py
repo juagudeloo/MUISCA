@@ -119,6 +119,29 @@ def test_common_nodes_are_matched_between_spinor_and_the_model():
     assert [(t, i_pred) for t, _, i_pred in matches] == [(-2.0, 10), (-0.8, 22), (0.0, 30)]
 
 
+def test_runtime_config_replays_the_degradation_a_run_was_trained_with(tmp_path):
+    """Analysis rebuilds a run's PSF and noise settings, and treats a run without them as pre-Phase-1b.
+
+    The defaults now blur the profiles with the Hinode PSF. A model trained before that
+    (no ``spatial_psf`` in its experiment_config.json) must be evaluated on unblurred
+    profiles, or every MURaM metric of the old models would change silently.
+    """
+    import json
+    pipe = AnalysisModelPipeline("cpu", tmp_path)
+    base = {"lambda_wfa": 0.0, "lambda_doppler": 0.0, "lambda_temp": 0.0}
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"data_config": {"seed": 1}}))
+    new = tmp_path / "new.json"
+    new.write_text(json.dumps({"data_config": {"spatial_psf": True, "hinode_noise": 1.2e-3,
+                                               "psf_path": "hinode-MODEST/PSFs/x.fits"}}))
+    cfg_old = pipe.build_runtime_training_config({**base, "config_path": str(old)})
+    cfg_none = pipe.build_runtime_training_config({**base, "config_path": None})
+    cfg_new = pipe.build_runtime_training_config({**base, "config_path": str(new)})
+    assert (cfg_old.spatial_psf, cfg_old.hinode_noise) == (False, 0.0)
+    assert (cfg_none.spatial_psf, cfg_none.hinode_noise) == (False, 0.0)
+    assert (cfg_new.spatial_psf, cfg_new.hinode_noise, cfg_new.psf_path) == (True, 1.2e-3, "hinode-MODEST/PSFs/x.fits")
+
+
 # --- Targets for the agreed changes ------------------------------------------------------
 
 @pytest.mark.xfail(strict=True, reason="Agreed in the reframe plan (Phase 1c): checkpoints with I, Q, U, V inputs "

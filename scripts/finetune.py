@@ -53,7 +53,7 @@ from mlflow.types import Schema, TensorSpec
 
 from utils.hinode_wavelengths import N_WL_OBSERVED
 from utils.mlflow_utils import default_tracking_uri, finite_metrics, flatten_params
-from scripts.base_training import set_global_seed
+from scripts.base_training import LEGACY_DEGRADATION, check_normalization_matches_run, set_global_seed
 from scripts.experiments.ablation_study import compute_tau_averaged_metrics
 
 
@@ -274,6 +274,13 @@ def load_and_adapt_config(
             except Exception:
                 pass
 
+    # A base run saved before Phase 1b has no PSF or noise settings and was trained without
+    # them; keep it that way instead of picking up today's defaults.
+    restored = set(applied) | {k for k in saved_config if hasattr(config, k)}
+    for key, value in LEGACY_DEGRADATION.items():
+        if key not in restored:
+            setattr(config, key, value)
+
     # ENFORCE Bz balancing (mandatory for fine-tuning, per magnetic_field_balancing_and_finetuning.md)
     # Override any base-training settings to ensure fine-tuning uses balanced data.
     config.apply_bz_bin_balance = True
@@ -389,6 +396,8 @@ def run_fine_tune_single_variation(
     mhd_normalizer.load(filepath=mhd_norm_path)
     stokes_normalizer = StokesNormalizer()
     stokes_normalizer.load(filepath=stokes_norm_path)
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
+                                    range(config.min_step, config.max_step + 1, config.step_size))
     print(f"✓ Normalizers loaded from {mhd_norm_path.parent}")
 
     # The normalizer and the checkpoint must agree on the optical-depth grid, or every

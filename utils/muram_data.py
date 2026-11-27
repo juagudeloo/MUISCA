@@ -914,6 +914,80 @@ logtau = mhd.logtau  # Optical depth map
 # ============================================================================
 # StokesData class
 # ============================================================================
+# Kilometres on the Sun per arcsecond seen from 1 AU (Hinode orbits the Earth; the yearly
+# change of the Sun-Earth distance moves this by about 1.7 %, which is ignored).
+KM_PER_ARCSEC = 149_597_870.7 * np.pi / 648_000.0
+
+
+def resample_psf(psf: np.ndarray, sampling_in_arcsec: float, pixel_out_arcsec: float) -> np.ndarray:
+    """Resample a centred 2-D PSF to another pixel size, keeping it centred and normalized.
+
+    The PSF is interpolated (bicubic) at offsets that are whole multiples of
+    ``pixel_out_arcsec`` from the centre, out to the edge of the input; negative
+    interpolation overshoots are set to 0 and the result is renormalized to sum 1. The
+    output has an odd size, with its centre at the middle pixel.
+
+    Args:
+        psf: ``(n, n)`` PSF with an odd ``n`` and its peak at the middle pixel.
+        sampling_in_arcsec: Pixel size of ``psf`` in arcsec (0.16 for the Hinode PSF file).
+        pixel_out_arcsec: Target pixel size in arcsec (25 km is about 0.0345 arcsec).
+
+    Returns:
+        ``(2 m + 1, 2 m + 1)`` PSF on the target pixels, summing to 1.
+
+    Raises:
+        ValueError: If ``psf`` is not square with an odd size.
+
+    Examples:
+        >>> y, x = np.mgrid[-5:6, -5:6]
+        >>> g = np.exp(-(x ** 2 + y ** 2) / 4.0)
+        >>> k = resample_psf(g / g.sum(), 0.16, 0.08)
+        >>> k.shape, round(float(k.sum()), 12), tuple(int(i) for i in np.unravel_index(k.argmax(), k.shape))
+        ((21, 21), 1.0, (10, 10))
+    """
+    psf = np.asarray(psf, dtype=np.float64)
+    if psf.ndim != 2 or psf.shape[0] != psf.shape[1] or psf.shape[0] % 2 == 0:
+        raise ValueError(f"psf must be square with an odd size, got {psf.shape}")
+    c = psf.shape[0] // 2
+    offsets_in = (np.arange(psf.shape[0]) - c) * float(sampling_in_arcsec)
+    m = int(np.floor(offsets_in[-1] / float(pixel_out_arcsec) + 1e-9))
+    offsets_out = np.arange(-m, m + 1) * float(pixel_out_arcsec)
+    interp = RegularGridInterpolator((offsets_in, offsets_in), psf, method="cubic",
+                                     bounds_error=False, fill_value=0.0)
+    yy, xx = np.meshgrid(offsets_out, offsets_out, indexing="ij")
+    out = np.clip(interp(np.stack([yy, xx], axis=-1)), 0.0, None)
+    return out / out.sum()
+
+
+def load_psf_on_muram_grid(psf_path: Union[str, Path], sampling_arcsec: float = 0.16,
+                           pixel_km: float = 25.0) -> np.ndarray:
+    """Read the Hinode PSF (FITS) and resample it to the MURaM pixel size.
+
+    The 0.16 arcsec file is used rather than the 0.08 arcsec one: it extends to 9.8 arcsec
+    and keeps the far wings (about 14 % of the energy lies beyond 0.8 arcsec), which the
+    0.08 arcsec file cuts at 4.9 arcsec. On MURaM step 198 the 0.16 arcsec PSF lowers the
+    continuum contrast from 14.5 % to 8.4 % (the 0.08 arcsec one only to 10.8 %); the raw
+    MODEST quiet Sun has 6.9 %. Summing two 0.16 arcsec pixels (the 0.32 arcsec fast map)
+    would lower it by a further 0.2 points only, so it is not modelled.
+
+    Args:
+        psf_path: FITS file with a centred ``(n, n)`` PSF.
+        sampling_arcsec: Pixel size of the file in arcsec.
+        pixel_km: MURaM horizontal cell size in km.
+
+    Returns:
+        The PSF on the MURaM grid, summing to 1 (``(279, 279)`` for the Hinode file and 25 km).
+
+    Examples:
+        >>> load_psf_on_muram_grid("data/hinode-MODEST/PSFs/hinode_psf_bin.0.16.fits").shape  # doctest: +SKIP
+        (279, 279)
+    """
+    from astropy.io import fits
+    with fits.open(psf_path) as hdul:
+        psf = np.asarray(hdul[0].data, dtype=np.float64)
+    return resample_psf(psf / psf.sum(), sampling_arcsec, pixel_km / KM_PER_ARCSEC)
+
+
 class StokesData:
     """Synthetic Stokes profiles of one MURaM step and their degradation to Hinode/SP.
 
@@ -1252,6 +1326,75 @@ class StokesData:
             print(f"  {key}: resampled to shape {stokes_interp.shape}")
         self.wl = self.hinode_wl
         self.nwl = NAXIS1
+        print("  Done.")
+        return self.data
+
+    def apply_spatial_psf(self, psf: np.ndarray, chunk: int = 16) -> Dict[str, np.ndarray]:
+        """Convolve every wavelength map of every Stokes parameter with a spatial PSF.
+
+        The convolution is periodic (FFT), like the MURaM box, and the PSF sums to 1, so the
+        mean profile of the frame is exactly conserved while the spatial contrast drops.
+        2-D maps of the frame's size in ``self.data``, and ``self.mean_continuum``, are
+        blurred the same way so they stay consistent with the profiles. The spatial
+        convolution commutes with the LSF convolution and the resampling along wavelength
+        (all linear, on different axes), so it can be applied before or after them.
+
+        Args:
+            psf: ``(n0, n1)`` PSF on the data's pixel size, odd sizes, centred, summing to 1
+                (see :func:`load_psf_on_muram_grid`). It must not be larger than the frame.
+            chunk: Number of wavelengths transformed at once (memory only).
+
+        Returns:
+            ``self.data`` with the blurred arrays (same shapes and dtypes).
+
+        Raises:
+            ValueError: If no data are loaded, or if the PSF has an even size, is larger than
+                the frame, or does not sum to 1.
+
+        Examples:
+            >>> import contextlib, io
+            >>> s = StokesData(".", 110)
+            >>> s.data = {"I": np.ones((8, 8, 2)), "V": np.zeros((8, 8, 2))}
+            >>> s.data["V"][4, 4] = 1.0
+            >>> psf = np.zeros((3, 3)); psf[1, :] = [0.25, 0.5, 0.25]
+            >>> with contextlib.redirect_stdout(io.StringIO()):
+            ...     out = s.apply_spatial_psf(psf)
+            >>> out["V"][4, 3:6, 0].tolist(), float(out["V"].sum()), bool(np.allclose(out["I"], 1.0))
+            ([0.25, 0.5, 0.25], 2.0, True)
+        """
+        from scipy.fft import irfft2, rfft2
+        if not self.data:
+            raise ValueError("Stokes data not loaded. Call load_stokes() first.")
+        psf = np.asarray(psf, dtype=np.float64)
+        if psf.ndim != 2 or psf.shape[0] % 2 == 0 or psf.shape[1] % 2 == 0:
+            raise ValueError(f"psf must be 2-D with odd sizes (centred), got {psf.shape}")
+        if not np.isclose(psf.sum(), 1.0, rtol=0.0, atol=1e-6):
+            raise ValueError(f"psf must sum to 1 (got {psf.sum():.8f}), or the mean profile changes")
+        nx, ny = next(iter(self.data.values())).shape[:2]
+        if psf.shape[0] > nx or psf.shape[1] > ny:
+            raise ValueError(f"psf {psf.shape} is larger than the frame ({nx}, {ny})")
+        kernel = np.zeros((nx, ny))
+        kernel[:psf.shape[0], :psf.shape[1]] = psf
+        kernel = np.roll(kernel, (-(psf.shape[0] // 2), -(psf.shape[1] // 2)), axis=(0, 1))
+        otf = rfft2(kernel)
+
+        def _blur(arr: np.ndarray) -> np.ndarray:
+            if arr.ndim == 2:
+                return irfft2(rfft2(arr) * otf, s=(nx, ny)).astype(arr.dtype, copy=False)
+            out = np.empty(arr.shape, dtype=arr.dtype)
+            for i in range(0, arr.shape[2], chunk):
+                block = rfft2(arr[:, :, i:i + chunk], axes=(0, 1)) * otf[:, :, None]
+                out[:, :, i:i + chunk] = irfft2(block, s=(nx, ny), axes=(0, 1))
+            return out
+
+        print(f"Applying the spatial PSF ({psf.shape[0]} x {psf.shape[1]} pixels, periodic)...")
+        for key, arr in self.data.items():
+            arr = np.asarray(arr)
+            if arr.ndim in (2, 3) and arr.shape[:2] == (nx, ny):
+                self.data[key] = _blur(arr)
+                print(f"  {key}: blurred")
+        if self.mean_continuum is not None:
+            self.mean_continuum = _blur(np.asarray(self.mean_continuum))
         print("  Done.")
         return self.data
 

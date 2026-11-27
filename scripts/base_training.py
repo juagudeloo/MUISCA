@@ -29,6 +29,7 @@ import os
 import argparse
 import random
 import json
+import math
 import csv
 from pathlib import Path
 from dataclasses import dataclass, asdict, fields
@@ -57,6 +58,7 @@ from utils.muram_data import (
     build_balanced_region_indices,
     build_bz_balance_bin_edges,
     build_bz_strength_balanced_indices,
+    load_psf_on_muram_grid,
 )
 from utils.modest_data import ModestData
 from utils.normalizer import MhdNormalizer, StokesNormalizer
@@ -93,6 +95,7 @@ class TrainingConfig:
     stokes_normalizer_path: str = "normalization_stats/stokes_normalization.json"
     kappa_path: str = "csv/kappa.0.dat"
     lsf_path: str = "hinode-MODEST/PSFs/hinode_sp.spline.psf"
+    psf_path: str = "hinode-MODEST/PSFs/hinode_psf_bin.0.16.fits"
     
     # Simulation parameters
     nx: int = 480
@@ -118,6 +121,20 @@ class TrainingConfig:
     stokes_ic_mode: str = "fixed_global"  # 'per_step' or 'fixed_global'
     stokes_fixed_ic: float | None = None
     stokes_mult_factor: float = 1.0
+
+    # Observational degradation of the training profiles (reframe Phase 1b). The spatial
+    # PSF is part of the cached profiles; the noise is drawn anew for every training batch
+    # (never cached, so the model does not fit one realization). Validation and analysis
+    # inputs are noiseless. Runs saved before these settings existed are replayed with
+    # LEGACY_DEGRADATION (no PSF, no noise).
+    spatial_psf: bool = True
+    psf_sampling_arcsec: float = 0.16   # pixel size of psf_path
+    pixel_km: float = 25.0              # MURaM horizontal cell size
+    # Gaussian noise sigma in units of the HSRA continuum, the same for every Stokes
+    # parameter. 1.2e-3 is the noise measured in the raw MODEST Q, U and V (1.16e-3 to
+    # 1.27e-3 of the quiet-Sun continuum, first 8 wavelengths); MURaM's mean continuum is
+    # 0.97 of the HSRA one, a 3 % difference below that measurement's spread.
+    hinode_noise: float = 1.2e-3
 
     # Training data source: 'nicole_tau500' (NICOLE-synthesized on tau_500,
     # stokes_{step}_nicole_tau500.npy) or 'muram_legacy' (Rosseland-tau grid,
@@ -255,6 +272,8 @@ class TrainingConfig:
             self.scales = [1, 2, 3]
         if self.stokes_cont_indices is None:
             self.stokes_cont_indices = [0, 1, 2, 3]
+        if not (math.isfinite(self.hinode_noise) and self.hinode_noise >= 0):
+            raise ValueError(f"hinode_noise must be a finite number >= 0, got {self.hinode_noise}")
 
         valid_data_sources = {"muram_legacy", "nicole_tau500"}
         if self.data_source not in valid_data_sources:
@@ -441,7 +460,8 @@ class TrainingConfig:
                 of fields).
 
         Returns:
-            A validated :class:`TrainingConfig`.
+            A validated :class:`TrainingConfig`. Missing ``spatial_psf`` and ``hinode_noise``
+            are taken from :data:`LEGACY_DEGRADATION` (the file predates them).
 
         Examples:
             >>> cfg = TrainingConfig.load(Path("output/experiments/exp/checkpoints/config.json"))  # doctest: +SKIP
@@ -450,6 +470,10 @@ class TrainingConfig:
             config_dict = json.load(f)
         valid_keys = {field.name for field in fields(cls)}
         filtered_config = {key: value for key, value in config_dict.items() if key in valid_keys}
+        # A configuration saved before Phase 1b was trained without PSF and noise; resuming
+        # it must not pick up today's defaults.
+        for key, value in LEGACY_DEGRADATION.items():
+            filtered_config.setdefault(key, value)
         return cls(**filtered_config)
 
     def get_logtau_values(self) -> np.ndarray:
@@ -625,6 +649,232 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# Degradation of runs saved before Phase 1b: their experiment_config.json has no
+# spatial_psf or hinode_noise, and they were trained on noiseless, unblurred profiles.
+LEGACY_DEGRADATION = {"spatial_psf": False, "hinode_noise": 0.0}
+
+# Order of the Stokes channels in the model input (MuramStepDataset stacks I, then V).
+# Phase 1c replaces this with TrainingConfig.stokes_channels.
+MODEL_INPUT_CHANNELS = ("I", "V")
+
+
+def degrade_training_stokes(stokes: StokesData, config: TrainingConfig) -> StokesData:
+    """Turn synthesized profiles into what Hinode/SP would record, as the training sees them.
+
+    Hinode LSF along wavelength, resampling to the 112 Hinode wavelengths, then (with
+    ``config.spatial_psf``) the Hinode spatial PSF on the MURaM grid, and finally the
+    circular-polarization map. Noise is not added here: it is drawn per training batch
+    (:func:`add_input_noise`). Every path that builds training profiles (training, the
+    normalization statistics, analysis on MURaM) goes through this function, so they
+    cannot drift apart.
+
+    Args:
+        stokes: Profiles from :func:`load_source_arrays` (fine synthesis grid).
+        config: The training configuration (LSF and PSF files, PSF switch and sampling).
+
+    Returns:
+        ``stokes``, modified in place.
+
+    Examples:
+        >>> stokes, mhd = load_source_arrays(110, TrainingConfig())  # doctest: +SKIP
+        >>> degrade_training_stokes(stokes, TrainingConfig()).data["I"].shape  # doctest: +SKIP
+        (480, 480, 112)
+    """
+    stokes.load_hinode_lsf(config.data_path / config.lsf_path)
+    stokes.apply_spectral_convolution()
+    stokes.resample_to_hinode()
+    if config.spatial_psf:
+        stokes.apply_spatial_psf(load_psf_on_muram_grid(
+            config.data_path / config.psf_path, config.psf_sampling_arcsec, config.pixel_km))
+    stokes.spectropolarimetry()
+    return stokes
+
+
+def input_noise_scale(config: TrainingConfig, stokes_normalizer: StokesNormalizer | None,
+                      channels: tuple[str, ...] = MODEL_INPUT_CHANNELS,
+                      epsilon: float = 1e-8) -> torch.Tensor | None:
+    """Noise sigma of each input channel in normalized units, or ``None`` without noise.
+
+    The inputs are ``(S - mean) / (std + epsilon)`` per Stokes parameter, so a physical
+    sigma ``config.hinode_noise`` (continuum units: HSRA for ``nicole_tau500``, the step's
+    continuum for ``muram_legacy``) becomes ``hinode_noise * stokes_mult_factor /
+    (std + epsilon)`` for each channel (the legacy inputs are scaled by that factor).
+
+    Args:
+        config: The training configuration.
+        stokes_normalizer: The fitted Stokes normalizer (its ``std`` per parameter).
+        channels: The input channels, in model order.
+        epsilon: The normalizer's epsilon.
+
+    Returns:
+        ``(n_channels,)`` float32 tensor, or ``None`` when ``config.hinode_noise`` is 0.
+
+    Raises:
+        ValueError: If noise is requested without a normalizer.
+
+    Examples:
+        >>> import tempfile, types
+        >>> tmp = tempfile.mkdtemp()
+        >>> norm = types.SimpleNamespace(final_stats={"I": {"std": 0.1}, "V": {"std": 0.004}})
+        >>> cfg = TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, hinode_noise=1.2e-3)
+        >>> input_noise_scale(cfg, norm, epsilon=0.0).tolist()
+        [0.012000000104308128, 0.30000001192092896]
+    """
+    if config.hinode_noise <= 0:
+        return None
+    if stokes_normalizer is None:
+        raise ValueError("hinode_noise > 0 needs the Stokes normalizer to scale the noise")
+    stats = stokes_normalizer.final_stats
+    sigma = config.hinode_noise * float(config.stokes_mult_factor)
+    return torch.tensor([sigma / (float(stats[c]["std"]) + epsilon) for c in channels], dtype=torch.float32)
+
+
+def add_input_noise(stokes_batch: torch.Tensor, noise_scale: torch.Tensor | None) -> torch.Tensor:
+    """Add a fresh white Gaussian noise realization to a batch of normalized inputs.
+
+    Args:
+        stokes_batch: ``(batch, n_channels, n_wavelengths)`` normalized inputs.
+        noise_scale: ``(n_channels,)`` sigma per channel in normalized units
+            (:func:`input_noise_scale`), or ``None`` to return the batch unchanged.
+
+    Returns:
+        A new tensor (the input is not modified), or ``stokes_batch`` itself without noise.
+
+    Raises:
+        ValueError: If the number of channels differs from ``noise_scale``.
+
+    Examples:
+        >>> _ = torch.manual_seed(0)
+        >>> x = torch.zeros(4000, 2, 112)
+        >>> y = add_input_noise(x, torch.tensor([0.01, 0.3]))
+        >>> [round(float(y[:, c].std()), 2) for c in range(2)], bool((x == 0).all())
+        ([0.01, 0.3], True)
+    """
+    if noise_scale is None:
+        return stokes_batch
+    if noise_scale.numel() != stokes_batch.shape[1]:
+        raise ValueError(f"noise_scale has {noise_scale.numel()} channels, the batch {stokes_batch.shape[1]}")
+    scale = noise_scale.to(device=stokes_batch.device, dtype=stokes_batch.dtype).view(1, -1, 1)
+    return stokes_batch + torch.randn_like(stokes_batch) * scale
+
+
+def file_content_hash(path: Path) -> str | None:
+    """SHA-256 of a file's bytes, or ``None`` if it does not exist.
+
+    Args:
+        path: Any file.
+
+    Returns:
+        Hex digest, or ``None``.
+
+    Examples:
+        >>> file_content_hash(Path("/nonexistent")) is None
+        True
+    """
+    import hashlib
+    path = Path(path)
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def check_normalizer_velocity_target(mhd_normalizer: MhdNormalizer, convention: str | None) -> None:
+    """Refuse MHD statistics whose velocity convention differs from the data's.
+
+    Regenerated steps carry ``v_los`` = -Vz, so statistics computed on old files (mean of
+    +Vz) would shift every normalized velocity by twice the mean. Statistics saved before
+    the convention was recorded (``velocity_target`` None) are accepted only for old data.
+
+    Args:
+        mhd_normalizer: The loaded MHD normalizer.
+        convention: What :func:`require_one_velocity_convention` returned for the run's steps.
+
+    Raises:
+        ValueError: If the statistics describe another velocity than the data.
+
+    Examples:
+        >>> norm = MhdNormalizer(); norm.velocity_target = None
+        >>> check_normalizer_velocity_target(norm, "Vz")   # old stats, old data: fine
+        >>> check_normalizer_velocity_target(norm, "v_los")
+        Traceback (most recent call last):
+        ...
+        ValueError: The MHD normalization statistics describe Vz (unrecorded, older than Phase 1b) but the steps carry v_los; recompute them with scripts/compute_normalization_stats.py.
+    """
+    if convention is None:
+        return
+    stored = getattr(mhd_normalizer, "velocity_target", None)
+    effective = stored if stored is not None else "Vz"
+    if effective != convention:
+        label = stored if stored is not None else "Vz (unrecorded, older than Phase 1b)"
+        raise ValueError(
+            f"The MHD normalization statistics describe {label} but the steps carry {convention}; "
+            "recompute them with scripts/compute_normalization_stats.py."
+        )
+
+
+def check_stokes_normalizer_degradation(stokes_normalizer: StokesNormalizer, config: TrainingConfig) -> None:
+    """Refuse Stokes statistics computed on profiles degraded differently from the run's.
+
+    The PSF lowers the spatial spread of every Stokes parameter (the V std most), so
+    statistics of unblurred profiles would mis-scale blurred inputs and the noise sigma
+    (:func:`input_noise_scale`), and the other way round. Statistics written before Phase 1b
+    (no record) describe unblurred profiles.
+
+    Args:
+        stokes_normalizer: The loaded Stokes normalizer.
+        config: The run's configuration.
+
+    Raises:
+        ValueError: If the recorded degradation differs from the configuration's.
+
+    Examples:
+        >>> import tempfile
+        >>> tmp = tempfile.mkdtemp()
+        >>> norm = StokesNormalizer(); norm.degradation = None
+        >>> check_stokes_normalizer_degradation(norm, TrainingConfig(checkpoint_dir=tmp, log_dir=tmp, spatial_psf=False))
+        >>> check_stokes_normalizer_degradation(norm, TrainingConfig(checkpoint_dir=tmp, log_dir=tmp))
+        Traceback (most recent call last):
+        ...
+        ValueError: The Stokes normalization statistics were computed without the spatial PSF, but this run uses it; recompute them with scripts/compute_normalization_stats.py (--spatial-psf 1).
+    """
+    stored = getattr(stokes_normalizer, "degradation", None) or {"spatial_psf": False}
+    expected = _degradation_signature(config)
+    if stored != expected:
+        have = "with" if stored.get("spatial_psf") else "without"
+        want = "uses" if expected.get("spatial_psf") else "does not use"
+        detail = "" if stored.get("spatial_psf") != expected.get("spatial_psf") else f" (recorded {stored}, run {expected})"
+        raise ValueError(
+            f"The Stokes normalization statistics were computed {have} the spatial PSF, but this run "
+            f"{want} it{detail}; recompute them with scripts/compute_normalization_stats.py "
+            f"(--spatial-psf {int(bool(expected.get('spatial_psf')))})."
+        )
+
+
+def check_normalization_matches_run(mhd_normalizer: MhdNormalizer, stokes_normalizer: StokesNormalizer,
+                                    config: TrainingConfig, steps) -> None:
+    """Every guard on the loaded statistics, for any entry point that trains or evaluates.
+
+    The steps must share one velocity convention, the MHD statistics must describe it, and
+    the Stokes statistics must come from profiles degraded like this run's.
+
+    Args:
+        mhd_normalizer: The loaded MHD normalizer.
+        stokes_normalizer: The loaded Stokes normalizer.
+        config: The run's configuration.
+        steps: All steps the run reads (training, validation and test).
+
+    Raises:
+        ValueError: From :func:`require_one_velocity_convention`,
+            :func:`check_normalizer_velocity_target` or
+            :func:`check_stokes_normalizer_degradation`.
+
+    Examples:
+        >>> check_normalization_matches_run(mn, sn, cfg, [110, 120, 130, 140, 150, 198])  # doctest: +SKIP
+    """
+    check_normalizer_velocity_target(mhd_normalizer, require_one_velocity_convention(list(steps), config))
+    check_stokes_normalizer_degradation(stokes_normalizer, config)
+
+
 def require_one_velocity_convention(steps, config: TrainingConfig) -> str | None:
     """Refuse a set of steps whose velocity targets follow different sign conventions.
 
@@ -720,8 +970,8 @@ def build_cache_config_signature(config: TrainingConfig, step: int | None = None
         files' fingerprint.
 
     Note:
-        ``lande_factor`` and ``lsf_path`` change the cached content but are missing (strict
-        xfails in ``tests/test_cache_signatures.py``; reframe Phase 1b).
+        ``hinode_noise`` is not part of it: the noise is drawn per training batch and never
+        cached.
 
     Examples:
         >>> import tempfile
@@ -745,8 +995,30 @@ def build_cache_config_signature(config: TrainingConfig, step: int | None = None
         'stokes_ic_mode': str(config.stokes_ic_mode),
         'stokes_fixed_ic': None if config.stokes_fixed_ic is None else float(config.stokes_fixed_ic),
         'stokes_mult_factor': float(config.stokes_mult_factor),
+        'lande_factor': float(config.lande_factor),
+        'lsf_path': str(config.lsf_path),
+        'lsf_sha256': file_content_hash(Path(config.data_path) / config.lsf_path),
+        **_degradation_signature(config),
         **_temperature_approx_signature(config),
         **({} if step is None else {'source_fingerprint': source_data_fingerprint(step, config)}),
+    }
+
+
+def _degradation_signature(config: TrainingConfig) -> dict:
+    """Spatial-PSF settings that change the cached profiles (and the maps derived from them).
+
+    The PSF file is identified by its SHA-256 as well as its path, so a file replaced in
+    place invalidates the caches. The same dict is stored with the Stokes normalization
+    statistics (:func:`check_stokes_normalizer_degradation`).
+    """
+    if not config.spatial_psf:
+        return {'spatial_psf': False}
+    return {
+        'spatial_psf': True,
+        'psf_path': str(config.psf_path),
+        'psf_sha256': file_content_hash(Path(config.data_path) / config.psf_path),
+        'psf_sampling_arcsec': float(config.psf_sampling_arcsec),
+        'pixel_km': float(config.pixel_km),
     }
 
 
@@ -777,9 +1049,10 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
         continuum normalization and the black-body settings.
 
     Note:
-        The balanced cache stores normalized tensors and the WFA and Doppler maps, but the
-        normalization statistics, ``wl_range``, ``central_wavelength`` and ``lande_factor``
-        are missing (strict xfails; reframe Phase 1b).
+        The balanced cache stores normalized tensors built from the per-step data, so the
+        whole per-step signature (without the per-step source fingerprint, which is covered
+        by ``source_fingerprints``) and the SHA-256 of both normalization JSON files are
+        part of it. Recomputing the statistics therefore rebuilds the cache.
 
     Examples:
         >>> import tempfile
@@ -789,9 +1062,15 @@ def build_balanced_cache_signature(config: TrainingConfig, train_steps: list[int
         [110, 120]
     """
     return {
-        "version": 1,
+        "version": 2,
         "data_source": str(config.data_source),
         "steps": [int(s) for s in sorted(train_steps)],
+        "per_step_settings": {k: list(v) if isinstance(v, tuple) else v
+                              for k, v in build_cache_config_signature(config).items()},
+        "normalizer_hashes": {
+            "mhd": file_content_hash(Path(config.data_path) / config.mhd_normalizer_path),
+            "stokes": file_content_hash(Path(config.data_path) / config.stokes_normalizer_path),
+        },
         "apply_region_mask": bool(config.apply_region_mask),
         "apply_bz_bin_balance": bool(config.apply_bz_bin_balance),
         "bz_balance_scope": str(config.bz_balance_scope),
@@ -1195,8 +1474,9 @@ def load_source_arrays(
     Both sources return the same contract: a :class:`StokesData` whose ``.data`` holds I, Q,
     U, V on the fine synthesis grid (before LSF and resampling) and whose ``.mean_continuum``
     is set, and ``{"T", "Vz", "Bz"}`` Quantities (K, km/s, G) of shape
-    ``(nx, ny, n_logtau)`` on :meth:`TrainingConfig.get_logtau_values`. The LSF, resampling
-    and polarization map are applied by the caller.
+    ``(nx, ny, n_logtau)`` on :meth:`TrainingConfig.get_logtau_values`. The LSF, resampling,
+    spatial PSF and polarization map are applied by the caller
+    (:func:`degrade_training_stokes`).
 
     * ``nicole_tau500``: ``stokes_<step>_nicole_tau500.npy`` (already normalized to the HSRA
       continuum) and ``atmos_<step>_tau500.npz``; the file's log tau grid must equal the
@@ -1350,7 +1630,8 @@ def load_and_prepare_step(
 
     If the per-step cache has the step for the current signature, the arrays and
     approximations come from it. Otherwise the step is read (:func:`load_source_arrays`),
-    convolved with the Hinode LSF, resampled to the 112 Hinode wavelengths, and the WFA
+    degraded like a Hinode observation (:func:`degrade_training_stokes`: LSF, 112 Hinode
+    wavelengths and, with ``config.spatial_psf``, the spatial PSF), and the WFA
     (G), Doppler (km/s) and black-body (K) maps are computed and cached. Then the pixels are
     optionally balanced (region masks, per-step or global Bz balancing) and normalized into
     a :class:`MuramStepDataset`.
@@ -1534,10 +1815,7 @@ def load_and_prepare_step(
         return None
     stokes, mhd_od_data = result
 
-    stokes.load_hinode_lsf(config.data_path / config.lsf_path)
-    stokes.apply_spectral_convolution()
-    stokes.resample_to_hinode()
-    stokes.spectropolarimetry()
+    degrade_training_stokes(stokes, config)
 
     # Keep derived 2D maps in stokes payload for cache/users that need region masking.
     stokes.data["mean_continuum"] = np.asarray(stokes.mean_continuum, dtype=np.float32)
@@ -1882,11 +2160,14 @@ def train_one_step(
     step_num: int,
     logger: MetricsLogger | None,
     enable_physics: bool = True,
+    noise_scale: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """One full pass over one step's pixels: forward, loss, backward, clip, update, per batch.
 
     The physics context (normalizer, nodes and this step's approximation maps) is set once.
-    Gradients are clipped to ``gradient_clip`` (L2 norm) when it is positive.
+    Gradients are clipped to ``gradient_clip`` (L2 norm) when it is positive. With
+    ``noise_scale``, every batch gets a fresh noise realization before the forward pass
+    (the physics approximations stay those of the noiseless profiles).
 
     Args:
         model: The model.
@@ -1899,6 +2180,8 @@ def train_one_step(
         step_num: Simulation step (for logging).
         logger: Logger, or ``None``.
         enable_physics: Whether the physics gate is open.
+        noise_scale: Noise sigma per input channel in normalized units
+            (:func:`input_noise_scale`), or ``None`` for noiseless inputs.
 
     Returns:
         The losses averaged over the batches; the physics entries are NaN when the gate is
@@ -1932,7 +2215,7 @@ def train_one_step(
     
     for batch_idx, (stokes_batch, mhd_batch, spatial_idx_batch) in enumerate(dataloader):
         # Move to device
-        stokes_batch = stokes_batch.to(config.device)
+        stokes_batch = add_input_noise(stokes_batch.to(config.device), noise_scale)
         mhd_batch = mhd_batch.to(config.device)
         spatial_idx_batch = spatial_idx_batch.to(config.device)
         
@@ -2197,14 +2480,15 @@ def train_epoch(
     Each step's samples come from the preloaded balanced cache, the balanced cache on disk,
     or :func:`load_and_prepare_step`, in that order of preference, and are shuffled into
     batches of ``config.batch_size``. Batches of different steps are never mixed, so the last
-    step of an epoch is the most recent the model has seen.
+    step of an epoch is the most recent the model has seen. With ``config.hinode_noise``,
+    the inputs of every batch get a fresh noise realization (:func:`add_input_noise`).
 
     Args:
         model: The model.
         train_steps: Training steps.
         config: The training configuration.
         mhd_normalizer: Fitted MHD normalizer.
-        stokes_normalizer: Fitted Stokes normalizer.
+        stokes_normalizer: Fitted Stokes normalizer (also scales the noise).
         optimizer: Optimizer.
         epoch: Epoch index (0-based).
         logger: Logger, or ``None``.
@@ -2223,12 +2507,14 @@ def train_epoch(
 
     Raises:
         RuntimeError: If no step could be used.
+        ValueError: If ``config.hinode_noise`` > 0 without a Stokes normalizer.
 
     Examples:
         >>> metrics = train_epoch(model, [110, 120, 130, 140], cfg, mn, sn, opt, epoch=0)  # doctest: +SKIP
     """
     model.train()
-    
+    noise_scale = input_noise_scale(config, stokes_normalizer)
+
     # Shuffle and limit steps
     steps_to_use = train_steps.copy()
     random.shuffle(steps_to_use)
@@ -2309,6 +2595,7 @@ def train_epoch(
                 step_num=step,
                 logger=logger,
                 enable_physics=enable_physics,
+                noise_scale=noise_scale,
             )
             
             # Accumulate step metrics (including temperature)
@@ -3385,6 +3672,8 @@ def train_pinn_model(config: TrainingConfig):
     mhd_normalizer.load(filepath=config.data_path / config.mhd_normalizer_path)
     stokes_normalizer = StokesNormalizer()
     stokes_normalizer.load(filepath=config.data_path / config.stokes_normalizer_path)
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
+                                    range(config.min_step, config.max_step + 1, config.step_size))
     print("  ✓ Normalizers loaded")
     
     # Initialize model (including temperature parameters)

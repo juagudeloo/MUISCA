@@ -12,7 +12,8 @@ from tqdm import tqdm
 from utils.muram_data import StokesData
 from utils.normalizer import MhdNormalizer, StokesNormalizer
 from utils.cache_manage import MuramDataCache
-from scripts.base_training import (TrainingConfig, build_cache_config_signature, load_source_arrays,
+from scripts.base_training import (TrainingConfig, _degradation_signature, build_cache_config_signature,
+                                   degrade_training_stokes, load_source_arrays,
                                    require_one_velocity_convention)
 
 
@@ -90,6 +91,7 @@ def compute_normalization_stats(
     output_dir: str | Path | None = None,
     kappa_path: str | Path | None = None,
     lsf_path: str | Path | None = None,
+    spatial_psf: bool = True,
 ):
     """Accumulate the MHD and Stokes normalization statistics over the training steps and save them.
 
@@ -125,6 +127,8 @@ def compute_normalization_stats(
         output_dir: Where to write the JSON files (default: the data source's folder).
         kappa_path: Rosseland opacity table (legacy source).
         lsf_path: Hinode LSF file.
+        spatial_psf: Blur the profiles with the Hinode spatial PSF, as training does
+            (``TrainingConfig.spatial_psf``). Noise is never included in the statistics.
 
     Examples:
         Statistics of the four training steps::
@@ -312,12 +316,14 @@ def compute_normalization_stats(
         stokes_ic_mode=(stokes_ic_mode if data_source == "muram_legacy" else "per_step"),
         stokes_fixed_ic=(None if fixed_ic_value is None else float(fixed_ic_value)),
         data_source=data_source,
+        spatial_psf=bool(spatial_psf),
         # avoid side effects unrelated to this script
         checkpoint_dir=str(output_dir / "_tmp_checkpoints"),
         log_dir=str(output_dir / "_tmp_logs"),
     )
     # Statistics over steps with opposite velocity signs would have a meaningless Vz mean.
-    require_one_velocity_convention(available_steps, shared_cfg)
+    # The convention is stored in the JSON so training can refuse mismatched statistics.
+    velocity_target = require_one_velocity_convention(available_steps, shared_cfg)
 
     # Initialize cache (optional)
     cache = None
@@ -348,11 +354,7 @@ def compute_normalization_stats(
                 print(f"\n[Step {step}] Processing raw {data_source} data for stats")
 
                 stokes, mhd_od_data = load_source_arrays(step=step, config=shared_cfg)
-
-                stokes.load_hinode_lsf(shared_cfg.data_path / shared_cfg.lsf_path)
-                stokes.apply_spectral_convolution()
-                stokes.resample_to_hinode()
-                stokes.spectropolarimetry()
+                degrade_training_stokes(stokes, shared_cfg)
 
                 stokes.data["mean_continuum"] = np.asarray(stokes.mean_continuum, dtype=np.float32)
                 stokes.data["circular_polarization"] = np.asarray(stokes.circular_polarization, dtype=np.float32)
@@ -415,8 +417,9 @@ def compute_normalization_stats(
     stokes_stats = stokes_normalizer.finalize()
     
     # Save final statistics (include logtau metadata in MHD stats)
-    mhd_normalizer.save(output_dir / "mhd_normalization.json", logtau_values=new_logtau.tolist())
-    stokes_normalizer.save(output_dir / "stokes_normalization.json")
+    mhd_normalizer.save(output_dir / "mhd_normalization.json", logtau_values=new_logtau.tolist(),
+                        velocity_target=velocity_target)
+    stokes_normalizer.save(output_dir / "stokes_normalization.json", degradation=_degradation_signature(shared_cfg))
     
     print("\n" + "="*60)
     print("Normalization statistics computed successfully!")
@@ -558,6 +561,16 @@ if __name__ == "__main__":
              "use for a small, non-contiguous set of already-generated steps."
     )
 
+    parser.add_argument(
+        "--spatial-psf", "--spatial_psf",
+        dest="spatial_psf",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Blur the profiles with the Hinode spatial PSF before the statistics, as training "
+             "does (default 1)."
+    )
+
     args = parser.parse_args()
 
     default_cache = os.environ.get(
@@ -590,4 +603,5 @@ if __name__ == "__main__":
         ic_cont_indices=args.ic_cont_indices,
         clean_start=args.clean_start,
         purge_cache=args.purge_cache,
+        spatial_psf=bool(args.spatial_psf),
     )

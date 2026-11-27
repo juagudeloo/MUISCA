@@ -83,11 +83,14 @@ Every test has a docstring stating the property it checks, its units/tolerance, 
 ```
 MURaM 3D simulation cubes (T, Vz, Bz at geometric height)
   → optical depth remapping (utils/muram_data.py: MhdData, StokesData)
-  → synthetic Stokes profiles + LSF spectral degradation
+  → synthetic Stokes profiles + LSF spectral degradation + Hinode spatial PSF
+    (scripts/base_training.py: degrade_training_stokes, used by training, stats and analysis)
   → normalization (utils/normalizer.py: MhdNormalizer, StokesNormalizer)
   → HDF5 cache (utils/cache_manage.py: MuramDataCache)
-  → MuramStepDataset → DataLoader → training
+  → MuramStepDataset → DataLoader → fresh Gaussian noise per batch (hinode_noise) → training
 ```
+
+The PSF (`spatial_psf`, the 0.16″ Hinode PSF resampled to the 25 km MURaM grid) is cached with the profiles; the noise (`hinode_noise` = 1.2e-3 of the continuum, measured in MODEST) is never cached, and validation and analysis inputs are noiseless. Runs saved without these settings are replayed with `LEGACY_DEGRADATION` (no PSF, no noise).
 
 ### Model Architecture
 

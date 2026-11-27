@@ -124,6 +124,8 @@ def test_finetuning_refuses_a_base_run_without_a_balancing_node(tmp_path):
         {"physics_config": {"lambda_wfa": 10.0}, "data_config": {"bz_balance_tau_idx": 44}}))
     cfg, _ = finetune.load_and_adapt_config(run / "final_model.pth", finetune_epochs_override=3)
     assert (cfg.lambda_wfa, cfg.apply_bz_bin_balance, cfg.bz_balance_scope, cfg.n_epochs) == (10.0, True, "global", 3)
+    # A run saved before Phase 1b (no spatial_psf, hinode_noise) is fine-tuned as it was trained.
+    assert (cfg.spatial_psf, cfg.hinode_noise) == (False, 0.0)
 
 
 # --- Generation safeguards ---------------------------------------------------------------

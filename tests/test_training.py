@@ -27,7 +27,7 @@ from scripts.base_training import (
     train_one_step,
     update_wfa_gate_state,
 )
-from utils.normalizer import MhdNormalizer
+from utils.normalizer import MhdNormalizer, StokesNormalizer
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -191,7 +191,7 @@ def test_epoch_visits_every_training_step_once(tmp_path):
     are averages over steps.
     """
     norm, ds, approx = _tiny_step(tmp_path)
-    cfg = _cfg(tmp_path, batch_size=32)
+    cfg = _cfg(tmp_path, batch_size=32, hinode_noise=0.0)  # no Stokes normalizer here to scale noise
     m = _model()
     logger = MetricsLogger(tmp_path / "logs")
     preloaded = {s: (ds, approx) for s in (110, 120, 130, 140)}
@@ -341,3 +341,84 @@ def test_an_experiment_refuses_steps_with_different_velocity_conventions(tmp_pat
     assert require_one_velocity_convention([198], cfg) == "Vz"
     with pytest.raises(ValueError, match=r"\[198\]"):
         require_one_velocity_convention([150, 198], cfg)
+
+
+def test_training_noise_has_the_measured_sigma_in_physical_units():
+    """Noise added to normalized inputs is, back in physical units, white with sigma = hinode_noise.
+
+    The inputs are (S - mean) / std per Stokes parameter, so the noise must be scaled per
+    channel; one sigma for all normalized channels would give V (std ~1e-3) almost no noise
+    or I far too much. Each call draws a new realization (the model must not fit one).
+    Tolerance 2 % on 4e5 samples per channel.
+    """
+    import types
+    from scripts.base_training import add_input_noise, input_noise_scale
+    norm = types.SimpleNamespace(final_stats={"I": {"mean": 0.95, "std": 0.12}, "V": {"mean": 0.0, "std": 4e-3}})
+    cfg = TrainingConfig(checkpoint_dir="/tmp/_ck", log_dir="/tmp/_lg", hinode_noise=1.2e-3)
+    scale = input_noise_scale(cfg, norm)
+    torch.manual_seed(0)
+    x = torch.zeros(4000, 2, 100)
+    a, b = add_input_noise(x, scale), add_input_noise(x, scale)
+    for c, key in enumerate(("I", "V")):
+        sigma_phys = float(a[:, c].std()) * (norm.final_stats[key]["std"] + 1e-8)
+        assert sigma_phys == pytest.approx(1.2e-3, rel=0.02)
+    assert not torch.equal(a, b) and bool((x == 0).all())
+    assert input_noise_scale(TrainingConfig(checkpoint_dir="/tmp/_ck", log_dir="/tmp/_lg", hinode_noise=0.0), norm) is None
+    with pytest.raises(ValueError, match="normalizer"):
+        input_noise_scale(cfg, None)
+
+
+def test_training_refuses_statistics_of_the_other_velocity_convention():
+    """Statistics of +Vz (recorded, or unrecorded and so older) cannot normalize regenerated v_los steps.
+
+    A mismatch would shift every normalized velocity target by twice the Vz mean per node.
+    """
+    from scripts.base_training import check_normalizer_velocity_target
+    norm = MhdNormalizer(n_tau=45)
+    for stored, data, ok in ((None, "Vz", True), (None, "v_los", False), ("v_los", "v_los", True),
+                             ("Vz", "v_los", False), ("v_los", "Vz", False), ("v_los", None, True)):
+        norm.velocity_target = stored
+        if ok:
+            check_normalizer_velocity_target(norm, data)
+        else:
+            with pytest.raises(ValueError, match="recompute"):
+                check_normalizer_velocity_target(norm, data)
+
+
+def test_training_refuses_stokes_statistics_of_differently_degraded_profiles(tmp_path):
+    """Statistics of unblurred profiles (recorded, or older than Phase 1b) cannot scale PSF-blurred inputs.
+
+    The PSF lowers the spread of every Stokes parameter, so mismatched statistics would
+    mis-scale the inputs and the noise sigma.
+    """
+    from scripts.base_training import _degradation_signature, check_stokes_normalizer_degradation
+    with_psf = _cfg(tmp_path)
+    without = _cfg(tmp_path, spatial_psf=False)
+    norm = StokesNormalizer()
+    norm.degradation = None
+    check_stokes_normalizer_degradation(norm, without)
+    with pytest.raises(ValueError, match="without the spatial PSF"):
+        check_stokes_normalizer_degradation(norm, with_psf)
+    norm.degradation = _degradation_signature(with_psf)
+    check_stokes_normalizer_degradation(norm, with_psf)
+    with pytest.raises(ValueError, match="with the spatial PSF"):
+        check_stokes_normalizer_degradation(norm, without)
+
+
+def test_resuming_an_old_configuration_keeps_it_without_psf_and_noise(tmp_path):
+    """``TrainingConfig.load`` of a file without the degradation settings replays LEGACY_DEGRADATION.
+
+    Resuming a run trained on clean, unblurred profiles must not switch to today's defaults
+    halfway through; a file that has the settings keeps them. A NaN noise sigma is refused.
+    """
+    import json
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"n_epochs": 3, "checkpoint_dir": str(tmp_path / "c"), "log_dir": str(tmp_path / "l")}))
+    cfg = TrainingConfig.load(old)
+    assert (cfg.n_epochs, cfg.spatial_psf, cfg.hinode_noise) == (3, False, 0.0)
+    new = tmp_path / "new.json"
+    new.write_text(json.dumps({"spatial_psf": True, "hinode_noise": 1.2e-3,
+                               "checkpoint_dir": str(tmp_path / "c"), "log_dir": str(tmp_path / "l")}))
+    assert (TrainingConfig.load(new).spatial_psf, TrainingConfig.load(new).hinode_noise) == (True, 1.2e-3)
+    with pytest.raises(ValueError, match="hinode_noise"):
+        _cfg(tmp_path, hinode_noise=float("nan"))

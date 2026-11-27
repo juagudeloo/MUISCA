@@ -7,9 +7,9 @@ changes what a layer stores but not that layer's signature, the cache silently s
 data. This happened before: the black-body approximation was changed and the balanced cache
 kept serving the old temperatures.
 
-Each test changes one setting and checks that the relevant signature changes. Settings that
-are known to be missing from a signature are strict xfails, to be fixed when the signatures
-are reworked in the reframe plan (Phase 1b).
+Each test changes one setting and checks that the relevant signature changes. Since Phase 1b
+the balanced signature contains the whole per-step signature and the SHA-256 of both
+normalization files, which closed the gaps that were strict xfails here.
 """
 import dataclasses
 
@@ -23,7 +23,6 @@ from scripts.base_training import (
 from utils.cache_manage import BalancedTrainDataCache, MuramDataCache
 
 STEPS = [110, 120, 130, 140]
-GAP = "Known gap, fixed in reframe Phase 1b: this setting changes the cached content but not this signature."
 
 
 def _variant(**changes) -> TrainingConfig:
@@ -48,10 +47,11 @@ RAW_CASES = [
     pytest.param({"temp_continuum_indices": [0, 1, 2, 3]}, id="temp_continuum_indices (black body)"),
     pytest.param({"temp_continuum_wavelength": 6300.9}, id="temp_continuum_wavelength (black body)"),
     pytest.param({"stokes_cont_indices": [4, 5, 6, 7]}, id="stokes_cont_indices"),
-    pytest.param({"lande_factor": 2.5}, id="lande_factor (WFA)",
-                 marks=pytest.mark.xfail(strict=True, reason=GAP)),
-    pytest.param({"lsf_path": "hinode-MODEST/PSFs/other.psf"}, id="lsf_path (spectral degradation)",
-                 marks=pytest.mark.xfail(strict=True, reason=GAP)),
+    pytest.param({"lande_factor": 2.5}, id="lande_factor (WFA)"),
+    pytest.param({"lsf_path": "hinode-MODEST/PSFs/other.psf"}, id="lsf_path (spectral degradation)"),
+    pytest.param({"spatial_psf": False}, id="spatial_psf (spatial degradation)"),
+    pytest.param({"psf_path": "hinode-MODEST/PSFs/hinode_psf_bin.0.08.fits"}, id="psf_path"),
+    pytest.param({"pixel_km": 50.0}, id="pixel_km (PSF resampling)"),
 ]
 
 # Settings that change the balanced cache: the same approximations it copies, plus the
@@ -59,24 +59,18 @@ RAW_CASES = [
 BALANCED_CASES = [
     pytest.param({"temp_continuum_indices": [0, 1, 2, 3]}, id="temp_continuum_indices (black body)"),
     pytest.param({"stokes_cont_indices": [4, 5, 6, 7]}, id="stokes_cont_indices"),
-    pytest.param({"wl_range": (10, 60)}, id="wl_range (WFA and Doppler window)",
-                 marks=pytest.mark.xfail(strict=True, reason=GAP)),
-    pytest.param({"central_wavelength": 6302.5}, id="central_wavelength (WFA and Doppler)",
-                 marks=pytest.mark.xfail(strict=True, reason=GAP)),
-    pytest.param({"lande_factor": 2.5}, id="lande_factor (WFA)",
-                 marks=pytest.mark.xfail(strict=True, reason=GAP)),
-    pytest.param({"mhd_normalizer_path": "normalization_stats/other/mhd_normalization.json"},
-                 id="mhd normalization stats", marks=pytest.mark.xfail(strict=True, reason=GAP)),
-    pytest.param({"stokes_normalizer_path": "normalization_stats/other/stokes_normalization.json"},
-                 id="stokes normalization stats", marks=pytest.mark.xfail(strict=True, reason=GAP)),
+    pytest.param({"wl_range": (10, 60)}, id="wl_range (WFA and Doppler window)"),
+    pytest.param({"central_wavelength": 6302.5}, id="central_wavelength (WFA and Doppler)"),
+    pytest.param({"lande_factor": 2.5}, id="lande_factor (WFA)"),
+    pytest.param({"spatial_psf": False}, id="spatial_psf (spatial degradation)"),
+    pytest.param({"lsf_path": "hinode-MODEST/PSFs/other.psf"}, id="lsf_path (spectral degradation)"),
 ]
 
 
-# Settings added by the reframe plan (Phase 1b, 1c): they change what both caches store.
+# Settings added by the reframe plan (Phase 1c): they change what both caches store.
 NEW = "Agreed in the reframe plan: new setting, not in TrainingConfig yet."
 PHASE1_CASES = [
-    pytest.param({"spatial_psf": True}, id="spatial_psf (Phase 1b)", marks=pytest.mark.xfail(strict=True, reason=NEW)),
-    pytest.param({"hinode_noise": 1e-3}, id="hinode_noise (Phase 1b)", marks=pytest.mark.xfail(strict=True, reason=NEW)),
+    pytest.param({"spatial_psf": False}, id="spatial_psf (Phase 1b)"),
     pytest.param({"stokes_channels": ("I", "V")}, id="stokes_channels (Phase 1c)",
                  marks=pytest.mark.xfail(strict=True, reason=NEW)),
 ]
@@ -84,7 +78,7 @@ PHASE1_CASES = [
 
 @pytest.mark.parametrize("changes", PHASE1_CASES)
 def test_new_settings_change_both_signatures(changes):
-    """The PSF, noise and channel settings change both cache signatures (each changes the cached input)."""
+    """The PSF and channel settings change both cache signatures (each changes the cached input)."""
     assert _raw_hash(_variant(**changes)) != _raw_hash(TrainingConfig())
     assert _balanced_hash(_variant(**changes)) != _balanced_hash(TrainingConfig())
 
@@ -113,8 +107,13 @@ def test_setting_changes_the_balanced_cache_signature(changes):
 
 
 def test_signatures_ignore_settings_that_do_not_change_the_data():
-    """Optimizer and logging settings must not invalidate either cache (a full rebuild takes hours)."""
-    other = _variant(learning_rate=TrainingConfig().learning_rate * 10, n_epochs=TrainingConfig().n_epochs + 1)
+    """Optimizer and noise settings must not invalidate either cache (a full rebuild takes hours).
+
+    The noise is drawn anew for every training batch and never cached, so changing its sigma
+    must not rebuild anything.
+    """
+    other = _variant(learning_rate=TrainingConfig().learning_rate * 10, n_epochs=TrainingConfig().n_epochs + 1,
+                     hinode_noise=0.0)
     assert _raw_hash(other) == _raw_hash(TrainingConfig())
     assert _balanced_hash(other) == _balanced_hash(TrainingConfig())
 
@@ -143,3 +142,20 @@ def test_regenerated_source_files_change_both_signatures(tmp_path):
     (sim / "atmos_110_tau500.npz").write_bytes(b"regenerated, longer")
     assert MuramDataCache.make_config_hash(build_cache_config_signature(cfg, step=110)) != raw0
     assert BalancedTrainDataCache.make_signature_hash(build_balanced_cache_signature(cfg, [110])) != bal0
+
+
+def test_recomputed_normalization_statistics_change_the_balanced_signature(tmp_path):
+    """Rewriting a normalization JSON in place (same path, new content) changes the balanced hash.
+
+    The balanced cache stores normalized tensors. Recomputing the statistics (the pending
+    retrain does) keeps the file names, so the path alone would let the cache serve tensors
+    normalized with the old statistics.
+    """
+    stats = tmp_path / "normalization_stats" / "nicole_tau500"
+    stats.mkdir(parents=True)
+    (stats / "mhd_normalization.json").write_text("{}")
+    (stats / "stokes_normalization.json").write_text("{}")
+    cfg = _variant(data_path=str(tmp_path))
+    before = BalancedTrainDataCache.make_signature_hash(build_balanced_cache_signature(cfg, [110]))
+    (stats / "stokes_normalization.json").write_text('{"I": {"mean": 0.9}}')
+    assert BalancedTrainDataCache.make_signature_hash(build_balanced_cache_signature(cfg, [110])) != before

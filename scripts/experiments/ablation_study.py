@@ -57,7 +57,7 @@ from scripts.base_training import (
     TrainingConfig, set_global_seed,
     load_and_prepare_step, validate, train_epoch, MetricsLogger,
     initialize_wfa_gate_state, update_wfa_gate_state,
-    compute_global_bz_balancing_indices, require_one_velocity_convention,
+    compute_global_bz_balancing_indices, check_normalization_matches_run,
     build_or_refresh_balanced_cache, choose_balanced_cache_runtime_mode,
     preload_balanced_steps_from_cache,
     generate_epoch_diagnostic_plots, generate_epoch_diagnostic_videos,
@@ -1628,6 +1628,13 @@ def run_single_experiment(
             'bz_balance_mode': str(config.bz_balance_mode),
             'bz_balance_bins': int(config.bz_balance_bins),
             'bz_balance_tau_idx': None if config.bz_balance_tau_idx is None else int(config.bz_balance_tau_idx),
+            # Observational degradation; analysis and fine-tuning replay these (runs without
+            # them were trained with LEGACY_DEGRADATION).
+            'spatial_psf': bool(config.spatial_psf),
+            'psf_path': str(config.psf_path),
+            'psf_sampling_arcsec': float(config.psf_sampling_arcsec),
+            'pixel_km': float(config.pixel_km),
+            'hinode_noise': float(config.hinode_noise),
         },
         'model_config': {
             'scales': [1, 2, 3],
@@ -1702,7 +1709,8 @@ def run_single_experiment(
     n_val = max(1, len(train_steps) // 10)
     val_steps = random.sample(train_steps, n_val)
     train_steps = [s for s in train_steps if s not in val_steps]
-    require_one_velocity_convention(train_steps + val_steps + list(test_steps), config)
+    check_normalization_matches_run(mhd_normalizer, stokes_normalizer, config,
+                                    train_steps + val_steps + list(test_steps))
 
     global_bz_selection_indices = None
     global_bz_balance_metadata = None
@@ -2287,6 +2295,12 @@ def main():
     parser.add_argument('--stokes-ic-mode', '--stokes_ic_mode', dest='stokes_ic_mode',
                        type=str, choices=['per_step', 'fixed_global'], default='fixed_global',
                        help='Continuum normalization mode for Stokes data')
+    parser.add_argument('--spatial-psf', '--spatial_psf', dest='spatial_psf', type=int, choices=[0, 1],
+                       default=1,
+                       help='Blur the training profiles with the Hinode spatial PSF (default 1)')
+    parser.add_argument('--hinode-noise', '--hinode_noise', dest='hinode_noise', type=float, default=1.2e-3,
+                       help='Gaussian noise sigma added to every training batch, in units of the HSRA '
+                            'continuum (default 1.2e-3, measured in MODEST Q, U and V; 0 disables it)')
     parser.add_argument('--no-cache', action='store_true',
                        help='Disable data caching')
     parser.add_argument('--cache-dir', '--cache_dir', dest='cache_dir', type=str, default=None,
@@ -2678,6 +2692,8 @@ def main():
             stokes_mult_factor=args.stokes_mult_factor,
             stokes_ic_mode=args.stokes_ic_mode,
             data_source=args.data_source,
+            spatial_psf=bool(args.spatial_psf),
+            hinode_noise=float(args.hinode_noise),
             **common_epoch_plot_kwargs,
         )
 

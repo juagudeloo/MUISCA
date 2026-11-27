@@ -456,7 +456,8 @@ class PredictionExporter:
             old pipeline, Rosseland tau for the pressure) regardless of the checkpoint's data
             source. For models trained on ``nicole_tau500`` the MURaM input therefore differs
             from the training profiles (e.g. continuum 0.91 instead of 0.97 at one pixel of
-            step 198). Fixed in the reframe plan, Phase 1d.
+            step 198). Fixed in the reframe plan, Phase 1d. Until then it refuses models
+            trained with the spatial PSF (``NotImplementedError``).
 
         Returns ``(prediction_stokes, wavelength, gt_pressure)``.
         """
@@ -464,6 +465,14 @@ class PredictionExporter:
         # mode, stokes_mult_factor, ...) the checkpoint was actually trained
         # with -- same call scripts/analysis/muram_analysis.py makes.
         train_cfg = pipeline.build_runtime_training_config(model_cfg)
+        if train_cfg.spatial_psf:
+            # This path does not apply the spatial PSF, so a PSF-trained model would get
+            # profiles with MURaM's full granulation contrast. Phase 1d moves it onto
+            # load_source_arrays + degrade_training_stokes.
+            raise NotImplementedError(
+                "The MURaM bridge does not degrade the profiles with the spatial PSF yet (reframe "
+                "Phase 1d); it only serves models trained without it."
+            )
         data_path = Path(train_cfg.data_path)
 
         mhd = MhdData(
